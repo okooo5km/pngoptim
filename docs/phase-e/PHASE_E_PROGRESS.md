@@ -7,7 +7,7 @@
 
 - [x] 模块级耗时分解：decode/quantize/encode/total
 - [x] 内存画像：`reports/perf/perf-v1-20260305-e5/memory_profile.json`
-- [x] 评测脚本：`scripts/perf/run_phase_e_perf.py`
+- [x] 评测命令：`cargo run --release --bin xtask -- perf --run-id <run_id> --candidate target/release/pngoptim --build`
 
 ## E2. 热点优化（逐项）
 
@@ -17,7 +17,7 @@
 
 ## E3. 平台优化
 
-- [x] release 基准模式固化到评测脚本（公平性能评测）
+- [x] release 基准模式固化到 `xtask perf`（公平性能评测）
 - [ ] SIMD 路径（留待后续阶段扩展）
 - [ ] 并行调度策略（留待后续阶段扩展）
 

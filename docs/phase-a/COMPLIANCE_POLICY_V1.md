@@ -62,7 +62,7 @@
 已落地文件：
 
 1. 配置：`config/compliance/deny.toml`
-2. 本地执行脚本：`scripts/compliance/run_compliance_checks.sh`
+2. 本地执行命令：`cargo run --release --bin xtask -- compliance --config config/compliance/deny.toml`
 3. CI：`.github/workflows/phase-a-governance.yml`
 4. 最近检查证据：`reports/compliance/cargo-deny-check.txt`
 

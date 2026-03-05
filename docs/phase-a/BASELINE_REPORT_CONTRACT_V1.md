@@ -2,7 +2,7 @@
 
 > 生效日期：2026-03-05  
 > 关联阶段：A3/A4  
-> 生成脚本：`scripts/baseline/run_baseline_v1.py`
+> 生成命令：`cargo run --release --bin xtask -- baseline --run-id <run_id> --profile Q_MED`
 
 ## 1. 输出目录
 
@@ -91,11 +91,10 @@
 2. `run_id`
 3. `profile`
 4. `splits`
-5. 平台信息（system/release/machine/python）
+5. 平台信息（system/release/machine/rust）
 
 ## 4. 判定规则（Phase A）
 
 1. 脚本可重复执行且输出完整文件集。
 2. `failures.json` 中不得存在 `unexpected_result`（若存在则需登记豁免）。
 3. 运行元信息完整可追溯。
-

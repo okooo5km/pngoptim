@@ -24,13 +24,13 @@
 代码位置：
 1. `src/pipeline.rs`
 2. `src/palette_quant.rs`
-3. `scripts/perf/run_phase_e_perf.py`
+3. `src/bin/xtask.rs`（`perf` 子命令）
 
 主要动作：
 1. 新增模块级耗时埋点（decode/quantize/encode/total），通过环境变量 `PNGOPTIM_PROFILE_METRICS=1` 输出。
 2. 编码阶段改为 speed 分档策略（压缩等级与过滤器候选集绑定）。
 3. 量化路径改为固定桶数组索引，降低 HashMap 热点成本。
-4. Phase E 评测脚本默认使用 `release` 二进制，输出 `perf_compare.csv` 与 `memory_profile.json`。
+4. `xtask perf` 默认使用 `release` 二进制，输出 `perf_compare.csv` 与 `memory_profile.json`。
 
 ## 3. 模块级耗时画像（candidate 平均，ms）
 

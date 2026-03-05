@@ -6,8 +6,8 @@
 ## G1. 发布材料
 
 - [x] 发布预检文档：`docs/phase-g/PUBLIC_RELEASE_V1.md`
-- [x] 许可证导出脚本：`scripts/release/export_third_party_licenses.py`
-- [x] 发布检查脚本：`scripts/release/validate_release_bundle.py`
+- [x] 许可证导出命令：`cargo run --release --bin xtask -- release-licenses`
+- [x] 发布检查命令：`cargo run --release --bin xtask -- release-check`
 - [ ] 最终发布包（待阶段 F 收口）
 
 ## G2. 社区治理

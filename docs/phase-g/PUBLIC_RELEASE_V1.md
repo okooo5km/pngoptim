@@ -20,8 +20,8 @@
 3. PR 模板：`.github/pull_request_template.md`
 4. 定时回归 workflow：`.github/workflows/nightly-regression.yml`
 5. 三平台一致性 workflow：`.github/workflows/phase-f-cross-platform.yml`
-6. 许可证导出脚本：`scripts/release/export_third_party_licenses.py`
-7. 发布检查脚本：`scripts/release/validate_release_bundle.py`
+6. 许可证导出命令：`cargo run --release --bin xtask -- release-licenses`
+7. 发布检查命令：`cargo run --release --bin xtask -- release-check`
 
 ## 3. 发布前必须完成项
 
@@ -33,6 +33,6 @@
 ## 4. 建议发布命令
 
 ```bash
-python3 scripts/release/export_third_party_licenses.py --run-id release-licenses-v1
-python3 scripts/release/validate_release_bundle.py --run-id release-check-v1
+cargo run --release --bin xtask -- release-licenses --run-id release-licenses-v1
+cargo run --release --bin xtask -- release-check --run-id release-check-v1
 ```

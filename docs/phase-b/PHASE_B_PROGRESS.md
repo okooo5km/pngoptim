@@ -23,10 +23,9 @@
 ## 阶段证据
 
 1. MVP 实现说明：`docs/phase-b/MVP_PIPELINE_V1.md`
-2. smoke 运行脚本：`scripts/smoke/run_smoke_phase_b.py`
+2. smoke 运行命令：`cargo run --release --bin xtask -- smoke --run-id <run_id> --build`
 3. smoke 结果明细：`reports/smoke/smoke-v1-20260305/smoke_report.csv`
 
 ## 阶段结论
 
 - [x] 阶段 B 出口条件已满足：`MVP Pipeline` + `Smoke Report v1`
-

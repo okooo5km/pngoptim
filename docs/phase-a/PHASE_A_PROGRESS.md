@@ -21,9 +21,9 @@
 - [x] 数据集目录结构：`dataset/`
 - [x] 首批样本清单：`dataset/functional/manifest.json`（2 个样本）
 - [x] 参数矩阵：`config/evaluation/parameter_matrix_v1.toml`
-- [x] 报告生成脚本：`scripts/baseline/run_baseline_v1.py`
+- [x] 报告生成命令：`cargo run --release --bin xtask -- baseline --run-id <run_id> --profile Q_MED`
 - [x] 报告 contract：`docs/phase-a/BASELINE_REPORT_CONTRACT_V1.md`
-- [x] 数据集扩充脚本：`scripts/dataset/seed_phase_a_dataset.py`
+- [x] 数据集扩充命令：`cargo run --release --bin xtask -- dataset-seed`
 
 ## A4. 基线产出
 

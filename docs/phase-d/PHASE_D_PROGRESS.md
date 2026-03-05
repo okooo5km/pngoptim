@@ -29,7 +29,7 @@
 ## 阶段证据
 
 1. 阶段报告：`docs/phase-d/QUALITY_SIZE_REPORT_V1.md`
-2. 质量/体积评测脚本：`scripts/evaluation/run_phase_d_quality_size.py`
+2. 质量/体积评测命令：`cargo run --release --bin xtask -- quality-size --run-id <run_id> --candidate target/release/pngoptim --build`
 3. 主评测结果：`reports/quality-size/quality-size-v1-20260305-r3/summary.md`
 4. 回归稳定性：`reports/smoke/smoke-v1-20260305-d-encoding/summary.md`
 5. 兼容性回归：`reports/compat/compat-v1-20260305-d-encoding/summary.md`

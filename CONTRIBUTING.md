@@ -30,11 +30,11 @@ cargo test
 
 按变更类型补充：
 ```bash
-python3 scripts/smoke/run_smoke_phase_b.py --run-id smoke-local --binary target/release/pngoptim
-python3 scripts/compat/run_phase_c_compat.py --run-id compat-local --binary target/release/pngoptim
-python3 scripts/evaluation/run_phase_d_quality_size.py --run-id quality-size-local --candidate target/release/pngoptim
-python3 scripts/perf/run_phase_e_perf.py --run-id perf-local --candidate target/release/pngoptim
-python3 scripts/stability/run_phase_f_stability.py --run-id stability-local --binary target/release/pngoptim
+cargo run --release --bin xtask -- smoke --run-id smoke-local --binary target/release/pngoptim
+cargo run --release --bin xtask -- compat --run-id compat-local --binary target/release/pngoptim
+cargo run --release --bin xtask -- quality-size --run-id quality-size-local --candidate target/release/pngoptim
+cargo run --release --bin xtask -- perf --run-id perf-local --candidate target/release/pngoptim
+cargo run --release --bin xtask -- stability --run-id stability-local --binary target/release/pngoptim
 ```
 
 ## 5. Data & Reports

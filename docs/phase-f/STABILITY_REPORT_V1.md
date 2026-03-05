@@ -22,8 +22,8 @@
 
 ## 3. 脚本与产物
 
-脚本：
-1. `scripts/stability/run_phase_f_stability.py`
+命令：
+1. `cargo run --release --bin xtask -- stability`
 
 产物：
 1. `reports/stability/stability-v1-20260305-f1/stability_report.csv`

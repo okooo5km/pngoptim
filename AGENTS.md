@@ -125,14 +125,14 @@
 13. 2026-03-05：完成 indexed PNG 编码优化（位深自适应、过滤器择优、透明表裁剪），修复阶段 D 高回归样本。
 14. 2026-03-05：完成阶段 D 质量/体积评测（`quality-size-v1-20260305-r3`），均值/中位数/P95 均优于 baseline。
 15. 2026-03-05：完成回归守护验证（`smoke-v1-20260305-d-encoding` + `compat-v1-20260305-d-encoding`），阶段 D 更新为 `Done`。
-16. 2026-03-05：完成 Phase E 评测脚本（`scripts/perf/run_phase_e_perf.py`），支持 `perf_compare.csv` 与 `memory_profile.json` 产出。
+16. 2026-03-05：完成 Phase E 评测命令（`cargo run --release --bin xtask -- perf`），支持 `perf_compare.csv` 与 `memory_profile.json` 产出。
 17. 2026-03-05：新增模块级耗时埋点与量化/编码热点优化，完成 release 性能评测（`perf-v1-20260305-e5`）。
 18. 2026-03-05：完成阶段 E 回归守护（`smoke-v1-20260305-e`、`compat-v1-20260305-e`、`quality-size-v1-20260305-e-guard-r3`），阶段 E 更新为 `Done`。
-19. 2026-03-05：新增 Phase F 稳定性脚本（`scripts/stability/run_phase_f_stability.py`），完成 `stability-v1-20260305-f1`（49 case，0 crash/panic/timeout）。
-20. 2026-03-05：新增 Phase F 跨平台脚本（collect+aggregate）与 CI 工作流（`.github/workflows/phase-f-cross-platform.yml`）。
+19. 2026-03-05：新增 Phase F 稳定性命令（`cargo run --release --bin xtask -- stability`），完成 `stability-v1-20260305-f1`（49 case，0 crash/panic/timeout）。
+20. 2026-03-05：新增 Phase F 跨平台命令（collect+aggregate）与 CI 工作流（`.github/workflows/phase-f-cross-platform.yml`）。
 21. 2026-03-05：完成本地跨平台链路验证（`cross-platform-v1-20260305-f1` partial），阶段 F 更新为 `In Progress`，待 CI 三平台收口。
 22. 2026-03-05：新增阶段 G 协作资产（`CONTRIBUTING.md` + Issue 模板 + `nightly-regression` workflow）。
-23. 2026-03-05：新增发布资产脚本（`scripts/release/export_third_party_licenses.py`、`scripts/release/validate_release_bundle.py`）。
+23. 2026-03-05：新增发布资产命令（`cargo run --release --bin xtask -- release-licenses`、`cargo run --release --bin xtask -- release-check`）。
 24. 2026-03-05：新增阶段 G 预检文档（`docs/phase-g/PUBLIC_RELEASE_V1.md`），阶段 G 状态标记为 `Blocked`（等待 F 收口）。
 25. 2026-03-05：将 Phase F 跨平台 CI 编排迁移为 Rust `xtask`（`src/bin/xtask.rs`），`phase-f-cross-platform` workflow 已改为 `cargo run --bin xtask`，不再依赖 Python 运行时。
 26. 2026-03-06：将 `nightly-regression` workflow 迁移为 Rust `xtask nightly-regression`，主 CI 编排链路不再要求 Python 环境。
