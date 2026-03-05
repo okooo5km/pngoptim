@@ -1,0 +1,3 @@
+# Keep GitHub language stats focused on product/runtime code.
+# CI/evaluation orchestration lives in scripts/ and should not dominate language breakdown.
+scripts/** linguist-detectable=false
