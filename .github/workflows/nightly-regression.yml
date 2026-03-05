@@ -18,43 +18,9 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-
-      - name: Install Python dependencies
-        run: |
-          python -m pip install --upgrade pip
-          python -m pip install pillow numpy
-
-      - name: Build release binary
-        run: cargo build --release
-
-      - name: Run quality/size guard
-        run: |
-          python scripts/evaluation/run_phase_d_quality_size.py \
-            --run-id "nightly-quality-size-${{ github.run_id }}" \
-            --candidate target/release/pngoptim \
-            --quality 55-75 \
-            --speed 4
-
-      - name: Run perf regression
-        run: |
-          python scripts/perf/run_phase_e_perf.py \
-            --run-id "nightly-perf-${{ github.run_id }}" \
-            --candidate target/release/pngoptim \
-            --quality 55-75 \
-            --speed 4 \
-            --iterations 2
-
-      - name: Run stability regression
-        run: |
-          python scripts/stability/run_phase_f_stability.py \
-            --run-id "nightly-stability-${{ github.run_id }}" \
-            --binary target/release/pngoptim \
-            --fuzz-cases 24 \
-            --timeout-sec 6
+      - name: Run nightly regression (Rust xtask)
+        run: >-
+          cargo run --release --bin xtask -- nightly-regression --run-id "${{ github.run_id }}" --binary target/release/pngoptim --build --quality 55-75 --speed 4 --iterations 2 --fuzz-cases 24
 
       - name: Upload nightly artifacts
         uses: actions/upload-artifact@v4

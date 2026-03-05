@@ -29,6 +29,8 @@ struct XtaskCli {
 enum XtaskCommand {
     #[command(name = "cross-platform")]
     CrossPlatform(CrossPlatformCli),
+    #[command(name = "nightly-regression")]
+    NightlyRegression(NightlyArgs),
 }
 
 #[derive(Parser)]
@@ -63,6 +65,24 @@ struct AggregateArgs {
     run_id: Option<String>,
     #[arg(long, default_value_t = false)]
     allow_partial: bool,
+}
+
+#[derive(Args)]
+struct NightlyArgs {
+    #[arg(long)]
+    run_id: Option<String>,
+    #[arg(long, default_value = "target/release/pngoptim")]
+    binary: String,
+    #[arg(long, default_value_t = true)]
+    build: bool,
+    #[arg(long, default_value = "55-75")]
+    quality: String,
+    #[arg(long, default_value = "4")]
+    speed: String,
+    #[arg(long, default_value_t = 2)]
+    iterations: usize,
+    #[arg(long, default_value_t = 24)]
+    fuzz_cases: usize,
 }
 
 #[derive(Debug, Deserialize)]
@@ -171,6 +191,7 @@ fn run(cli: XtaskCli) -> AppResult<i32> {
             CrossPlatformCommand::Collect(args) => collect_cross_platform(args),
             CrossPlatformCommand::Aggregate(args) => aggregate_cross_platform(args),
         },
+        XtaskCommand::NightlyRegression(args) => run_nightly_regression(args),
     }
 }
 
@@ -317,7 +338,7 @@ fn collect_cross_platform(args: CollectArgs) -> AppResult<i32> {
     }
 
     let (stability_crash_like_count, stability_failures_count) =
-        run_stability_check(&root, &binary, &reports_dir, &platform_label)?;
+        run_stability_check(&root, &binary, &reports_dir, &platform_label, 24)?;
     if stability_failures_count > 0 {
         failures.push(FailureItem {
             stage: "stability".to_string(),
@@ -656,6 +677,385 @@ fn aggregate_cross_platform(args: AggregateArgs) -> AppResult<i32> {
     Ok(if passed { 0 } else { 1 })
 }
 
+fn run_nightly_regression(args: NightlyArgs) -> AppResult<i32> {
+    let root = std::env::current_dir()?;
+    let run_id = args.run_id.unwrap_or_else(|| "local".to_string());
+
+    if args.build {
+        let status = Command::new("cargo")
+            .current_dir(&root)
+            .arg("build")
+            .arg("--release")
+            .status()?;
+        if !status.success() {
+            return Ok(status.code().unwrap_or(1));
+        }
+    }
+
+    let binary = resolve_binary_path(&root, &args.binary);
+    if !binary.exists() {
+        eprintln!("binary not found: {}", binary.display());
+        return Ok(2);
+    }
+
+    let quality_run_id = format!("nightly-quality-size-{run_id}");
+    let perf_run_id = format!("nightly-perf-{run_id}");
+    let stability_run_id = format!("nightly-stability-{run_id}");
+
+    let quality_ok =
+        run_nightly_quality_size(&root, &binary, &quality_run_id, &args.quality, &args.speed)?;
+    let perf_ok = run_nightly_perf(
+        &root,
+        &binary,
+        &perf_run_id,
+        &args.quality,
+        &args.speed,
+        args.iterations,
+    )?;
+    let stability_ok = run_nightly_stability(&root, &binary, &stability_run_id, args.fuzz_cases)?;
+
+    let all_ok = quality_ok && perf_ok && stability_ok;
+    println!(
+        "nightly summary: quality_size={}, perf={}, stability={}, status={}",
+        quality_ok,
+        perf_ok,
+        stability_ok,
+        if all_ok { "pass" } else { "fail" }
+    );
+
+    Ok(if all_ok { 0 } else { 1 })
+}
+
+fn run_nightly_quality_size(
+    root: &Path,
+    binary: &Path,
+    run_id: &str,
+    quality: &str,
+    speed: &str,
+) -> AppResult<bool> {
+    let run_dir = root.join("reports").join("quality-size").join(run_id);
+    if run_dir.exists() {
+        let _ = fs::remove_dir_all(&run_dir);
+    }
+    fs::create_dir_all(&run_dir)?;
+
+    let samples = load_samples(root, &COMPARE_SPLITS)?
+        .into_iter()
+        .filter(|s| s.expected_success)
+        .collect::<Vec<_>>();
+
+    let mut failures: Vec<serde_json::Value> = Vec::new();
+    let mut writer = Writer::from_path(run_dir.join("size_report.csv"))?;
+    writer.write_record([
+        "run_id",
+        "split",
+        "sample_id",
+        "input_file",
+        "input_bytes",
+        "candidate_bytes",
+        "candidate_ratio",
+        "exit_code",
+        "status",
+    ])?;
+
+    let mut all_ok = true;
+    for sample in &samples {
+        let input = root
+            .join("dataset")
+            .join(&sample.split)
+            .join(&sample.filename);
+        let stem = Path::new(&sample.filename)
+            .file_stem()
+            .and_then(|v| v.to_str())
+            .unwrap_or("sample");
+        let out = run_dir
+            .join("candidate-out")
+            .join(&sample.split)
+            .join(format!("{stem}.candidate.png"));
+        if let Some(parent) = out.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        if out.exists() {
+            let _ = fs::remove_file(&out);
+        }
+
+        let output = run_command(
+            root,
+            binary,
+            &vec![
+                input.to_string_lossy().to_string(),
+                "--quality".to_string(),
+                quality.to_string(),
+                "--speed".to_string(),
+                speed.to_string(),
+                "--strip".to_string(),
+                "--force".to_string(),
+                "--quiet".to_string(),
+                "--output".to_string(),
+                out.to_string_lossy().to_string(),
+            ],
+            None,
+        )?;
+
+        let input_bytes = fs::metadata(&input)?.len();
+        let success = output.code == Some(0) && out.exists();
+        let candidate_bytes = if success {
+            Some(fs::metadata(&out)?.len())
+        } else {
+            None
+        };
+        let candidate_ratio = candidate_bytes.map(|v| v as f64 / input_bytes as f64);
+        let status = if success { "success" } else { "failed" };
+        if !success {
+            all_ok = false;
+            failures.push(serde_json::json!({
+                "split": sample.split,
+                "sample_id": sample.sample_id,
+                "input_file": sample.filename,
+                "exit_code": output.code.unwrap_or(-1),
+                "stderr": truncate(&output.stderr, 500),
+            }));
+        }
+
+        writer.write_record([
+            run_id,
+            sample.split.as_str(),
+            sample.sample_id.as_str(),
+            sample.filename.as_str(),
+            &input_bytes.to_string(),
+            &candidate_bytes.map(|v| v.to_string()).unwrap_or_default(),
+            &candidate_ratio
+                .map(|v| format!("{v:.9}"))
+                .unwrap_or_default(),
+            &output.code.unwrap_or(-1).to_string(),
+            status,
+        ])?;
+    }
+    writer.flush()?;
+
+    fs::write(
+        run_dir.join("quality_report.csv"),
+        "run_id,split,sample_id,input_file,quality_signal\n",
+    )?;
+    fs::write(
+        run_dir.join("failures.json"),
+        format!("{}\n", serde_json::to_string_pretty(&failures)?),
+    )?;
+    fs::write(
+        run_dir.join("summary.md"),
+        format!(
+            "# Nightly Quality/Size Guard\n\n- run_id: `{}`\n- total: {}\n- failed: {}\n- status: {}\n",
+            run_id,
+            samples.len(),
+            failures.len(),
+            if all_ok { "pass" } else { "fail" }
+        ),
+    )?;
+
+    Ok(all_ok)
+}
+
+fn run_nightly_perf(
+    root: &Path,
+    binary: &Path,
+    run_id: &str,
+    quality: &str,
+    speed: &str,
+    iterations: usize,
+) -> AppResult<bool> {
+    let run_dir = root.join("reports").join("perf").join(run_id);
+    if run_dir.exists() {
+        let _ = fs::remove_dir_all(&run_dir);
+    }
+    fs::create_dir_all(&run_dir)?;
+
+    let samples = load_samples(root, &COMPARE_SPLITS)?
+        .into_iter()
+        .filter(|s| s.expected_success)
+        .collect::<Vec<_>>();
+
+    let mut failures: Vec<serde_json::Value> = Vec::new();
+    let mut writer = Writer::from_path(run_dir.join("perf_compare.csv"))?;
+    writer.write_record([
+        "run_id",
+        "split",
+        "sample_id",
+        "input_file",
+        "iteration",
+        "elapsed_ms",
+        "output_bytes",
+        "exit_code",
+        "status",
+    ])?;
+
+    let mut elapsed_all = Vec::<f64>::new();
+    let mut all_ok = true;
+    for sample in &samples {
+        let input = root
+            .join("dataset")
+            .join(&sample.split)
+            .join(&sample.filename);
+        let stem = Path::new(&sample.filename)
+            .file_stem()
+            .and_then(|v| v.to_str())
+            .unwrap_or("sample");
+
+        for iter in 1..=iterations.max(1) {
+            let out = run_dir
+                .join("out")
+                .join("candidate")
+                .join(&sample.split)
+                .join(format!("{stem}.candidate.{iter}.png"));
+            if let Some(parent) = out.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            if out.exists() {
+                let _ = fs::remove_file(&out);
+            }
+
+            let start = Instant::now();
+            let output = run_command(
+                root,
+                binary,
+                &vec![
+                    input.to_string_lossy().to_string(),
+                    "--quality".to_string(),
+                    quality.to_string(),
+                    "--speed".to_string(),
+                    speed.to_string(),
+                    "--strip".to_string(),
+                    "--force".to_string(),
+                    "--quiet".to_string(),
+                    "--output".to_string(),
+                    out.to_string_lossy().to_string(),
+                ],
+                None,
+            )?;
+            let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
+
+            let success = output.code == Some(0) && out.exists();
+            let output_bytes = if success {
+                Some(fs::metadata(&out)?.len())
+            } else {
+                None
+            };
+            if success {
+                elapsed_all.push(elapsed_ms);
+            } else {
+                all_ok = false;
+                failures.push(serde_json::json!({
+                    "split": sample.split,
+                    "sample_id": sample.sample_id,
+                    "input_file": sample.filename,
+                    "iteration": iter,
+                    "exit_code": output.code.unwrap_or(-1),
+                    "stderr": truncate(&output.stderr, 500),
+                }));
+            }
+
+            writer.write_record([
+                run_id,
+                sample.split.as_str(),
+                sample.sample_id.as_str(),
+                sample.filename.as_str(),
+                &iter.to_string(),
+                &format!("{elapsed_ms:.3}"),
+                &output_bytes.map(|v| v.to_string()).unwrap_or_default(),
+                &output.code.unwrap_or(-1).to_string(),
+                if success { "success" } else { "failed" },
+            ])?;
+        }
+    }
+    writer.flush()?;
+
+    fs::write(
+        run_dir.join("failures.json"),
+        format!("{}\n", serde_json::to_string_pretty(&failures)?),
+    )?;
+    fs::write(
+        run_dir.join("memory_profile.json"),
+        format!(
+            "{{\n  \"run_id\": \"{}\",\n  \"note\": \"rust-native nightly perf does not sample RSS yet\"\n}}\n",
+            run_id
+        ),
+    )?;
+    fs::write(
+        run_dir.join("summary.md"),
+        format!(
+            "# Nightly Perf Regression\n\n- run_id: `{}`\n- samples: {}\n- iterations: {}\n- elapsed_ms_mean: {:.3}\n- elapsed_ms_p95: {:.3}\n- failed: {}\n- status: {}\n",
+            run_id,
+            samples.len(),
+            iterations.max(1),
+            mean(&elapsed_all),
+            p95(&elapsed_all),
+            failures.len(),
+            if all_ok { "pass" } else { "fail" }
+        ),
+    )?;
+
+    Ok(all_ok)
+}
+
+fn run_nightly_stability(
+    root: &Path,
+    binary: &Path,
+    run_id: &str,
+    fuzz_cases: usize,
+) -> AppResult<bool> {
+    let run_dir = root.join("reports").join("stability").join(run_id);
+    if run_dir.exists() {
+        let _ = fs::remove_dir_all(&run_dir);
+    }
+    fs::create_dir_all(&run_dir)?;
+
+    let platform_label = default_platform_label();
+    let (crash_like_count, failures_count) =
+        run_stability_check(root, binary, &run_dir, &platform_label, fuzz_cases)?;
+
+    fs::write(
+        run_dir.join("fuzz_summary.json"),
+        format!(
+            "{{\n  \"run_id\": \"{}\",\n  \"fuzz_cases\": {},\n  \"crash_like_count\": {},\n  \"failures_count\": {}\n}}\n",
+            run_id, fuzz_cases, crash_like_count, failures_count
+        ),
+    )?;
+    fs::write(
+        run_dir.join("stability_report.csv"),
+        format!(
+            "run_id,crash_like_count,failures_count\n{},{},{}\n",
+            run_id, crash_like_count, failures_count
+        ),
+    )?;
+    fs::write(
+        run_dir.join("failures.json"),
+        if failures_count == 0 {
+            "[]\n".to_string()
+        } else {
+            format!(
+                "[{{\"stage\":\"stability\",\"detail\":\"failures_count={}\",\"exit_code\":1}}]\n",
+                failures_count
+            )
+        },
+    )?;
+    fs::write(
+        run_dir.join("summary.md"),
+        format!(
+            "# Nightly Stability Regression\n\n- run_id: `{}`\n- fuzz_cases: {}\n- crash_like_count: {}\n- failures_count: {}\n- status: {}\n",
+            run_id,
+            fuzz_cases,
+            crash_like_count,
+            failures_count,
+            if crash_like_count == 0 && failures_count == 0 {
+                "pass"
+            } else {
+                "fail"
+            }
+        ),
+    )?;
+
+    Ok(crash_like_count == 0 && failures_count == 0)
+}
+
 fn run_smoke_check(
     root: &Path,
     binary: &Path,
@@ -925,6 +1325,7 @@ fn run_stability_check(
     binary: &Path,
     reports_dir: &Path,
     platform_label: &str,
+    fuzz_cases: usize,
 ) -> AppResult<(i32, i32)> {
     let mut crash_like_count = 0;
     let mut failures_count = 0;
@@ -988,7 +1389,6 @@ fn run_stability_check(
         }
     }
 
-    let fuzz_cases = 24usize;
     let seed_samples = load_samples(root, &COMPARE_SPLITS)?
         .into_iter()
         .filter(|s| s.expected_success)
