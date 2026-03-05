@@ -75,6 +75,7 @@ jobs:
           python scripts/cross_platform/run_phase_f_cross_platform.py --mode aggregate --run-id "${{ env.RUN_ID }}"
 
       - name: Upload aggregate report
+        if: ${{ always() }}
         uses: actions/upload-artifact@v4
         with:
           name: phase-f-cross-platform-summary
@@ -82,4 +83,4 @@ jobs:
             reports/cross_platform/${{ env.RUN_ID }}/summary.md
             reports/cross_platform/${{ env.RUN_ID }}/consistency.csv
             reports/cross_platform/${{ env.RUN_ID }}/inconsistent_samples.json
-          if-no-files-found: error
+          if-no-files-found: warn

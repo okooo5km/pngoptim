@@ -81,6 +81,12 @@ def main() -> int:
     tiny_img = Image.new("1", (64, 64), 0)
     tiny_img.save(tiny_skip_case, optimize=True)
 
+    # Cross-platform deterministic I/O failure:
+    # create a regular file and attempt to create output under it as if it were a directory.
+    io_parent_file = tmp_dir / "not_a_directory"
+    io_parent_file.write_text("compat-io-failure-sentinel\n", encoding="utf-8")
+    io_failure_output = io_parent_file / "child.png"
+
     # 1) Parameter coverage checks
     arg_checks: dict[str, dict] = {}
 
@@ -182,7 +188,9 @@ def main() -> int:
                 "--force",
             ]
         ),
-        "io_failure": run([str(binary), str(sample_func), "--output", "/dev/null/out.png", "--force"]),
+        "io_failure": run(
+            [str(binary), str(sample_func), "--output", str(io_failure_output), "--force"]
+        ),
     }
 
     expected_exit = {
@@ -321,7 +329,13 @@ def main() -> int:
     ]
     (run_dir / "summary.md").write_text("\n".join(summary) + "\n", encoding="utf-8")
     print(f"Compatibility run complete: {run_dir}")
-    return 0
+    exit_checks_ok = all(check["passed"] for check in exit_report["checks"].values())
+    io_checks_ok = all(
+        item["passed"]
+        for item in io_behavior.values()
+        if isinstance(item, dict) and "passed" in item
+    )
+    return 0 if exit_checks_ok and io_checks_ok else 1
 
 
 if __name__ == "__main__":

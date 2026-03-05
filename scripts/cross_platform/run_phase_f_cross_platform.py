@@ -474,6 +474,7 @@ def aggregate(args: argparse.Namespace) -> int:
     )
 
     passed = all(c["passed"] for c in checks)
+    failed_checks = [c for c in checks if not c["passed"]]
     summary = [
         "# Cross-platform Report v1",
         "",
@@ -488,9 +489,23 @@ def aggregate(args: argparse.Namespace) -> int:
         f"- `reports/cross_platform/{args.run_id}/consistency.csv`",
         f"- `reports/cross_platform/{args.run_id}/inconsistent_samples.json`",
     ]
+    if failed_checks:
+        summary.append("")
+        summary.append("Failed Checks:")
+        for c in failed_checks:
+            summary.append(
+                f"- {c['metric']}: min={c['min']}, max={c['max']}, spread={c['spread']}, threshold={c['threshold']}"
+            )
     (run_dir / "summary.md").write_text("\n".join(summary) + "\n", encoding="utf-8")
 
     print(f"Cross-platform aggregate complete: {run_dir / 'summary.md'}")
+    if failed_checks:
+        for c in failed_checks:
+            print(
+                "FAILED_CHECK\t"
+                f"{c['metric']}\tmin={c['min']}\tmax={c['max']}\tspread={c['spread']}\tthreshold={c['threshold']}",
+                file=sys.stderr,
+            )
     return 0 if passed else 1
 
 
