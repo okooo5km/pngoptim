@@ -2,7 +2,7 @@
 
 > 更新日期：2026-03-05  
 > 阶段：F（稳定性与跨平台收口）  
-> 脚本：`scripts/cross_platform/run_phase_f_cross_platform.py`
+> 编排命令：`cargo run --release --bin xtask -- cross-platform <collect|aggregate>`
 
 ## 1. 结论摘要（当前本地证据）
 
@@ -22,8 +22,8 @@ partial 聚合证据：
 1. `.github/workflows/phase-f-cross-platform.yml`
 
 流程：
-1. `collect`：`ubuntu-latest` / `macos-latest` / `windows-latest` 三平台并行执行。
-2. `aggregate`：汇总三平台 JSON，生成一致性报告并门禁失败。
+1. `collect`：`ubuntu-latest` / `macos-latest` / `windows-latest` 三平台并行执行（Rust `xtask`）。
+2. `aggregate`：汇总三平台 JSON，生成一致性报告并门禁失败（Rust `xtask`）。
 
 ## 3. 一致性判定项
 

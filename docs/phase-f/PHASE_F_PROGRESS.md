@@ -17,6 +17,8 @@
   证据：`reports/cross_platform/cross-platform-v1-20260305-f2/summary.md`
 - [x] 三平台 CI matrix 流程已落地  
   证据：`.github/workflows/phase-f-cross-platform.yml`
+- [x] Phase-F 跨平台门禁改为 Rust 原生 `xtask` 编排（去除 Python 运行时依赖）  
+  证据：`src/bin/xtask.rs`
 - [ ] 三平台一致性最终结论（待 CI 实际产出）
 
 ## F3. 发布门禁
