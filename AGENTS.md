@@ -1,6 +1,6 @@
 # PNGOptim 项目阶段记忆（AGENTS）
 
-> 最后更新：2026-03-05  
+> 最后更新：2026-03-06  
 > 依据文档：`docs/RECONSTRUCTION_MASTER_PLAN.md`、`docs/PHASE_TASKLIST.md`、`docs/EVALUATION_SPEC.md`、`docs/ACCEPTANCE_MATRIX.md`
 
 ## 1. 项目开发目的（统一认知）
@@ -78,7 +78,7 @@
 2. 三平台一致性回归（macOS/Linux/Windows）。
 3. 可复现构建与 RC 门禁落地。
 - 阶段出口：`RC Candidate` + `Stability Report v1` + `Cross-platform Report v1`
-- 当前状态：`In Progress`
+- 当前状态：`Done`
 
 ### 阶段 G：开源发布与社区协作
 - 目标：具备可持续开源协作能力。
@@ -87,7 +87,7 @@
 2. 建立贡献规范、Issue/PR 模板和回归流程。
 3. 建立长期性能回归与样本扩充机制。
 - 阶段出口：`Public Release v1`
-- 当前状态：`Blocked`
+- 当前状态：`In Progress`
 
 ## 3. 验收门禁（阶段推进依据）
 
@@ -106,8 +106,8 @@
 | C | Done | 阶段收口完成 | `docs/phase-c/PHASE_C_PROGRESS.md` |
 | D | Done | 阶段收口完成 | `docs/phase-d/PHASE_D_PROGRESS.md` |
 | E | Done | 阶段收口完成 | `docs/phase-e/PHASE_E_PROGRESS.md` |
-| F | In Progress | 三平台一致性收口 | `docs/phase-f/PHASE_F_PROGRESS.md` |
-| G | Blocked | 依赖 F 三平台收口 | `docs/phase-g/PHASE_G_PROGRESS.md` |
+| F | Done | 阶段收口完成 | `docs/phase-f/PHASE_F_PROGRESS.md` |
+| G | In Progress | 发布与协作收口 | `docs/phase-g/PHASE_G_PROGRESS.md` |
 
 ### 最近更新
 1. 2026-03-05：确认参考仓库本地路径与远程可达性，并锁定 `main` 分支 commit。
@@ -136,6 +136,7 @@
 24. 2026-03-05：新增阶段 G 预检文档（`docs/phase-g/PUBLIC_RELEASE_V1.md`），阶段 G 状态标记为 `Blocked`（等待 F 收口）。
 25. 2026-03-05：将 Phase F 跨平台 CI 编排迁移为 Rust `xtask`（`src/bin/xtask.rs`），`phase-f-cross-platform` workflow 已改为 `cargo run --bin xtask`，不再依赖 Python 运行时。
 26. 2026-03-06：将 `nightly-regression` workflow 迁移为 Rust `xtask nightly-regression`，主 CI 编排链路不再要求 Python 环境。
+27. 2026-03-06：Phase F 三平台 CI 收口完成（`phase-f-cross-platform` run `22722936354` 全绿），新增 `RC Candidate v1` 并将阶段 F 标记为 `Done`，阶段 G 由 `Blocked` 切换为 `In Progress`。
 
 ### 更新规则
 1. 每次推进必须更新对应阶段状态：`Not Started` / `In Progress` / `Blocked` / `Done`。

@@ -1,14 +1,14 @@
 # Phase G Progress
 
 > 阶段：G（开源发布与社区协作）  
-> 更新日期：2026-03-05
+> 更新日期：2026-03-06
 
 ## G1. 发布材料
 
 - [x] 发布预检文档：`docs/phase-g/PUBLIC_RELEASE_V1.md`
 - [x] 许可证导出命令：`cargo run --release --bin xtask -- release-licenses`
 - [x] 发布检查命令：`cargo run --release --bin xtask -- release-check`
-- [ ] 最终发布包（待阶段 F 收口）
+- [ ] 最终发布包（待发布窗口执行）
 
 ## G2. 社区治理
 
@@ -24,4 +24,4 @@
 
 ## 阶段结论
 
-- [ ] 阶段 G 当前状态：`Blocked`（等待阶段 F 三平台 CI 通过）
+- [ ] 阶段 G 当前状态：`In Progress`（阶段 F 已收口）
