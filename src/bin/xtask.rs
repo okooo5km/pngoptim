@@ -47,6 +47,8 @@ enum XtaskCommand {
     ReleaseLicenses(ReleaseLicensesArgs),
     #[command(name = "release-check")]
     ReleaseCheck(ReleaseCheckArgs),
+    #[command(name = "release-package")]
+    ReleasePackage(ReleasePackageArgs),
     #[command(name = "compliance")]
     Compliance(ComplianceArgs),
     #[command(name = "dataset-seed")]
@@ -192,6 +194,16 @@ struct ReleaseCheckArgs {
 }
 
 #[derive(Args)]
+struct ReleasePackageArgs {
+    #[arg(long)]
+    run_id: Option<String>,
+    #[arg(long, default_value = "target/release/pngoptim")]
+    binary: String,
+    #[arg(long, default_value_t = true)]
+    build: bool,
+}
+
+#[derive(Args)]
 struct ComplianceArgs {
     #[arg(long, default_value = "config/compliance/deny.toml")]
     config: String,
@@ -288,6 +300,13 @@ struct ConsistencyRow {
     passed: bool,
 }
 
+#[derive(Debug, Serialize)]
+struct ReleaseBundleEntry {
+    path: String,
+    size_bytes: u64,
+    sha256: String,
+}
+
 fn main() {
     let cli = XtaskCli::parse();
     let code = match run(cli) {
@@ -315,6 +334,7 @@ fn run(cli: XtaskCli) -> AppResult<i32> {
         XtaskCommand::Baseline(args) => run_baseline_command(args),
         XtaskCommand::ReleaseLicenses(args) => run_release_licenses_command(args),
         XtaskCommand::ReleaseCheck(args) => run_release_check_command(args),
+        XtaskCommand::ReleasePackage(args) => run_release_package_command(args),
         XtaskCommand::Compliance(args) => run_compliance_command(args),
         XtaskCommand::DatasetSeed(args) => run_dataset_seed_command(args),
     }
@@ -1443,8 +1463,13 @@ fn run_release_check_command(args: ReleaseCheckArgs) -> AppResult<i32> {
     fs::create_dir_all(&run_dir)?;
 
     let required_paths = vec![
+        "LICENSE",
+        "docs/phase-g/USER_GUIDE_V1.md",
+        "docs/phase-g/BENCHMARK_REPRO_V1.md",
+        "docs/phase-g/PUBLIC_RELEASE_V1.md",
         "docs/phase-f/STABILITY_REPORT_V1.md",
         "docs/phase-f/CROSS_PLATFORM_REPORT_V1.md",
+        "docs/phase-f/RC_CANDIDATE_V1.md",
         "docs/phase-e/PERF_REPORT_V1.md",
         "docs/phase-d/QUALITY_SIZE_REPORT_V1.md",
         ".github/workflows/phase-f-cross-platform.yml",
@@ -1505,6 +1530,143 @@ fn run_release_check_command(args: ReleaseCheckArgs) -> AppResult<i32> {
 
     println!("Release bundle check complete: {}", run_dir.display());
     Ok(if passed { 0 } else { 1 })
+}
+
+fn run_release_package_command(args: ReleasePackageArgs) -> AppResult<i32> {
+    let root = std::env::current_dir()?;
+    let run_id = args
+        .run_id
+        .unwrap_or_else(|| "public-release-v1-local".to_string());
+    let run_dir = root.join("reports").join("release").join(&run_id);
+    let bundle_dir = run_dir.join("public_release_v1");
+    if run_dir.exists() {
+        let _ = fs::remove_dir_all(&run_dir);
+    }
+    fs::create_dir_all(&bundle_dir)?;
+
+    if args.build {
+        let status = Command::new("cargo")
+            .current_dir(&root)
+            .arg("build")
+            .arg("--release")
+            .status()?;
+        if !status.success() {
+            return Ok(status.code().unwrap_or(1));
+        }
+    }
+
+    let binary = resolve_binary_path(&root, &args.binary);
+    if !binary.exists() {
+        eprintln!("binary not found: {}", binary.display());
+        return Ok(2);
+    }
+
+    let licenses_run_id = format!("{run_id}-licenses");
+    let release_check_run_id = format!("{run_id}-check");
+
+    let license_code = run_release_licenses_command(ReleaseLicensesArgs {
+        run_id: Some(licenses_run_id.clone()),
+    })?;
+    if license_code != 0 {
+        return Ok(license_code);
+    }
+
+    let check_code = run_release_check_command(ReleaseCheckArgs {
+        run_id: Some(release_check_run_id.clone()),
+    })?;
+    if check_code != 0 {
+        return Ok(check_code);
+    }
+
+    let binary_name = binary
+        .file_name()
+        .and_then(|v| v.to_str())
+        .unwrap_or("pngoptim")
+        .to_string();
+
+    let mut manifest = Vec::<ReleaseBundleEntry>::new();
+    manifest.push(copy_release_asset(
+        &binary,
+        &bundle_dir,
+        &format!("bin/{binary_name}"),
+    )?);
+
+    let repo_assets = vec![
+        "LICENSE",
+        "CONTRIBUTING.md",
+        "docs/phase-g/PUBLIC_RELEASE_V1.md",
+        "docs/phase-g/USER_GUIDE_V1.md",
+        "docs/phase-g/BENCHMARK_REPRO_V1.md",
+        "docs/phase-f/STABILITY_REPORT_V1.md",
+        "docs/phase-f/CROSS_PLATFORM_REPORT_V1.md",
+        "docs/phase-f/RC_CANDIDATE_V1.md",
+        "docs/phase-e/PERF_REPORT_V1.md",
+        "docs/phase-d/QUALITY_SIZE_REPORT_V1.md",
+        ".github/workflows/phase-f-cross-platform.yml",
+        ".github/workflows/nightly-regression.yml",
+        ".github/pull_request_template.md",
+        ".github/ISSUE_TEMPLATE/bug_report.yml",
+        ".github/ISSUE_TEMPLATE/compat_regression.yml",
+        ".github/ISSUE_TEMPLATE/perf_regression.yml",
+    ];
+    for rel in &repo_assets {
+        manifest.push(copy_release_asset(&root.join(rel), &bundle_dir, rel)?);
+    }
+
+    let generated_assets = vec![
+        format!("reports/release/{licenses_run_id}/third_party_licenses.csv"),
+        format!("reports/release/{licenses_run_id}/license_stats.json"),
+        format!("reports/release/{licenses_run_id}/summary.md"),
+        format!("reports/release/{release_check_run_id}/release_bundle_check.json"),
+        format!("reports/release/{release_check_run_id}/summary.md"),
+    ];
+    for rel in &generated_assets {
+        manifest.push(copy_release_asset(&root.join(rel), &bundle_dir, rel)?);
+    }
+
+    manifest.sort_by(|a, b| a.path.cmp(&b.path));
+    let file_count = manifest.len();
+    let generated_at_unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_secs();
+    let manifest_json = serde_json::to_string_pretty(&serde_json::json!({
+        "run_id": run_id,
+        "generated_at_unix": generated_at_unix,
+        "licenses_run_id": licenses_run_id,
+        "release_check_run_id": release_check_run_id,
+        "bundle_root": format!("reports/release/{}/public_release_v1", run_id),
+        "files": manifest,
+    }))?;
+    fs::write(
+        run_dir.join("bundle_manifest.json"),
+        format!("{manifest_json}\n"),
+    )?;
+    fs::write(
+        bundle_dir.join("bundle_manifest.json"),
+        format!("{manifest_json}\n"),
+    )?;
+
+    let summary = vec![
+        "# Public Release Bundle v1".to_string(),
+        String::new(),
+        format!("- run_id: `{run_id}`"),
+        format!("- binary: `bin/{binary_name}`"),
+        format!("- files: {}", file_count),
+        format!("- licenses_run_id: `{licenses_run_id}`"),
+        format!("- release_check_run_id: `{release_check_run_id}`"),
+        String::new(),
+        "Artifacts:".to_string(),
+        format!("- `reports/release/{run_id}/summary.md`"),
+        format!("- `reports/release/{run_id}/bundle_manifest.json`"),
+        format!("- `reports/release/{run_id}/public_release_v1/`"),
+    ];
+    fs::write(
+        run_dir.join("summary.md"),
+        format!("{}\n", summary.join("\n")),
+    )?;
+
+    println!("Public release bundle complete: {}", run_dir.display());
+    Ok(0)
 }
 
 fn run_compliance_command(args: ComplianceArgs) -> AppResult<i32> {
@@ -2316,6 +2478,26 @@ fn load_samples(root: &Path, splits: &[&str]) -> AppResult<Vec<Sample>> {
         }
     }
     Ok(samples)
+}
+
+fn copy_release_asset(
+    source: &Path,
+    bundle_dir: &Path,
+    relative_dest: &str,
+) -> AppResult<ReleaseBundleEntry> {
+    if !source.exists() || !source.is_file() {
+        return Err(format!("required release asset missing: {}", source.display()).into());
+    }
+    let dest = bundle_dir.join(relative_dest);
+    if let Some(parent) = dest.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::copy(source, &dest)?;
+    Ok(ReleaseBundleEntry {
+        path: relative_dest.to_string(),
+        size_bytes: fs::metadata(&dest)?.len(),
+        sha256: sha256_file(&dest)?,
+    })
 }
 
 fn run_command(

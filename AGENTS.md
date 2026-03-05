@@ -137,6 +137,7 @@
 25. 2026-03-05：将 Phase F 跨平台 CI 编排迁移为 Rust `xtask`（`src/bin/xtask.rs`），`phase-f-cross-platform` workflow 已改为 `cargo run --bin xtask`，不再依赖 Python 运行时。
 26. 2026-03-06：将 `nightly-regression` workflow 迁移为 Rust `xtask nightly-regression`，主 CI 编排链路不再要求 Python 环境。
 27. 2026-03-06：Phase F 三平台 CI 收口完成（`phase-f-cross-platform` run `22722936354` 全绿），新增 `RC Candidate v1` 并将阶段 F 标记为 `Done`，阶段 G 由 `Blocked` 切换为 `In Progress`。
+28. 2026-03-06：新增发布打包命令 `xtask release-package`，补齐 `LICENSE`、`USER_GUIDE_V1`、`BENCHMARK_REPRO_V1`，并产出发布包 `public-release-v1-20260306-g1-verify`（22 个文件，含 SHA256 清单）。
 
 ### 更新规则
 1. 每次推进必须更新对应阶段状态：`Not Started` / `In Progress` / `Blocked` / `Done`。

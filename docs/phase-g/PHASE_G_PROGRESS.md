@@ -6,9 +6,12 @@
 ## G1. 发布材料
 
 - [x] 发布预检文档：`docs/phase-g/PUBLIC_RELEASE_V1.md`
+- [x] 用户文档：`docs/phase-g/USER_GUIDE_V1.md`
+- [x] 评测复现文档：`docs/phase-g/BENCHMARK_REPRO_V1.md`
+- [x] 开源许可证声明：`LICENSE`
 - [x] 许可证导出命令：`cargo run --release --bin xtask -- release-licenses`
 - [x] 发布检查命令：`cargo run --release --bin xtask -- release-check`
-- [ ] 最终发布包（待发布窗口执行）
+- [x] 最终发布包：`reports/release/public-release-v1-20260306-g1-verify/summary.md`
 
 ## G2. 社区治理
 
