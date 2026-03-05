@@ -7,6 +7,7 @@ import argparse
 import csv
 import json
 import math
+import os
 import statistics
 import subprocess
 from pathlib import Path
@@ -34,6 +35,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--quality", default="55-75", help="Quality range.")
     parser.add_argument("--speed", default="4", help="Speed value.")
     return parser.parse_args()
+
+
+def resolve_binary_path(raw_path: str) -> Path:
+    path = Path(raw_path)
+    if path.exists():
+        return path
+    if os.name == "nt" and path.suffix.lower() != ".exe":
+        exe_path = path.with_name(path.name + ".exe")
+        if exe_path.exists():
+            return exe_path
+    return path
 
 
 def run_cmd(cmd: list[str]) -> dict:
@@ -107,7 +119,7 @@ def main() -> int:
     if args.build:
         subprocess.run(["cargo", "build"], cwd=ROOT, check=True)
 
-    candidate = Path(args.candidate)
+    candidate = resolve_binary_path(args.candidate)
     if not candidate.exists():
         print(f"candidate binary not found: {candidate}")
         return 2

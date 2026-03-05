@@ -40,7 +40,7 @@ jobs:
 
       - name: Collect platform metrics
         run: >-
-          python scripts/cross_platform/run_phase_f_cross_platform.py --mode collect --run-id "${{ env.RUN_ID }}" --platform-label "${{ runner.os }}-${{ runner.arch }}" --build
+          python scripts/cross_platform/run_phase_f_cross_platform.py --mode collect --run-id "${{ env.RUN_ID }}" --platform-label "${{ runner.os }}-${{ runner.arch }}" --binary "target/release/pngoptim${{ runner.os == 'Windows' && '.exe' || '' }}" --build
 
       - name: Upload platform artifact
         uses: actions/upload-artifact@v4

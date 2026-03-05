@@ -46,6 +46,17 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def resolve_binary_path(raw_path: str) -> Path:
+    path = Path(raw_path)
+    if path.exists():
+        return path
+    if os.name == "nt" and path.suffix.lower() != ".exe":
+        exe_path = path.with_name(path.name + ".exe")
+        if exe_path.exists():
+            return exe_path
+    return path
+
+
 def load_samples() -> list[dict]:
     samples: list[dict] = []
     for split in SPLITS:
@@ -147,7 +158,7 @@ def main() -> int:
     if args.build:
         subprocess.run(["cargo", "build", "--release"], cwd=ROOT, check=True)
 
-    candidate = Path(args.candidate)
+    candidate = resolve_binary_path(args.candidate)
     if not candidate.exists():
         print(f"candidate binary not found: {candidate}")
         return 2

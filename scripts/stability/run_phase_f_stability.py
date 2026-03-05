@@ -72,6 +72,17 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def resolve_binary_path(raw_path: str) -> Path:
+    path = Path(raw_path)
+    if path.exists():
+        return path
+    if sys.platform.startswith("win") and path.suffix.lower() != ".exe":
+        exe_path = path.with_name(path.name + ".exe")
+        if exe_path.exists():
+            return exe_path
+    return path
+
+
 def load_manifest_samples(split: str) -> list[dict]:
     manifest = DATASET / split / "manifest.json"
     if not manifest.exists():
@@ -197,7 +208,7 @@ def main() -> int:
     if args.build:
         subprocess.run(["cargo", "build", "--release"], cwd=ROOT, check=True)
 
-    binary = Path(args.binary)
+    binary = resolve_binary_path(args.binary)
     if not binary.exists():
         print(f"binary not found: {binary}", file=sys.stderr)
         return 2

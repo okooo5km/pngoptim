@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import shutil
 import subprocess
 from pathlib import Path
@@ -29,6 +30,17 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def resolve_binary_path(raw_path: str) -> Path:
+    path = Path(raw_path)
+    if path.exists():
+        return path
+    if os.name == "nt" and path.suffix.lower() != ".exe":
+        exe_path = path.with_name(path.name + ".exe")
+        if exe_path.exists():
+            return exe_path
+    return path
+
+
 def run(cmd: list[str], *, stdin_bytes: bytes | None = None) -> dict:
     proc = subprocess.run(
         cmd,
@@ -49,7 +61,7 @@ def main() -> int:
     if args.build:
         subprocess.run(["cargo", "build"], cwd=ROOT, check=True)
 
-    binary = Path(args.binary)
+    binary = resolve_binary_path(args.binary)
     if not binary.exists():
         print(f"binary not found: {binary}")
         return 2
