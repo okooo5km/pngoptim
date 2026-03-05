@@ -39,12 +39,8 @@ jobs:
           python -m pip install pillow
 
       - name: Collect platform metrics
-        run: |
-          python scripts/cross_platform/run_phase_f_cross_platform.py \
-            --mode collect \
-            --run-id "${{ env.RUN_ID }}" \
-            --platform-label "${{ runner.os }}-${{ runner.arch }}" \
-            --build
+        run: >-
+          python scripts/cross_platform/run_phase_f_cross_platform.py --mode collect --run-id "${{ env.RUN_ID }}" --platform-label "${{ runner.os }}-${{ runner.arch }}" --build
 
       - name: Upload platform artifact
         uses: actions/upload-artifact@v4
@@ -75,10 +71,8 @@ jobs:
           path: reports/cross_platform/${{ env.RUN_ID }}/platform
 
       - name: Aggregate cross-platform report
-        run: |
-          python scripts/cross_platform/run_phase_f_cross_platform.py \
-            --mode aggregate \
-            --run-id "${{ env.RUN_ID }}"
+        run: >-
+          python scripts/cross_platform/run_phase_f_cross_platform.py --mode aggregate --run-id "${{ env.RUN_ID }}"
 
       - name: Upload aggregate report
         uses: actions/upload-artifact@v4
