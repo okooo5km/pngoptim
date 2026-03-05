@@ -1,0 +1,5 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security Report
+    url: https://github.com
+    about: Please avoid disclosing security issues publicly. Use private channel first.

@@ -1,0 +1,32 @@
+[meta]
+version = "v1"
+updated_at = "2026-03-05"
+owner = "pngoptim-core"
+status = "active"
+
+# 说明：
+# 1) 每新增依赖都要新增一条 [[dependency]]
+# 2) approval_status: approved | review | denied
+# 3) copyleft_risk: none | low | medium | high
+
+[[dependency]]
+name = "clap"
+version = "4.5.60"
+source = "crates.io"
+license = "MIT OR Apache-2.0"
+spdx_ok = true
+copyleft_risk = "none"
+approval_status = "approved"
+owner = "pngoptim-core"
+notes = "CLI parsing for Phase B MVP."
+
+[[dependency]]
+name = "image"
+version = "0.25.9"
+source = "crates.io"
+license = "MIT OR Apache-2.0"
+spdx_ok = true
+copyleft_risk = "none"
+approval_status = "approved"
+owner = "pngoptim-core"
+notes = "PNG decode/encode path for Phase B MVP."

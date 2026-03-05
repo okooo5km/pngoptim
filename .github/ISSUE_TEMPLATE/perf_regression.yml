@@ -1,0 +1,50 @@
+name: Performance Regression
+description: Report perf/memory regressions with benchmark evidence.
+title: "[Perf] "
+labels: ["performance"]
+body:
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: What metric regressed?
+    validations:
+      required: true
+
+  - type: input
+    id: metric
+    attributes:
+      label: Metric
+      description: elapsed_ms_mean / elapsed_ms_p95 / rss_kb_peak ...
+      placeholder: elapsed_ms_mean
+    validations:
+      required: true
+
+  - type: textarea
+    id: baseline_vs_current
+    attributes:
+      label: Baseline vs Current
+      placeholder: |
+        baseline: 120.3
+        current: 165.4
+        delta: +37.4%
+    validations:
+      required: true
+
+  - type: textarea
+    id: commands
+    attributes:
+      label: Benchmark Commands
+      description: Include exact run commands and run_id.
+    validations:
+      required: true
+
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Evidence Paths
+      placeholder: |
+        reports/perf/...
+        reports/quality-size/...
+    validations:
+      required: true

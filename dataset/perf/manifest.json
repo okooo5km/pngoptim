@@ -1,0 +1,34 @@
+[
+  {
+    "id": "perf-001-large-gradient-noise",
+    "filename": "p_large_gradient_noise.png",
+    "resolution": "2400x1600",
+    "scene_tags": [
+      "perf",
+      "large",
+      "noise",
+      "gradient"
+    ],
+    "source": "generated-by-scripts/dataset/seed_phase_a_dataset.py",
+    "sha256": "c504839a37a40506e72421be668f25c7e232a3a674450f843291c122e128c30e",
+    "added_at": "2026-03-05",
+    "added_reason": "seed baseline perf dataset",
+    "expected_success": true
+  },
+  {
+    "id": "perf-002-large-alpha-pattern",
+    "filename": "p_large_alpha_pattern.png",
+    "resolution": "2048x2048",
+    "scene_tags": [
+      "perf",
+      "large",
+      "alpha",
+      "pattern"
+    ],
+    "source": "generated-by-scripts/dataset/seed_phase_a_dataset.py",
+    "sha256": "a5a35bfa209182dceb2755dbd556eddfea4512e56222e917a93a12271bee4505",
+    "added_at": "2026-03-05",
+    "added_reason": "seed baseline perf alpha dataset",
+    "expected_success": true
+  }
+]

@@ -1,0 +1,47 @@
+[meta]
+version = "v1"
+freeze_date = "2026-03-05"
+status = "frozen-for-phase-a"
+
+# 统一测试矩阵（先冻结，后续如需改动必须走文档变更）
+# 候选实现与 baseline 均使用同组参数进行逐样本比较。
+
+[profiles.Q_HIGH]
+label = "High quality profile"
+quality_min = 70
+quality_max = 90
+speed = 3
+dither = "fs"
+strip = "none"
+
+[profiles.Q_MED]
+label = "Balanced profile"
+quality_min = 55
+quality_max = 75
+speed = 4
+dither = "fs"
+strip = "none"
+
+[profiles.Q_LOW]
+label = "High compression profile"
+quality_min = 35
+quality_max = 55
+speed = 6
+dither = "fs"
+strip = "none"
+
+[profiles.FAST]
+label = "High speed profile"
+quality_min = 55
+quality_max = 75
+speed = 10
+dither = "fs"
+strip = "none"
+
+[profiles.NO_DITHER]
+label = "No dither special profile"
+quality_min = 55
+quality_max = 75
+speed = 4
+dither = "nofs"
+strip = "none"

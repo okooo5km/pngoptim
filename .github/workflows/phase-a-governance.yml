@@ -1,0 +1,40 @@
+name: phase-a-governance
+
+on:
+  pull_request:
+  push:
+    branches: ["main"]
+
+permissions:
+  contents: read
+
+jobs:
+  pr-template-guard:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate PR body includes required fields
+        env:
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: |
+          set -euo pipefail
+          echo "$PR_BODY" | grep -q "Phase:" || (echo "Missing 'Phase:' in PR body" && exit 1)
+          echo "$PR_BODY" | grep -q "DoD IDs:" || (echo "Missing 'DoD IDs:' in PR body" && exit 1)
+          echo "$PR_BODY" | grep -q "Report/Test paths:" || (echo "Missing 'Report/Test paths:' in PR body" && exit 1)
+
+  compliance-cargo-deny:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@cargo-deny
+
+      - name: Run compliance gate
+        run: |
+          cargo deny check --config config/compliance/deny.toml licenses advisories bans sources
+

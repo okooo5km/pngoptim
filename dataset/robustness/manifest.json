@@ -1,0 +1,32 @@
+[
+  {
+    "id": "robust-001-truncated-png",
+    "filename": "r_truncated_png.png",
+    "resolution": "n/a",
+    "scene_tags": [
+      "robustness",
+      "corrupted",
+      "truncated"
+    ],
+    "source": "generated-from-quality-001",
+    "sha256": "b3faabeddf8efbf9b1afc52f9399a10a04c90e31d1bcc5b548735c6f53f76875",
+    "added_at": "2026-03-05",
+    "added_reason": "seed corrupted input robustness set",
+    "expected_success": false
+  },
+  {
+    "id": "robust-002-garbage-png",
+    "filename": "r_garbage_png.png",
+    "resolution": "n/a",
+    "scene_tags": [
+      "robustness",
+      "corrupted",
+      "invalid-bytes"
+    ],
+    "source": "generated-by-scripts/dataset/seed_phase_a_dataset.py",
+    "sha256": "ed7ff1b0564dd09bf85d5907db90308b2735b1bda9d853050cccd5686d8e2049",
+    "added_at": "2026-03-05",
+    "added_reason": "seed invalid input robustness set",
+    "expected_success": false
+  }
+]

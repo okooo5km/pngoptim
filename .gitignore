@@ -1,0 +1,27 @@
+# Rust
+/target
+**/*.rs.bk
+
+# OS / Editor
+.DS_Store
+.idea/
+.vscode/
+
+# Python
+__pycache__/
+**/__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+
+# Environment
+.env
+.env.*
+!.env.example
+
+# Generated reports and artifacts
+/reports/*
+!/reports/.gitkeep
+!/reports/waivers/
+!/reports/waivers/.gitkeep

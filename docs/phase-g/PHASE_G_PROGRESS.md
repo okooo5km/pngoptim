@@ -1,0 +1,27 @@
+# Phase G Progress
+
+> 阶段：G（开源发布与社区协作）  
+> 更新日期：2026-03-05
+
+## G1. 发布材料
+
+- [x] 发布预检文档：`docs/phase-g/PUBLIC_RELEASE_V1.md`
+- [x] 许可证导出脚本：`scripts/release/export_third_party_licenses.py`
+- [x] 发布检查脚本：`scripts/release/validate_release_bundle.py`
+- [ ] 最终发布包（待阶段 F 收口）
+
+## G2. 社区治理
+
+- [x] 贡献规范：`CONTRIBUTING.md`
+- [x] Issue 模板：`.github/ISSUE_TEMPLATE/*`
+- [x] PR 模板：`.github/pull_request_template.md`
+
+## G3. 持续演进
+
+- [x] 夜间回归 workflow：`.github/workflows/nightly-regression.yml`
+- [x] 三平台一致性 workflow：`.github/workflows/phase-f-cross-platform.yml`
+- [ ] 长期趋势看板（待远程仓库 CI 历史积累）
+
+## 阶段结论
+
+- [ ] 阶段 G 当前状态：`Blocked`（等待阶段 F 三平台 CI 通过）

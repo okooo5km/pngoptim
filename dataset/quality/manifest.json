@@ -1,0 +1,49 @@
+[
+  {
+    "id": "quality-001-gradient-photo",
+    "filename": "q_gradient_photo_like.png",
+    "resolution": "960x540",
+    "scene_tags": [
+      "quality",
+      "photo-like",
+      "gradient",
+      "noise"
+    ],
+    "source": "generated-by-scripts/dataset/seed_phase_a_dataset.py",
+    "sha256": "27f7cb5758935d5dfb01b56ebda07d0197911afd62c5ee49b88ffaf1adef92c8",
+    "added_at": "2026-03-05",
+    "added_reason": "seed baseline quality dataset",
+    "expected_success": true
+  },
+  {
+    "id": "quality-002-ui-alpha-icon",
+    "filename": "q_ui_alpha_icon.png",
+    "resolution": "512x512",
+    "scene_tags": [
+      "quality",
+      "ui",
+      "icon",
+      "alpha-edge"
+    ],
+    "source": "generated-by-scripts/dataset/seed_phase_a_dataset.py",
+    "sha256": "c38529275975860fd85f2f780df9ae1888c4b77af86558116267aee9c828fea1",
+    "added_at": "2026-03-05",
+    "added_reason": "seed baseline alpha/UI quality dataset",
+    "expected_success": true
+  },
+  {
+    "id": "quality-003-lowcolor-blocks",
+    "filename": "q_lowcolor_blocks.png",
+    "resolution": "640x360",
+    "scene_tags": [
+      "quality",
+      "low-color",
+      "blocks"
+    ],
+    "source": "generated-by-scripts/dataset/seed_phase_a_dataset.py",
+    "sha256": "8f5760688640136b10b38c739f856b134ae407b5f339e103294c8520fcdec524",
+    "added_at": "2026-03-05",
+    "added_reason": "seed baseline low-color quality dataset",
+    "expected_success": true
+  }
+]

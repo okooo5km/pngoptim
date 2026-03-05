@@ -1,0 +1,42 @@
+name: Compatibility Regression
+description: Report CLI behavior/exit-code/I/O/metadata regressions.
+title: "[Compat] "
+labels: ["compatibility"]
+body:
+  - type: input
+    id: area
+    attributes:
+      label: Area
+      description: args / exit-code / io / metadata
+      placeholder: exit-code
+    validations:
+      required: true
+
+  - type: textarea
+    id: command
+    attributes:
+      label: Reproduction Command
+      description: Provide exact command.
+      placeholder: ./pngoptim input.png --quality 99-100 --posterize 8
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected Behavior
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual Behavior
+    validations:
+      required: true
+
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Evidence Paths
+      placeholder: reports/compat/...

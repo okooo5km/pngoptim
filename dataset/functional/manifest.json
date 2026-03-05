@@ -1,0 +1,24 @@
+[
+  {
+    "id": "functional-001-pngquant-test",
+    "filename": "pngquant_test.png",
+    "resolution": "380x287",
+    "scene_tags": ["functional", "reference-pngquant"],
+    "source": "copied-from-/Users/5km/Dev/C/pngquant/test/img/test.png",
+    "sha256": "d66fa6e9b950a730725ab0bdba36c03bb646eea7cfee8295ad6eb98b1ec460a9",
+    "added_at": "2026-03-05",
+    "added_reason": "seed functional dataset for Phase A baseline",
+    "expected_success": true
+  },
+  {
+    "id": "functional-002-pngquant-metadata",
+    "filename": "pngquant_metadata.png",
+    "resolution": "2x2",
+    "scene_tags": ["functional", "metadata", "reference-pngquant"],
+    "source": "copied-from-/Users/5km/Dev/C/pngquant/test/img/metadata.png",
+    "sha256": "7ca797e42af148dc2e76a0b6bedf83d25c83ef6086b1ce1c8406743638c31e01",
+    "added_at": "2026-03-05",
+    "added_reason": "seed functional metadata behavior tests",
+    "expected_success": true
+  }
+]
