@@ -384,7 +384,8 @@ pngquant /Users/5km/Downloads/demo.png --output /tmp/pngq-q6575-audit.png --qual
    - 之前引入的 ICC 像素转换会把这张图的唯一颜色数从 `1499` 膨胀到 `9347`
    - remap / Floyd 前没有像 `init_int_palette()` 那样先按输出精度 round palette
 3. 去掉坏的 ICC 转换、补齐“先 round 再 remap/dither”后，再把大图无 dither-map 时的 `edges` fallback 接回主线，原始带 ICC 输入上的默认抖动和半强度抖动都继续缩小，`--nofs` 保持在接近 `pngquant --nofs` 的区间。
-4. 这说明静态 PNG 主链当前剩余差距已从“基础量化完全跑偏”收敛到少量 palette 落点和大图 Floyd 细节，而不是继续在 histogram / mediancut 外层补护栏。
+4. 当前继续做 reference-first 对齐后，`demo.png` 的体积没有再明显跳变，但 palette 对比已经暴露出更具体的剩余差异：`pngoptim` 仍会给棕色/强调色多留一档颜色，而 `pngquant` 会把同一预算更多分配给中间灰阶，这正是灰色阴影台阶感的主要来源之一。
+5. 这说明静态 PNG 主链当前剩余差距已从“基础量化完全跑偏”收敛到 palette 灰阶分配和 Floyd 细节，而不是继续在 histogram / mediancut 外层补护栏。
 
 ### 10.2 本轮已修复的偏差
 
@@ -406,12 +407,13 @@ pngquant /Users/5km/Downloads/demo.png --output /tmp/pngq-q6575-audit.png --qual
 14. 将 plain remap / Floyd 的 palette 使用顺序改回与 `init_int_palette()` 一致：先按输出 posterize 精度 round palette，再做 remap/dither。
 15. 对大图默认 Floyd 补上一次 plain remap feedback，让未生成 dither-map 的路径也能拿到更接近 `remap_to_palette()` 的 full-image finalize。
 16. 保留 contrast maps 的 `edges` 图，并在大图未生成 dither-map 时退回使用 `edges` 作为选择性抖动图，而不是直接做“裸 Floyd”。
+17. histogram 在超出 `max_histogram_entries` 时会持续升级 input posterize 到 `3` bit 上限，VP-tree 的 histogram key 改为固定 `u32` identity hasher，K-Means / unused color replacement 改成 popularity-root vantage point，plain remap 的 `last_match` 也改为按行重置。
 
 ### 10.3 仍然存在的关键偏差
 
 1. 当前 plain remap / dither remap 还没有完整实现 `remap.rs::remap_to_palette()` 的 full-image K-Means finalize 结构。
 2. 当前 selective dithering 虽然已接入 core subset，但还没达到 `remap_to_palette_floyd()` 的整套 chunk warmup / background-aware / guess 策略。
-3. 默认抖动路径当前仍比 `pngquant` 默认路径大约高 `7.9KB`，说明大图 Floyd 主链已基本回到正确方向，但 palette 落点与剩余 diffusion 细节还要继续收口。
+3. 默认抖动路径当前仍比 `pngquant` 默认路径大约高 `7.9KB`，而且即便强制 `pngquant` 也只用 `18` 色，它仍然会把预算更多给中间灰而不是额外强调色，说明当前剩余差距已明确落在 palette 分配策略本身。
 4. `--quality` 路径速度已明显改善，但相对 `pngquant` 仍慢约 `2x`，说明 quantizer 内部仍有可继续收紧的预算与 finalize 开销。
 
 ## 11. 当前判断

@@ -1,5 +1,6 @@
 use std::cmp::Ordering;
 use std::collections::HashMap;
+use std::hash::{BuildHasherDefault, Hasher};
 
 use crate::quality::{
     DitherMapMode, InternalPixel, SRGB_OUTPUT_GAMMA, SpeedSettings, gamma_lut, quality_to_mse,
@@ -152,6 +153,29 @@ struct HistAccumulator {
     cluster_index: u8,
     initialized: bool,
 }
+
+#[derive(Default)]
+struct U32IdentityHasher(u32);
+
+impl Hasher for U32IdentityHasher {
+    fn finish(&self) -> u64 {
+        u64::from(self.0)
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        debug_assert!(bytes.len() <= 4);
+        let mut value = [0u8; 4];
+        value[..bytes.len()].copy_from_slice(bytes);
+        self.0 = u32::from_ne_bytes(value);
+    }
+
+    fn write_u32(&mut self, value: u32) {
+        self.0 = value;
+    }
+}
+
+type U32HashBuilder = BuildHasherDefault<U32IdentityHasher>;
+type HistMap = HashMap<u32, HistAccumulator, U32HashBuilder>;
 
 #[derive(Debug, Clone, Copy, Default)]
 struct Cluster {
@@ -388,20 +412,17 @@ fn build_histogram(
     gamma: &[f32; 256],
     importance_map: Option<&[u8]>,
 ) -> HistogramData {
-    let bits = initial_posterize_bits.min(3);
-    let map = build_histogram_map(rgba, bits, importance_map);
-    if map.len() > max_histogram_entries as usize && bits < 3 {
-        return finalize_histogram(build_histogram_map(rgba, bits + 1, importance_map), gamma);
+    let mut bits = initial_posterize_bits.min(3);
+    let mut map = build_histogram_map(rgba, bits, importance_map);
+    while map.len() > max_histogram_entries as usize && bits < 3 {
+        bits += 1;
+        map = build_histogram_map(rgba, bits, importance_map);
     }
     finalize_histogram(map, gamma)
 }
 
-fn build_histogram_map(
-    rgba: &[u8],
-    posterize_bits: u8,
-    importance_map: Option<&[u8]>,
-) -> HashMap<u32, HistAccumulator> {
-    let mut map: HashMap<u32, HistAccumulator> = HashMap::new();
+fn build_histogram_map(rgba: &[u8], posterize_bits: u8, importance_map: Option<&[u8]>) -> HistMap {
+    let mut map: HistMap = HashMap::with_hasher(U32HashBuilder::default());
     for (pixel_idx, px) in rgba.chunks_exact(4).enumerate() {
         let mut bucket_rgba = posterized_rgba(px, posterize_bits);
         let representative = [px[0], px[1], px[2], px[3]];
@@ -426,7 +447,7 @@ fn build_histogram_map(
     map
 }
 
-fn finalize_histogram(map: HashMap<u32, HistAccumulator>, gamma: &[f32; 256]) -> HistogramData {
+fn finalize_histogram(map: HistMap, gamma: &[f32; 256]) -> HistogramData {
     if map.is_empty() {
         return HistogramData::default();
     }
@@ -825,7 +846,11 @@ fn kmeans_iteration(
     adjust_weights: bool,
 ) -> PaletteStats {
     let palette_points = palette.iter().map(|entry| entry.color).collect::<Vec<_>>();
-    let tree = NearestTree::new(&palette_points);
+    let palette_popularities = palette
+        .iter()
+        .map(|entry| entry.popularity)
+        .collect::<Vec<_>>();
+    let tree = NearestTree::new_with_popularity(&palette_points, Some(&palette_popularities));
     let mut sums = vec![[0.0f64; 4]; palette.len()];
     let mut weights = vec![0.0f64; palette.len()];
     let total_weight = histogram
@@ -889,7 +914,12 @@ fn replace_unused_palette_entries(histogram: &[HistItem], palette: &mut [Palette
 
         let worst_idx = {
             let palette_points = palette.iter().map(|entry| entry.color).collect::<Vec<_>>();
-            let tree = NearestTree::new(&palette_points);
+            let palette_popularities = palette
+                .iter()
+                .map(|entry| entry.popularity)
+                .collect::<Vec<_>>();
+            let tree =
+                NearestTree::new_with_popularity(&palette_points, Some(&palette_popularities));
             let mut worst_idx = None;
             let mut worst_diff = 0.0f32;
             for (item_idx, item) in histogram.iter().enumerate() {
@@ -1039,9 +1069,13 @@ impl SearchVisitor {
 
 impl<'a> NearestTree<'a> {
     fn new(points: &'a [InternalPixel]) -> Self {
+        Self::new_with_popularity(points, None)
+    }
+
+    fn new_with_popularity(points: &'a [InternalPixel], popularities: Option<&[f32]>) -> Self {
         debug_assert!(!points.is_empty());
         let mut indexes = (0..points.len()).collect::<Vec<_>>();
-        let root = build_search_node(points, &mut indexes);
+        let root = build_search_node(points, &mut indexes, popularities);
         let mut tree = Self {
             root,
             points,
@@ -1090,7 +1124,11 @@ impl<'a> NearestTree<'a> {
     }
 }
 
-fn build_search_node(points: &[InternalPixel], indexes: &mut [usize]) -> SearchNode {
+fn build_search_node(
+    points: &[InternalPixel],
+    indexes: &mut [usize],
+    popularities: Option<&[f32]>,
+) -> SearchNode {
     debug_assert!(!indexes.is_empty());
     if indexes.len() == 1 {
         let idx = indexes[0];
@@ -1099,6 +1137,21 @@ fn build_search_node(points: &[InternalPixel], indexes: &mut [usize]) -> SearchN
             vantage_point: points[idx],
             inner: SearchNodeInner::Leaf { idxs: Box::new([]) },
         };
+    }
+
+    if let Some(popularities) = popularities {
+        if let Some((most_popular, _)) =
+            indexes
+                .iter()
+                .enumerate()
+                .max_by(|(_, left_idx), (_, right_idx)| {
+                    let left = popularities.get(**left_idx).copied().unwrap_or_default();
+                    let right = popularities.get(**right_idx).copied().unwrap_or_default();
+                    left.partial_cmp(&right).unwrap_or(Ordering::Equal)
+                })
+        {
+            indexes.swap(0, most_popular);
+        }
     }
 
     let idx = indexes[0];
@@ -1123,8 +1176,8 @@ fn build_search_node(points: &[InternalPixel], indexes: &mut [usize]) -> SearchN
         SearchNodeInner::Branch {
             radius,
             radius_squared,
-            near: Box::new(build_search_node(points, near_idx)),
-            far: Box::new(build_search_node(points, far_idx)),
+            near: Box::new(build_search_node(points, near_idx, popularities)),
+            far: Box::new(build_search_node(points, far_idx, popularities)),
         }
     };
 
@@ -1198,6 +1251,7 @@ fn remap_image(
     } else {
         remap_image_plain(
             rgba,
+            width,
             palette,
             settings.output_posterize_bits,
             importance_map,
@@ -1226,13 +1280,15 @@ fn remap_image(
 
 fn remap_image_plain(
     rgba: &[u8],
+    width: usize,
     palette: &[(InternalPixel, [u8; 4])],
     output_posterize_bits: u8,
     importance_map: Option<&[u8]>,
 ) -> (Vec<(InternalPixel, [u8; 4])>, Vec<u8>, Vec<usize>) {
     let mut palette_points = palette.iter().map(|entry| entry.0).collect::<Vec<_>>();
-    let output_palette = round_palette_for_output_in_place(&mut palette_points, output_posterize_bits);
-    let final_pass = remap_image_plain_pass(rgba, &palette_points, importance_map);
+    let output_palette =
+        round_palette_for_output_in_place(&mut palette_points, output_posterize_bits);
+    let final_pass = remap_image_plain_pass(rgba, width, &palette_points, importance_map);
 
     let remapped_palette = palette_points
         .into_iter()
@@ -1253,6 +1309,7 @@ struct PlainRemapPass {
 
 fn remap_image_plain_pass(
     rgba: &[u8],
+    width: usize,
     palette_points: &[InternalPixel],
     importance_map: Option<&[u8]>,
 ) -> PlainRemapPass {
@@ -1264,12 +1321,15 @@ fn remap_image_plain_pass(
     let mut total_error = 0.0f64;
     let mut total_pixels = 0usize;
     let tree = NearestTree::new(palette_points);
-    let mut last_idx = 0usize;
-
     for (pixel_idx, px) in rgba.chunks_exact(4).enumerate() {
+        let row_offset = pixel_idx % width;
+        let last_idx = if row_offset == 0 {
+            0usize
+        } else {
+            indices[pixel_idx - 1] as usize
+        };
         let color = InternalPixel::from_rgba(&gamma, px);
         let (idx, diff) = tree.search(color, last_idx);
-        last_idx = idx;
         counts[idx] += 1;
         total_error += f64::from(diff);
         total_pixels += 1;
@@ -1297,10 +1357,11 @@ fn remap_image_plain_pass(
 
 fn finalize_plain_remap(
     rgba: &[u8],
+    width: usize,
     palette_points: &mut [InternalPixel],
     importance_map: Option<&[u8]>,
 ) -> PlainRemapPass {
-    let feedback = remap_image_plain_pass(rgba, palette_points, importance_map);
+    let feedback = remap_image_plain_pass(rgba, width, palette_points, importance_map);
     if palette_points.len() <= 1 {
         return feedback;
     }
@@ -1358,7 +1419,12 @@ fn remap_image_dithered(
     // Align the dither path with remap-to-palette finalize: even when the dither map is
     // skipped for very large images, do one plain remap pass first so Floyd uses an
     // actual full-image palette refinement instead of the histogram-only estimate.
-    let plain_pass = Some(finalize_plain_remap(rgba, &mut palette_points, importance_map));
+    let plain_pass = Some(finalize_plain_remap(
+        rgba,
+        width,
+        &mut palette_points,
+        importance_map,
+    ));
     let output_image_is_remapped = generate_dither_map;
     let dither_map = if let Some(plain_pass) = plain_pass.as_ref() {
         if generate_dither_map {
@@ -1831,6 +1897,18 @@ mod tests {
     }
 
     #[test]
+    fn histogram_escalates_posterize_until_within_limit() {
+        let rgba = [240u8, 242, 244]
+            .into_iter()
+            .flat_map(|r| [128u8, 130].into_iter().flat_map(move |g| [r, g, 64, 255]))
+            .collect::<Vec<_>>();
+        let gamma = gamma_lut(SRGB_OUTPUT_GAMMA);
+        let histogram = super::build_histogram(&rgba, 8, 0, 4, &gamma, None);
+
+        assert!(histogram.items.len() <= 4);
+    }
+
+    #[test]
     fn palette_respects_max_colors() {
         let rgba = (0..64u8)
             .flat_map(|v| [v, 255 - v, v / 2, 255])
@@ -1845,7 +1923,7 @@ mod tests {
         let rgba = vec![255u8, 0, 0, 255, 0, 0, 255, 255];
         let gamma = gamma_lut(SRGB_OUTPUT_GAMMA);
         let mut palette_points = vec![InternalPixel::from_rgba(&gamma, &[0, 0, 0, 255])];
-        let pass = remap_image_plain_pass(&rgba, &palette_points, Some(&[255, 1]));
+        let pass = remap_image_plain_pass(&rgba, 2, &palette_points, Some(&[255, 1]));
         apply_remap_feedback(&mut palette_points, &pass);
 
         assert!(palette_points[0].r > palette_points[0].b);
@@ -1876,7 +1954,8 @@ mod tests {
             use_contrast_maps: false,
         };
 
-        let (plain_palette, _, _) = super::remap_image_plain(&rgba, &palette, 0, Some(&[255, 1]));
+        let (plain_palette, _, _) =
+            super::remap_image_plain(&rgba, 2, &palette, 0, Some(&[255, 1]));
         let (palette, indices, counts) = remap_image_dithered(
             &rgba,
             2,
@@ -1903,7 +1982,7 @@ mod tests {
             [131u8, 131, 131, 255],
         )];
 
-        let (final_palette, _, _) = remap_image_plain(&rgba, &seed, 2, None);
+        let (final_palette, _, _) = remap_image_plain(&rgba, 1, &seed, 2, None);
         assert_eq!(final_palette[0].1, [130, 130, 130, 255]);
     }
 

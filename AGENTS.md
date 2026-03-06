@@ -152,7 +152,7 @@
 2. 当前最硬的阻塞已经进一步收敛到 remap / dither 主链的剩余细节：
    - `remap.rs::remap_to_palette` 的 full-image K-Means finalize
    - `remap.rs::remap_to_palette_floyd` 的剩余视觉细节
-   - 默认无 `--quality` 路径虽然已与 `pngquant` 一样回到 `256-color / 高保真` 方向，但当前样本体积仍偏大
+   - palette 落点在灰阶 UI 样本上仍与 `pngquant` 有细微差异，当前会多保留一档棕色/强调色，少保留一档中间灰，导致默认抖动路径体积和阴影观感仍未完全对齐
 3. `src/pipeline.rs` 已不再在 `--quality` 模式下做外层色数二分，也不再在 `--quality` 模式额外跑 baseline 候选；质量约束完全收回 quantizer 内部，慢路径已明显缩短。
 4. 当前 `demo.png` spot check 的真实状态已更新为：
    - `pngoptim --quality 65-75`（默认抖动）: `144,803 bytes`, `quality_score=89`, `quality_mse=3.105`, `0.73s`
@@ -164,6 +164,12 @@
    - 当前 ICC 像素转换支路会把同一张图的唯一颜色数从 `1499` 膨胀到 `9347`
    - remap / Floyd 之前没有像 `init_int_palette()` 一样先按输出精度 round palette
    另外，大图在未生成 dither-map 时我们此前还漏掉了 `edges` fallback，导致默认 `speed=4` 比参考实现更像“裸 Floyd”。当前三点都已修正后，默认抖动和半强度抖动都继续向 `pngquant` 靠近，剩余差距已进一步收敛到少量 palette 落点与大图 Floyd 细节。
+6. 2026-03-06 本轮 reference-first 复查又补齐了几处实现口径：
+   - histogram 超限时会持续提高 input posterize，直到不超过 `3` bit 上限，而不是只提一级
+   - histogram 改用固定 `u32` identity hasher，避免标准随机 `HashMap` 顺序把 mediancut 起点带偏
+   - VP-tree 在 K-Means / unused color replacement 中按 palette popularity 选 vantage point，更接近 `nearest.rs`
+   - plain remap 按行重置 `last_match`，与 `remap.rs::remap_to_palette()` 的行级 hint 口径一致
+   这批修正对 `demo.png` 体积未产生新跳变，但清掉了真实参考偏差，后续可以把注意力继续压回 palette 分配和 Floyd 细节本身。
 
 ### 最近更新
 1. 2026-03-05：确认参考仓库本地路径与远程可达性，并锁定 `main` 分支 commit。
@@ -230,6 +236,7 @@
 62. 2026-03-06：定位到当前静态 PNG 质量回退的硬根因：`src/pipeline.rs` 中的 ICC 像素转换支路会把 `demo.png` 的唯一颜色数从 `1499` 放大到 `9347`，直接污染 histogram 与 dithering 输入。当前已移除这条坏支路，并把 indexed PNG 编码默认策略对齐到 `pngquant` 的 `PNG_FILTER_NONE + Deflate Level(9)`（`speed >= 10` 时 `Level(1)`）；回归验证 `smoke` 通过（`reports/smoke/static-icc-fix-smoke-20260306/summary.md`），`compat` 通过（`reports/compat/static-icc-fix-compat-20260306/summary.md`）。原始带 ICC 输入上，`pngoptim --quality 65-75 --nofs` 现为 `107,700 bytes`，已接近 `pngquant --nofs` 的 `104,038 bytes`。
 63. 2026-03-06：继续对齐 `init_int_palette() -> remap -> Floyd` 顺序：当前 remap/plain/Floyd 已统一改为“先按输出 posterize bits round palette，再做 remap/dither”，并让大图在未生成 dither-map 时也先执行一次 plain remap feedback，为 Floyd 提供更贴近 `remap_to_palette()` 的 full-image finalize。回归验证 `smoke` 通过（`reports/smoke/static-remap-rounding-smoke-20260306/summary.md`），`compat` 通过（`reports/compat/static-remap-rounding-compat-20260306/summary.md`）；`demo.png --quality 65-75` 继续缩到 `152,252 bytes`，`--floyd=0.5` 缩到 `139,222 bytes`。
 64. 2026-03-06：补齐 `remap_to_palette_floyd()` 的大图 fallback：当前已在 `src/palette_quant.rs` 中保留 contrast maps 的 `edges` 图，并在未生成 dither-map 时退回使用 `edges` 作为选择性抖动图，而不是直接做“裸 Floyd”；同时只在真正 `output_image_is_remapped` 时才复用 plain remap 索引做 nearest guess。回归验证 `smoke` 通过（`reports/smoke/static-dither-edge-fallback-smoke-20260306/summary.md`），`compat` 通过（`reports/compat/static-dither-edge-fallback-compat-20260306/summary.md`）；`demo.png --quality 65-75` 进一步缩到 `144,803 bytes`，`--floyd=0.5` 缩到 `133,985 bytes`。
+65. 2026-03-06：继续按参考实现清理静态 PNG 主链口径：`src/palette_quant.rs` 当前已补齐 histogram 超限时的持续 posterize 升级、固定 `u32` identity hasher、K-Means/unused color replacement 的 popularity-root VP-tree，以及 plain remap 的按行 `last_match` 重置。回归验证 `smoke` 通过（`reports/smoke/static-reference-align-smoke-20260306-r8/summary.md`），`compat` 通过（`reports/compat/static-reference-align-compat-20260306-r8/summary.md`）。这轮对 `demo.png` 的输出体积基本保持不变，说明剩余主问题已经收敛到 palette 灰阶分配和 Floyd 细节，而不是外围实现口径。
 
 ### 更新规则
 1. 每次推进必须更新对应阶段状态：`Not Started` / `In Progress` / `Blocked` / `Done`。
