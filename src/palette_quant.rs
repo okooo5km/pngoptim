@@ -1531,10 +1531,11 @@ fn remap_image_dithered(
         edges_map,
     );
     let tree = NearestTree::new(&palette_points);
-    let mut indices = vec![0u8; pixels.len()];
-    let mut counts = vec![0usize; palette.len()];
-    let mut next_errors = vec![InternalPixel::default(); width + 2];
-    let mut curr_errors = vec![InternalPixel::default(); width + 2];
+    let mut indices = plain_pass
+        .as_ref()
+        .filter(|_| output_image_is_remapped)
+        .map(|pass| pass.indices.clone())
+        .unwrap_or_else(|| vec![0u8; pixels.len()]);
     let mut base_dithering_level = (1.0 - settings.dither_level)
         .mul_add(-(1.0 - settings.dither_level), 1.0)
         * (15.0f32 / 16.0f32);
@@ -1548,69 +1549,22 @@ fn remap_image_dithered(
         .unwrap_or(quality_to_mse(80))
         .mul_add(2.4, 0.0)
         .max(quality_to_mse(35)) as f32;
-
-    for row in 0..height {
-        std::mem::swap(&mut curr_errors, &mut next_errors);
-        next_errors.fill(InternalPixel::default());
-
-        let even = row % 2 == 0;
-        let mut last_match = 0usize;
-        for offset in 0..width {
-            let x = if even { offset } else { width - 1 - offset };
-            let idx = row * width + x;
-            let mut dither_level = base_dithering_level;
-            if let Some(&level) = dither_map.get(idx) {
-                dither_level *= f32::from(level);
-            }
-
-            let color = get_dithered_pixel(
-                dither_level,
-                max_dither_error,
-                curr_errors[x + 1],
-                pixels[idx],
-            );
-
-            let plain_idx = if output_image_is_remapped {
-                plain_pass
-                    .as_ref()
-                    .map(|pass| pass.indices[idx] as usize)
-                    .unwrap_or(last_match)
-            } else {
-                last_match
-            };
-            let (pal_idx, _) = tree.search(color, plain_idx);
-            last_match = pal_idx;
-            indices[idx] = pal_idx as u8;
-            counts[pal_idx] += 1;
-
-            let out = palette_points[pal_idx];
-            let mut diff = InternalPixel {
-                a: color.a - out.a,
-                r: color.r - out.r,
-                g: color.g - out.g,
-                b: color.b - out.b,
-            };
-            if diff.r.mul_add(diff.r, diff.g * diff.g) + diff.b.mul_add(diff.b, diff.a * diff.a)
-                > max_dither_error
-            {
-                diff.a *= 0.75;
-                diff.r *= 0.75;
-                diff.g *= 0.75;
-                diff.b *= 0.75;
-            }
-
-            if even {
-                add_scaled_error(&mut curr_errors[x + 2], diff, 7.0 / 16.0);
-                add_scaled_error(&mut next_errors[x], diff, 3.0 / 16.0);
-                add_scaled_error(&mut next_errors[x + 1], diff, 5.0 / 16.0);
-                next_errors[x + 2] = scaled_error(diff, 1.0 / 16.0);
-            } else {
-                add_scaled_error(&mut curr_errors[x], diff, 7.0 / 16.0);
-                next_errors[x] = scaled_error(diff, 1.0 / 16.0);
-                add_scaled_error(&mut next_errors[x + 1], diff, 5.0 / 16.0);
-                add_scaled_error(&mut next_errors[x + 2], diff, 3.0 / 16.0);
-            }
-        }
+    remap_image_dithered_rows(
+        pixels,
+        width,
+        height,
+        &tree,
+        &palette_points,
+        &dither_map,
+        base_dithering_level,
+        max_dither_error,
+        output_image_is_remapped,
+        plain_pass.as_ref().map(|pass| pass.indices.as_slice()),
+        &mut indices,
+    );
+    let mut counts = vec![0usize; palette.len()];
+    for &idx in &indices {
+        counts[idx as usize] += 1;
     }
 
     let remapped_palette = palette_points
@@ -1620,6 +1574,174 @@ fn remap_image_dithered(
         .collect::<Vec<_>>();
 
     (remapped_palette, indices, counts)
+}
+
+fn remap_image_dithered_rows(
+    pixels: &[InternalPixel],
+    width: usize,
+    height: usize,
+    tree: &NearestTree<'_>,
+    palette_points: &[InternalPixel],
+    dither_map: &[u8],
+    base_dithering_level: f32,
+    max_dither_error: f32,
+    output_image_is_remapped: bool,
+    plain_indices: Option<&[u8]>,
+    indices: &mut [u8],
+) {
+    let num_chunks = effective_dither_chunks(width, height);
+    let chunk_height = (height + num_chunks - 1) / num_chunks;
+    indices
+        .par_chunks_mut(chunk_height.saturating_mul(width).max(width))
+        .enumerate()
+        .for_each(|(chunk_idx, chunk)| {
+            let start_row = chunk_idx * chunk_height;
+            let rows_in_chunk = chunk.len() / width;
+            if rows_in_chunk == 0 {
+                return;
+            }
+            let mut next_errors = vec![InternalPixel::default(); width + 2];
+            let mut curr_errors = vec![InternalPixel::default(); width + 2];
+            let mut discard = vec![0u8; width];
+
+            if start_row > 2 {
+                for row in (start_row - 2)..start_row {
+                    let row_pixels = &pixels[row * width..][..width];
+                    let row_map = dither_map
+                        .get(row * width..row * width + width)
+                        .unwrap_or(&[]);
+                    if output_image_is_remapped {
+                        if let Some(plain_indices) = plain_indices {
+                            discard.copy_from_slice(&plain_indices[row * width..][..width]);
+                        }
+                    } else {
+                        discard.fill(0);
+                    }
+                    dither_row(
+                        row_pixels,
+                        &mut discard,
+                        row_map,
+                        base_dithering_level,
+                        max_dither_error,
+                        tree,
+                        palette_points,
+                        output_image_is_remapped,
+                        &mut curr_errors,
+                        &mut next_errors,
+                        row % 2 == 0,
+                    );
+                }
+            }
+
+            for local_row in 0..rows_in_chunk {
+                let row = start_row + local_row;
+                let row_pixels = &pixels[row * width..][..width];
+                let row_map = dither_map
+                    .get(row * width..row * width + width)
+                    .unwrap_or(&[]);
+                let row_indices = &mut chunk[local_row * width..][..width];
+                if output_image_is_remapped {
+                    if let Some(plain_indices) = plain_indices {
+                        row_indices.copy_from_slice(&plain_indices[row * width..][..width]);
+                    }
+                }
+                dither_row(
+                    row_pixels,
+                    row_indices,
+                    row_map,
+                    base_dithering_level,
+                    max_dither_error,
+                    tree,
+                    palette_points,
+                    output_image_is_remapped,
+                    &mut curr_errors,
+                    &mut next_errors,
+                    row % 2 == 0,
+                );
+            }
+        });
+}
+
+fn effective_dither_chunks(width: usize, height: usize) -> usize {
+    if height <= 128 {
+        return 1;
+    }
+    let suggested = (width.saturating_mul(height) / 524_288)
+        .min(height / 128)
+        .max(2)
+        .min(rayon::current_num_threads());
+    suggested.max(1)
+}
+
+fn dither_row(
+    row_pixels: &[InternalPixel],
+    output_row: &mut [u8],
+    dither_map: &[u8],
+    base_dithering_level: f32,
+    max_dither_error: f32,
+    tree: &NearestTree<'_>,
+    palette_points: &[InternalPixel],
+    output_image_is_remapped: bool,
+    curr_errors: &mut Vec<InternalPixel>,
+    next_errors: &mut Vec<InternalPixel>,
+    even_row: bool,
+) {
+    std::mem::swap(curr_errors, next_errors);
+    next_errors.fill(InternalPixel::default());
+
+    let width = row_pixels.len();
+    let mut last_match = 0usize;
+    for offset in 0..width {
+        let x = if even_row { offset } else { width - 1 - offset };
+        let mut dither_level = base_dithering_level;
+        if let Some(&level) = dither_map.get(x) {
+            dither_level *= f32::from(level);
+        }
+
+        let color = get_dithered_pixel(
+            dither_level,
+            max_dither_error,
+            curr_errors[x + 1],
+            row_pixels[x],
+        );
+
+        let guessed_match = if output_image_is_remapped {
+            output_row[x] as usize
+        } else {
+            last_match
+        };
+        let (pal_idx, _) = tree.search(color, guessed_match);
+        last_match = pal_idx;
+        output_row[x] = pal_idx as u8;
+
+        let out = palette_points[pal_idx];
+        let mut diff = InternalPixel {
+            a: color.a - out.a,
+            r: color.r - out.r,
+            g: color.g - out.g,
+            b: color.b - out.b,
+        };
+        if diff.r.mul_add(diff.r, diff.g * diff.g) + diff.b.mul_add(diff.b, diff.a * diff.a)
+            > max_dither_error
+        {
+            diff.a *= 0.75;
+            diff.r *= 0.75;
+            diff.g *= 0.75;
+            diff.b *= 0.75;
+        }
+
+        if even_row {
+            add_scaled_error(&mut curr_errors[x + 2], diff, 7.0 / 16.0);
+            add_scaled_error(&mut next_errors[x], diff, 3.0 / 16.0);
+            add_scaled_error(&mut next_errors[x + 1], diff, 5.0 / 16.0);
+            next_errors[x + 2] = scaled_error(diff, 1.0 / 16.0);
+        } else {
+            add_scaled_error(&mut curr_errors[x], diff, 7.0 / 16.0);
+            next_errors[x] = scaled_error(diff, 1.0 / 16.0);
+            add_scaled_error(&mut next_errors[x + 1], diff, 5.0 / 16.0);
+            add_scaled_error(&mut next_errors[x + 2], diff, 3.0 / 16.0);
+        }
+    }
 }
 
 fn select_dither_map(

@@ -155,12 +155,12 @@
    - palette 落点在灰阶 UI 样本上仍与 `pngquant` 有细微差异，当前会多保留一档棕色/强调色，少保留一档中间灰，导致默认抖动路径体积和阴影观感仍未完全对齐
 3. `src/pipeline.rs` 已不再在 `--quality` 模式下做外层色数二分，也不再在 `--quality` 模式额外跑 baseline 候选；质量约束完全收回 quantizer 内部，慢路径已明显缩短。
 4. 当前 `demo.png` spot check 的真实状态已更新为：
-   - `pngoptim --quality 65-75`（默认抖动）: `142,017 bytes`, `quality_score=89`, `quality_mse=3.237`
-   - `pngoptim --quality 65-75 --floyd=0.5`: `133,223 bytes`, `quality_score=90`, `quality_mse=2.916`
+   - `pngoptim --quality 65-75`（默认抖动）: `142,626 bytes`, `quality_score=89`, `quality_mse=3.238`
+   - `pngoptim --quality 65-75 --floyd=0.5`: `133,638 bytes`, `quality_score=90`, `quality_mse=2.916`
    - `pngoptim --quality 65-75 --nofs`: `105,433 bytes`, `quality_score=91`, `quality_mse=2.524`
    - `pngquant --quality 65-75`: `136,915 bytes`, `0.55s`
    - `pngquant --quality 65-75 --nofs`: `104,038 bytes`, `0.45s`
-5. 2026-03-06 新一轮时间复查表明：在本机热缓存 5 次均值下，`demo.png` 上 `pngoptim --quality 65-75` 为 `0.306s`，`pngquant --quality 65-75` 为 `0.340s`；`--nofs` 下分别为 `0.246s` 和 `0.286s`。因此“当前这张样本上我们整体更慢”并不成立，真正稳定的热点仍是 quantizer 内部：本地埋点显示 `decode_ms≈65`、`quantize_ms≈160`、`encode_ms≈104`。参考实现在 `libimagequant/src/kmeans.rs`、`remap.rs` 和 `pngquant` CLI 层分别用了 Rayon / OpenMP 并行；当前 Rust 主线已补上 `kmeans` 分块并行，但 `remap/Floyd` 仍是单线程，这才是跨样本仍可能落后的结构性原因。
+5. 2026-03-06 新一轮时间复查表明：在本机热缓存 5 次均值下，`demo.png` 上 `pngoptim --quality 65-75` 为 `0.306s`，`pngquant --quality 65-75` 为 `0.340s`；`--nofs` 下分别为 `0.246s` 和 `0.286s`。因此“当前这张样本上我们整体更慢”并不成立，真正稳定的热点仍是 quantizer 内部。随后又补上了 `kmeans` 分块并行和大图 Floyd 分块并行，`demo.png --quality 65-75` 的内置 profile 现为 `decode_ms≈68`、`quantize_ms≈128`、`encode_ms≈75`。参考实现在 `libimagequant/src/kmeans.rs`、`remap.rs` 和 `pngquant` CLI 层分别用了 Rayon / OpenMP 并行；当前 Rust 主线已补上 `kmeans + 大图 Floyd` 两段，但 plain remap、dither-map 生成和 palette 质量细节仍会决定跨样本的剩余差距。
 6. 这轮确认的硬根因不是 palette search 本身，而是两处输入/输出对齐缺失：
    - 当前 ICC 像素转换支路会把同一张图的唯一颜色数从 `1499` 膨胀到 `9347`
    - remap / Floyd 之前没有像 `init_int_palette()` 一样先按输出精度 round palette
@@ -244,6 +244,7 @@
 69. 2026-03-06：继续收口 `remap_to_palette_floyd()` 的大图路径：已修复“未生成 dither-map 时丢失 `edges` fallback”的主偏差，并补上 `dither_map.or(edges)` 的回退语义；新增回归单测锁住这条路径。当前 `demo.png --quality 65-75` 进一步收敛到 `142,017 bytes`，`--floyd=0.5` 为 `133,223 bytes`，`--nofs` 维持 `105,433 bytes`。剩余主差距已进一步收敛到少量 palette 灰阶分配与 Floyd 细节。
 70. 2026-03-06：对静态 PNG 当前速度进行了分段复查，并顺手消除 plain remap 的重复 `RGBA -> InternalPixel` 转换：`src/palette_quant.rs` 现在会在已有 `contrast_pixels` 时直接复用内部像素，不再在 plain remap 中重复构造。回归验证 `smoke` 通过（`reports/smoke/remap-pixel-reuse-smoke-20260306/summary.md`），`compat` 通过（`reports/compat/remap-pixel-reuse-compat-20260306/summary.md`）。热缓存 5 次均值下，`demo.png` 上 `pngoptim --quality 65-75` 为 `0.306s`、`pngquant` 为 `0.340s`；`--nofs` 分别为 `0.246s` / `0.286s`。当前稳定热点仍在 `quantize_ms`，且参考实现的 `kmeans/remap/Floyd` 已具备 Rayon / OpenMP 并行，后续阶段 E 再次收口时应优先从量化主链并行化入手，而不是继续怀疑 decode/encode。
 71. 2026-03-06：按 `libimagequant/src/kmeans.rs` 的分块思路为 `src/palette_quant.rs::kmeans_iteration()` 接入 Rayon 并行归约，输出哈希在 `demo.png` 与 `dataset/perf/p_large_gradient_noise.png` 上与基线一致，回归验证 `smoke` 通过（`reports/smoke/kmeans-parallel-smoke-20260306/summary.md`），`compat` 通过（`reports/compat/kmeans-parallel-compat-20260306/summary.md`）。在 `dataset/perf/p_large_gradient_noise.png` 上，默认路径 3 次均值从基线 worktree 的 `1.987s` 降到当前的 `1.570s`；但 `--quality 65-75` 路径基本持平（`1.700s -> 1.707s`），说明后续性能收口仍需继续打 `remap/Floyd`，不能只停在 `kmeans`。
+72. 2026-03-06：继续按 `libimagequant/src/remap.rs` 对齐大图 Floyd：`src/palette_quant.rs` 当前已改为按图像高度分块并行执行选择性抖动，并在每个 chunk 起始前预热 2 行 diffusion 状态，避免分块缝线直接从零开始。回归验证 `smoke` 通过（`reports/smoke/floyd-chunking-smoke-20260306/summary.md`），`compat` 通过（`reports/compat/floyd-chunking-compat-20260306/summary.md`）。在 `dataset/perf/p_large_gradient_noise.png` 上，默认路径 3 次均值进一步从 `1.570s` 降到 `1.260s`；`demo.png --quality 65-75` 的内置 profile 也从约 `339ms` 收敛到 `282ms`。这一步主要改善了时间，不直接解决阴影阶梯感；剩余主差距仍在 palette 灰阶分配与 Floyd 视觉细节本身。
 
 ### 更新规则
 1. 每次推进必须更新对应阶段状态：`Not Started` / `In Progress` / `Blocked` / `Done`。
