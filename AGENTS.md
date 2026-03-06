@@ -11,6 +11,7 @@
 2. 体积、质量、性能达到统计意义等价或更优。
 3. 跨平台稳定（macOS / Linux / Windows）且可复现。
 4. 全过程以可自动化评测和报告驱动，不做无数据优化。
+5. 在核心量化算法上优先对齐 `pngquant` / `libimagequant` 的实现思路：允许编码实现不同，但 `quality`、palette search、remap、dither 的主链应一致。
 
 当前明确非目标：
 1. 不追求 bit-exact 输出。
@@ -109,6 +110,11 @@
 | F | Done | 阶段收口完成 | `docs/phase-f/PHASE_F_PROGRESS.md` |
 | G | Done | 阶段收口完成 | `docs/phase-g/PHASE_G_PROGRESS.md` |
 
+### 附加产品轨道
+| 轨道 | 状态 | 当前焦点 | 证据/报告 |
+|---|---|---|---|
+| Algorithm Replication | In Progress | 对齐 `pngquant/libimagequant` 的核心量化主链 | `docs/phase-d/ALGORITHM_REPLICATION_ANALYSIS_V1.md` |
+
 ### 最近更新
 1. 2026-03-05：确认参考仓库本地路径与远程可达性，并锁定 `main` 分支 commit。
 2. 2026-03-05：新增 `Compliance Policy v1`、依赖登记模板、参数矩阵、数据集目录骨架。
@@ -140,6 +146,7 @@
 28. 2026-03-06：新增发布打包命令 `xtask release-package`，补齐 `LICENSE`、`USER_GUIDE_V1`、`BENCHMARK_REPRO_V1`，并产出发布包 `public-release-v1-20260306-g1-verify`（22 个文件，含 SHA256 清单）。
 29. 2026-03-06：新增 `xtask ci-trends` 与 `ci-trend-dashboard` workflow，生成趋势报告 `ci-trends-v1-20260306`，阶段 G 最后一个缺口收口，状态更新为 `Done`。
 30. 2026-03-06：刷新最终发布包为 `public-release-v1-20260306-g2-verify`，将趋势看板文档与 workflow 一并纳入发布清单（24 个文件）。
+31. 2026-03-06：完成 `pngquant` / `libimagequant` 深度实现分析，确认当前实现与参考主链在 `quality` 语义、histogram、palette search、remap、dither 上存在架构级差距，新增 `docs/phase-d/ALGORITHM_REPLICATION_ANALYSIS_V1.md` 并启动 `Algorithm Replication` 附加产品轨道。
 
 ### 更新规则
 1. 每次推进必须更新对应阶段状态：`Not Started` / `In Progress` / `Blocked` / `Done`。
