@@ -1,0 +1,36 @@
+name: ci-trend-dashboard
+
+on:
+  schedule:
+    - cron: "0 3 * * 3"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  dashboard:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Generate CI trend dashboard
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          cargo run --release --bin xtask -- ci-trends --run-id "ci-trends-${{ github.run_id }}" --repo "${{ github.repository }}" --lookback 20
+
+      - name: Upload dashboard artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-trend-dashboard-${{ github.run_id }}
+          path: |
+            reports/trends/ci-trends-${{ github.run_id }}/summary.md
+            reports/trends/ci-trends-${{ github.run_id }}/workflow_runs.json
+            reports/trends/ci-trends-${{ github.run_id }}/workflow_summary.csv
+          if-no-files-found: error

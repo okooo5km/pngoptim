@@ -87,7 +87,7 @@
 2. 建立贡献规范、Issue/PR 模板和回归流程。
 3. 建立长期性能回归与样本扩充机制。
 - 阶段出口：`Public Release v1`
-- 当前状态：`In Progress`
+- 当前状态：`Done`
 
 ## 3. 验收门禁（阶段推进依据）
 
@@ -107,7 +107,7 @@
 | D | Done | 阶段收口完成 | `docs/phase-d/PHASE_D_PROGRESS.md` |
 | E | Done | 阶段收口完成 | `docs/phase-e/PHASE_E_PROGRESS.md` |
 | F | Done | 阶段收口完成 | `docs/phase-f/PHASE_F_PROGRESS.md` |
-| G | In Progress | 发布与协作收口 | `docs/phase-g/PHASE_G_PROGRESS.md` |
+| G | Done | 阶段收口完成 | `docs/phase-g/PHASE_G_PROGRESS.md` |
 
 ### 最近更新
 1. 2026-03-05：确认参考仓库本地路径与远程可达性，并锁定 `main` 分支 commit。
@@ -138,6 +138,8 @@
 26. 2026-03-06：将 `nightly-regression` workflow 迁移为 Rust `xtask nightly-regression`，主 CI 编排链路不再要求 Python 环境。
 27. 2026-03-06：Phase F 三平台 CI 收口完成（`phase-f-cross-platform` run `22722936354` 全绿），新增 `RC Candidate v1` 并将阶段 F 标记为 `Done`，阶段 G 由 `Blocked` 切换为 `In Progress`。
 28. 2026-03-06：新增发布打包命令 `xtask release-package`，补齐 `LICENSE`、`USER_GUIDE_V1`、`BENCHMARK_REPRO_V1`，并产出发布包 `public-release-v1-20260306-g1-verify`（22 个文件，含 SHA256 清单）。
+29. 2026-03-06：新增 `xtask ci-trends` 与 `ci-trend-dashboard` workflow，生成趋势报告 `ci-trends-v1-20260306`，阶段 G 最后一个缺口收口，状态更新为 `Done`。
+30. 2026-03-06：刷新最终发布包为 `public-release-v1-20260306-g2-verify`，将趋势看板文档与 workflow 一并纳入发布清单（24 个文件）。
 
 ### 更新规则
 1. 每次推进必须更新对应阶段状态：`Not Started` / `In Progress` / `Blocked` / `Done`。

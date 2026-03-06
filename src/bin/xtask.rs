@@ -49,6 +49,8 @@ enum XtaskCommand {
     ReleaseCheck(ReleaseCheckArgs),
     #[command(name = "release-package")]
     ReleasePackage(ReleasePackageArgs),
+    #[command(name = "ci-trends")]
+    CiTrends(CiTrendsArgs),
     #[command(name = "compliance")]
     Compliance(ComplianceArgs),
     #[command(name = "dataset-seed")]
@@ -204,6 +206,16 @@ struct ReleasePackageArgs {
 }
 
 #[derive(Args)]
+struct CiTrendsArgs {
+    #[arg(long)]
+    run_id: Option<String>,
+    #[arg(long)]
+    repo: Option<String>,
+    #[arg(long, default_value_t = 20)]
+    lookback: usize,
+}
+
+#[derive(Args)]
 struct ComplianceArgs {
     #[arg(long, default_value = "config/compliance/deny.toml")]
     config: String,
@@ -307,6 +319,24 @@ struct ReleaseBundleEntry {
     sha256: String,
 }
 
+#[derive(Debug, Deserialize, Serialize, Clone)]
+struct GhWorkflowRun {
+    #[serde(rename = "databaseId")]
+    database_id: u64,
+    #[serde(rename = "workflowName")]
+    workflow_name: String,
+    status: String,
+    conclusion: Option<String>,
+    #[serde(rename = "createdAt")]
+    created_at: String,
+    #[serde(rename = "updatedAt")]
+    updated_at: String,
+    #[serde(rename = "displayTitle")]
+    display_title: String,
+    #[serde(rename = "headBranch")]
+    head_branch: String,
+}
+
 fn main() {
     let cli = XtaskCli::parse();
     let code = match run(cli) {
@@ -335,6 +365,7 @@ fn run(cli: XtaskCli) -> AppResult<i32> {
         XtaskCommand::ReleaseLicenses(args) => run_release_licenses_command(args),
         XtaskCommand::ReleaseCheck(args) => run_release_check_command(args),
         XtaskCommand::ReleasePackage(args) => run_release_package_command(args),
+        XtaskCommand::CiTrends(args) => run_ci_trends_command(args),
         XtaskCommand::Compliance(args) => run_compliance_command(args),
         XtaskCommand::DatasetSeed(args) => run_dataset_seed_command(args),
     }
@@ -1466,12 +1497,14 @@ fn run_release_check_command(args: ReleaseCheckArgs) -> AppResult<i32> {
         "LICENSE",
         "docs/phase-g/USER_GUIDE_V1.md",
         "docs/phase-g/BENCHMARK_REPRO_V1.md",
+        "docs/phase-g/CI_TREND_DASHBOARD_V1.md",
         "docs/phase-g/PUBLIC_RELEASE_V1.md",
         "docs/phase-f/STABILITY_REPORT_V1.md",
         "docs/phase-f/CROSS_PLATFORM_REPORT_V1.md",
         "docs/phase-f/RC_CANDIDATE_V1.md",
         "docs/phase-e/PERF_REPORT_V1.md",
         "docs/phase-d/QUALITY_SIZE_REPORT_V1.md",
+        ".github/workflows/ci-trend-dashboard.yml",
         ".github/workflows/phase-f-cross-platform.yml",
         ".github/workflows/nightly-regression.yml",
         "src/bin/xtask.rs",
@@ -1597,11 +1630,13 @@ fn run_release_package_command(args: ReleasePackageArgs) -> AppResult<i32> {
         "docs/phase-g/PUBLIC_RELEASE_V1.md",
         "docs/phase-g/USER_GUIDE_V1.md",
         "docs/phase-g/BENCHMARK_REPRO_V1.md",
+        "docs/phase-g/CI_TREND_DASHBOARD_V1.md",
         "docs/phase-f/STABILITY_REPORT_V1.md",
         "docs/phase-f/CROSS_PLATFORM_REPORT_V1.md",
         "docs/phase-f/RC_CANDIDATE_V1.md",
         "docs/phase-e/PERF_REPORT_V1.md",
         "docs/phase-d/QUALITY_SIZE_REPORT_V1.md",
+        ".github/workflows/ci-trend-dashboard.yml",
         ".github/workflows/phase-f-cross-platform.yml",
         ".github/workflows/nightly-regression.yml",
         ".github/pull_request_template.md",
@@ -1666,6 +1701,197 @@ fn run_release_package_command(args: ReleasePackageArgs) -> AppResult<i32> {
     )?;
 
     println!("Public release bundle complete: {}", run_dir.display());
+    Ok(0)
+}
+
+fn run_ci_trends_command(args: CiTrendsArgs) -> AppResult<i32> {
+    let root = std::env::current_dir()?;
+    let run_id = args.run_id.unwrap_or_else(|| "ci-trends-local".to_string());
+    let repo = args
+        .repo
+        .or_else(|| github_repo_slug(&root))
+        .unwrap_or_else(|| "okooo5km/pngoptim".to_string());
+    let run_dir = root.join("reports").join("trends").join(&run_id);
+    fs::create_dir_all(&run_dir)?;
+
+    let gh_check = Command::new("gh").arg("--version").output();
+    match gh_check {
+        Ok(output) if output.status.success() => {}
+        _ => {
+            eprintln!("gh CLI is required for ci-trends. Install it from https://cli.github.com/");
+            return Ok(2);
+        }
+    }
+
+    let workflows = vec!["nightly-regression", "phase-f-cross-platform"];
+    let mut run_rows = Vec::<serde_json::Value>::new();
+    let mut summary_rows = Vec::<serde_json::Value>::new();
+    let mut summary_lines = vec![
+        "# CI Trend Dashboard v1".to_string(),
+        String::new(),
+        format!("- run_id: `{run_id}`"),
+        format!("- repo: `{repo}`"),
+        format!("- lookback: {}", args.lookback.max(1)),
+        String::new(),
+        "Workflow Summary:".to_string(),
+    ];
+
+    for workflow in &workflows {
+        let runs = gh_list_workflow_runs(&repo, workflow, args.lookback.max(1))?;
+        let mut success = 0usize;
+        let mut failure = 0usize;
+        let mut cancelled = 0usize;
+        let mut other = 0usize;
+        let mut latest_failure = None::<GhWorkflowRun>;
+
+        for run in &runs {
+            match run.conclusion.as_deref() {
+                Some("success") => success += 1,
+                Some("failure") => {
+                    failure += 1;
+                    if latest_failure.is_none() {
+                        latest_failure = Some(run.clone());
+                    }
+                }
+                Some("cancelled") => cancelled += 1,
+                _ => other += 1,
+            }
+            run_rows.push(serde_json::json!({
+                "workflow": workflow,
+                "run_id": run.database_id,
+                "display_title": run.display_title,
+                "status": run.status,
+                "conclusion": run.conclusion,
+                "created_at": run.created_at,
+                "updated_at": run.updated_at,
+                "head_branch": run.head_branch,
+                "url": format!("https://github.com/{repo}/actions/runs/{}", run.database_id),
+            }));
+        }
+
+        let total = runs.len();
+        let success_rate = if total == 0 {
+            0.0
+        } else {
+            success as f64 / total as f64 * 100.0
+        };
+        let last_run = runs.first().cloned();
+        summary_rows.push(serde_json::json!({
+            "workflow": workflow,
+            "total_runs": total,
+            "success": success,
+            "failure": failure,
+            "cancelled": cancelled,
+            "other": other,
+            "success_rate": success_rate,
+            "last_run_id": last_run.as_ref().map(|r| r.database_id),
+            "last_conclusion": last_run.as_ref().and_then(|r| r.conclusion.clone()),
+            "last_created_at": last_run.as_ref().map(|r| r.created_at.clone()),
+        }));
+
+        if total == 0 {
+            summary_lines.push(format!(
+                "- `{workflow}`: no runs found in the last {} records",
+                args.lookback.max(1)
+            ));
+        } else {
+            summary_lines.push(format!(
+                "- `{workflow}`: total={}, success={}, failure={}, cancelled={}, success_rate={:.1}%",
+                total, success, failure, cancelled, success_rate
+            ));
+            if let Some(run) = last_run {
+                summary_lines.push(format!(
+                    "- latest: run `{}` on branch `{}` concluded `{}` at `{}`",
+                    run.database_id,
+                    run.head_branch,
+                    run.conclusion.unwrap_or_else(|| "unknown".to_string()),
+                    run.created_at
+                ));
+            }
+            if let Some(failed_run) = latest_failure {
+                summary_lines.push(format!(
+                    "- latest_failure: run `{}` `{}`",
+                    failed_run.database_id, failed_run.display_title
+                ));
+            }
+        }
+    }
+
+    summary_lines.push(String::new());
+    summary_lines.push("Artifacts:".to_string());
+    summary_lines.push(format!("- `reports/trends/{run_id}/summary.md`"));
+    summary_lines.push(format!("- `reports/trends/{run_id}/workflow_runs.json`"));
+    summary_lines.push(format!("- `reports/trends/{run_id}/workflow_summary.csv`"));
+
+    fs::write(
+        run_dir.join("workflow_runs.json"),
+        format!("{}\n", serde_json::to_string_pretty(&run_rows)?),
+    )?;
+
+    let mut writer = Writer::from_path(run_dir.join("workflow_summary.csv"))?;
+    writer.write_record([
+        "workflow",
+        "total_runs",
+        "success",
+        "failure",
+        "cancelled",
+        "other",
+        "success_rate",
+        "last_run_id",
+        "last_conclusion",
+        "last_created_at",
+    ])?;
+    for row in &summary_rows {
+        writer.write_record([
+            row.get("workflow")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default(),
+            &row.get("total_runs")
+                .and_then(|v| v.as_u64())
+                .unwrap_or_default()
+                .to_string(),
+            &row.get("success")
+                .and_then(|v| v.as_u64())
+                .unwrap_or_default()
+                .to_string(),
+            &row.get("failure")
+                .and_then(|v| v.as_u64())
+                .unwrap_or_default()
+                .to_string(),
+            &row.get("cancelled")
+                .and_then(|v| v.as_u64())
+                .unwrap_or_default()
+                .to_string(),
+            &row.get("other")
+                .and_then(|v| v.as_u64())
+                .unwrap_or_default()
+                .to_string(),
+            &format!(
+                "{:.2}",
+                row.get("success_rate")
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or_default()
+            ),
+            &row.get("last_run_id")
+                .and_then(|v| v.as_u64())
+                .map(|v| v.to_string())
+                .unwrap_or_default(),
+            row.get("last_conclusion")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default(),
+            row.get("last_created_at")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default(),
+        ])?;
+    }
+    writer.flush()?;
+
+    fs::write(
+        run_dir.join("summary.md"),
+        format!("{}\n", summary_lines.join("\n")),
+    )?;
+
+    println!("CI trend dashboard complete: {}", run_dir.display());
     Ok(0)
 }
 
@@ -2498,6 +2724,56 @@ fn copy_release_asset(
         size_bytes: fs::metadata(&dest)?.len(),
         sha256: sha256_file(&dest)?,
     })
+}
+
+fn gh_list_workflow_runs(
+    repo: &str,
+    workflow: &str,
+    limit: usize,
+) -> AppResult<Vec<GhWorkflowRun>> {
+    let output = Command::new("gh")
+        .arg("run")
+        .arg("list")
+        .arg("--repo")
+        .arg(repo)
+        .arg("--workflow")
+        .arg(workflow)
+        .arg("--limit")
+        .arg(limit.to_string())
+        .arg("--json")
+        .arg(
+            "databaseId,workflowName,status,conclusion,createdAt,updatedAt,displayTitle,headBranch",
+        )
+        .output()?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("gh run list failed for {workflow}: {stderr}").into());
+    }
+
+    Ok(serde_json::from_slice(&output.stdout)?)
+}
+
+fn github_repo_slug(root: &Path) -> Option<String> {
+    let output = Command::new("git")
+        .current_dir(root)
+        .arg("remote")
+        .arg("get-url")
+        .arg("origin")
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+
+    let raw = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if let Some(rest) = raw.strip_prefix("git@github.com:") {
+        return Some(rest.trim_end_matches(".git").to_string());
+    }
+    if let Some(rest) = raw.strip_prefix("https://github.com/") {
+        return Some(rest.trim_end_matches(".git").to_string());
+    }
+    None
 }
 
 fn run_command(

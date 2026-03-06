@@ -11,7 +11,7 @@
 - [x] 开源许可证声明：`LICENSE`
 - [x] 许可证导出命令：`cargo run --release --bin xtask -- release-licenses`
 - [x] 发布检查命令：`cargo run --release --bin xtask -- release-check`
-- [x] 最终发布包：`reports/release/public-release-v1-20260306-g1-verify/summary.md`
+- [x] 最终发布包：`reports/release/public-release-v1-20260306-g2-verify/summary.md`
 
 ## G2. 社区治理
 
@@ -23,8 +23,8 @@
 
 - [x] 夜间回归 workflow：`.github/workflows/nightly-regression.yml`
 - [x] 三平台一致性 workflow：`.github/workflows/phase-f-cross-platform.yml`
-- [ ] 长期趋势看板（待远程仓库 CI 历史积累）
+- [x] 长期趋势看板：`reports/trends/ci-trends-v1-20260306/summary.md`
 
 ## 阶段结论
 
-- [ ] 阶段 G 当前状态：`In Progress`（阶段 F 已收口）
+- [x] 阶段 G 当前状态：`Done`
