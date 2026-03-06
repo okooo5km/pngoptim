@@ -19,7 +19,7 @@ const DEFAULT_MAX_COLORS: usize = 256;
 pub struct PipelineOptions {
     pub quality: Option<QualityRange>,
     pub speed: u8,
-    pub dither: bool,
+    pub dither_level: f32,
     pub posterize: Option<u8>,
     pub strip: bool,
     pub skip_if_larger: bool,
@@ -93,7 +93,7 @@ pub fn process_png_bytes(
         options.quality.as_ref(),
         options.posterize.unwrap_or(0),
         speed_settings,
-        options.dither,
+        options.dither_level,
     );
     let quantize_ms = t_quantize.elapsed().as_secs_f64() * 1000.0;
 
@@ -152,7 +152,6 @@ pub fn process_png_bytes(
 struct QuantizeCandidate {
     indexed: IndexedImage,
     quality: QualityMetrics,
-    estimated_output_bytes: Option<usize>,
 }
 
 fn select_palette_candidate(
@@ -162,7 +161,7 @@ fn select_palette_candidate(
     quality: Option<&QualityRange>,
     output_posterize_bits: u8,
     speed_settings: SpeedSettings,
-    dither: bool,
+    dither_level: f32,
 ) -> QuantizeCandidate {
     let target_mse = quality.map(|range| quality_to_mse(range.max));
     evaluate_candidate(
@@ -173,7 +172,7 @@ fn select_palette_candidate(
         output_posterize_bits,
         speed_settings,
         target_mse,
-        dither,
+        dither_level,
     )
 }
 
@@ -185,9 +184,9 @@ fn evaluate_candidate(
     output_posterize_bits: u8,
     speed_settings: SpeedSettings,
     target_mse: Option<f64>,
-    dither: bool,
+    dither_level: f32,
 ) -> QuantizeCandidate {
-    let mut best = evaluate_candidate_once(
+    evaluate_candidate_once(
         rgba,
         width,
         height,
@@ -195,32 +194,8 @@ fn evaluate_candidate(
         output_posterize_bits,
         speed_settings,
         target_mse,
-        false,
-    );
-
-    if dither {
-        let mut dithered = evaluate_candidate_once(
-            rgba,
-            width,
-            height,
-            max_colors,
-            output_posterize_bits,
-            speed_settings,
-            target_mse,
-            true,
-        );
-        if should_prefer_candidate(
-            &mut best,
-            &mut dithered,
-            width as u32,
-            height as u32,
-            speed_settings.raw_speed,
-        ) {
-            best = dithered;
-        }
-    }
-
-    best
+        dither_level,
+    )
 }
 
 fn evaluate_candidate_once(
@@ -231,79 +206,16 @@ fn evaluate_candidate_once(
     output_posterize_bits: u8,
     speed_settings: SpeedSettings,
     target_mse: Option<f64>,
-    dither: bool,
+    dither_level: f32,
 ) -> QuantizeCandidate {
-    let quantizer = quantizer_settings(max_colors, speed_settings, target_mse, dither);
+    let quantizer = quantizer_settings(max_colors, speed_settings, target_mse, dither_level);
     let mut indexed = quantize_indexed(rgba, width, height, quantizer);
     if output_posterize_bits > 0 {
         apply_posterize_palette(&mut indexed.palette, output_posterize_bits);
     }
     let remapped_rgba = remapped_rgba_from_indices(&indexed.indices, &indexed.palette);
     let quality = evaluate_quality_against_rgba(rgba, &remapped_rgba);
-    QuantizeCandidate {
-        indexed,
-        quality,
-        estimated_output_bytes: None,
-    }
-}
-
-fn should_prefer_candidate(
-    best: &mut QuantizeCandidate,
-    challenger: &mut QuantizeCandidate,
-    width: u32,
-    height: u32,
-    speed: u8,
-) -> bool {
-    if challenger.quality.quality_score != best.quality.quality_score {
-        return challenger.quality.quality_score > best.quality.quality_score;
-    }
-
-    let best_mse = best.quality.standard_mse;
-    let challenger_mse = challenger.quality.standard_mse;
-    let mse_tolerance = equal_score_mse_tolerance(best_mse, challenger_mse);
-
-    if challenger_mse + mse_tolerance < best_mse {
-        return true;
-    }
-
-    if (challenger_mse - best_mse).abs() <= mse_tolerance {
-        let best_size = estimate_output_bytes(best, width, height, speed);
-        let challenger_size = estimate_output_bytes(challenger, width, height, speed);
-        if challenger_size != best_size {
-            return challenger_size < best_size;
-        }
-    }
-
-    challenger_mse < best_mse
-}
-
-fn equal_score_mse_tolerance(left: f64, right: f64) -> f64 {
-    left.max(right) * 0.02 + 0.05
-}
-
-fn estimate_output_bytes(
-    candidate: &mut QuantizeCandidate,
-    width: u32,
-    height: u32,
-    speed: u8,
-) -> usize {
-    if let Some(bytes) = candidate.estimated_output_bytes {
-        return bytes;
-    }
-
-    let bytes = encode_indexed_png_to_vec(
-        width,
-        height,
-        &candidate.indexed.indices,
-        &candidate.indexed.palette,
-        None,
-        true,
-        speed,
-    )
-    .map(|png| png.len())
-    .unwrap_or(usize::MAX);
-    candidate.estimated_output_bytes = Some(bytes);
-    bytes
+    QuantizeCandidate { indexed, quality }
 }
 
 fn remapped_rgba_from_indices(indices: &[u8], palette: &[[u8; 4]]) -> Vec<u8> {
@@ -588,12 +500,9 @@ fn apply_posterize_palette(palette: &mut [[u8; 4]], bits: u8) {
 #[cfg(test)]
 mod tests {
     use super::{
-        QuantizeCandidate, apply_posterize_palette, equal_score_mse_tolerance, indexed_bit_depth,
-        pack_indices_by_bit_depth, remapped_rgba_from_indices, should_prefer_candidate,
-        skip_if_larger_max_file_size,
+        apply_posterize_palette, indexed_bit_depth, pack_indices_by_bit_depth,
+        remapped_rgba_from_indices, skip_if_larger_max_file_size,
     };
-    use crate::palette_quant::IndexedImage;
-    use crate::quality::QualityMetrics;
 
     #[test]
     fn posterize_reduces_bits() {
@@ -631,73 +540,6 @@ mod tests {
         let packed = pack_indices_by_bit_depth(&indices, 3, 2, png::BitDepth::One)
             .expect("pack 1-bit indices");
         assert_eq!(packed, vec![0b0110_0000, 0b0100_0000]);
-    }
-
-    #[test]
-    fn equal_score_prefers_smaller_candidate_when_mse_is_close() {
-        let mut best = QuantizeCandidate {
-            indexed: IndexedImage {
-                palette: vec![[0, 0, 0, 255]],
-                indices: vec![0],
-            },
-            quality: QualityMetrics {
-                internal_mse: 0.0,
-                standard_mse: 9.20,
-                quality_score: 70,
-            },
-            estimated_output_bytes: Some(328_647),
-        };
-        let mut challenger = QuantizeCandidate {
-            indexed: IndexedImage {
-                palette: vec![[0, 0, 0, 255]],
-                indices: vec![0],
-            },
-            quality: QualityMetrics {
-                internal_mse: 0.0,
-                standard_mse: 9.22,
-                quality_score: 70,
-            },
-            estimated_output_bytes: Some(328_049),
-        };
-
-        assert!(should_prefer_candidate(&mut best, &mut challenger, 1, 1, 4));
-    }
-
-    #[test]
-    fn equal_score_prefers_lower_mse_when_gap_is_large() {
-        let mut best = QuantizeCandidate {
-            indexed: IndexedImage {
-                palette: vec![[0, 0, 0, 255]],
-                indices: vec![0],
-            },
-            quality: QualityMetrics {
-                internal_mse: 0.0,
-                standard_mse: 5.0,
-                quality_score: 80,
-            },
-            estimated_output_bytes: Some(100),
-        };
-        let mut challenger = QuantizeCandidate {
-            indexed: IndexedImage {
-                palette: vec![[0, 0, 0, 255]],
-                indices: vec![0],
-            },
-            quality: QualityMetrics {
-                internal_mse: 0.0,
-                standard_mse: 5.5,
-                quality_score: 80,
-            },
-            estimated_output_bytes: Some(80),
-        };
-
-        assert!(!should_prefer_candidate(
-            &mut best,
-            &mut challenger,
-            1,
-            1,
-            4
-        ));
-        assert!(equal_score_mse_tolerance(5.0, 5.5) < 0.6);
     }
 
     #[test]

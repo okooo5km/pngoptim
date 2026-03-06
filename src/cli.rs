@@ -47,8 +47,16 @@ pub struct Cli {
     #[arg(long = "speed", default_value_t = 4, value_parser = clap::value_parser!(u8).range(1..=11))]
     pub speed: u8,
 
-    #[arg(long = "floyd", default_value_t = false, conflicts_with = "nofs")]
-    pub floyd: bool,
+    #[arg(
+        long = "floyd",
+        num_args = 0..=1,
+        default_missing_value = "1",
+        require_equals = true,
+        value_parser = parse_floyd_value,
+        conflicts_with = "nofs",
+        value_name = "N"
+    )]
+    pub floyd: Option<f32>,
 
     #[arg(long = "nofs", default_value_t = false)]
     pub nofs: bool,
@@ -117,11 +125,14 @@ impl Cli {
         Ok(())
     }
 
-    pub fn dither_enabled(&self) -> bool {
+    pub fn dither_level(&self) -> f32 {
         if SpeedSettings::from_speed(self.speed).force_disable_dither {
-            return false;
+            return 0.0;
         }
-        !self.nofs || self.floyd
+        if self.nofs {
+            return 0.0;
+        }
+        self.floyd.unwrap_or(1.0)
     }
 
     pub fn effective_speed(&self) -> u8 {
@@ -203,6 +214,17 @@ fn parse_quality_value(raw: &str, label: &str) -> Result<u8, String> {
         })
 }
 
+fn parse_floyd_value(raw: &str) -> Result<f32, String> {
+    let value = raw
+        .parse::<f32>()
+        .map_err(|_| "--floyd argument must be in 0..1 range".to_string())?;
+    if (0.0..=1.0).contains(&value) {
+        Ok(value)
+    } else {
+        Err("--floyd argument must be in 0..1 range".to_string())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{OutputTarget, parse_quality_range};
@@ -253,5 +275,19 @@ mod tests {
             cli.output_for_input("-").expect("resolve output"),
             OutputTarget::Stdout
         ));
+    }
+
+    #[test]
+    fn floyd_defaults_to_one_when_present_without_value() {
+        let cli = Cli::parse_from(["pngoptim", "in.png", "--floyd"]);
+        assert_eq!(cli.floyd, Some(1.0));
+        assert_eq!(cli.dither_level(), 1.0);
+    }
+
+    #[test]
+    fn floyd_accepts_fractional_strength() {
+        let cli = Cli::parse_from(["pngoptim", "in.png", "--floyd=0.5"]);
+        assert_eq!(cli.floyd, Some(0.5));
+        assert_eq!(cli.dither_level(), 0.5);
     }
 }

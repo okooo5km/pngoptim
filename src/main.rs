@@ -39,7 +39,7 @@ fn run(cli: Cli) -> Result<(), AppError> {
         let options = PipelineOptions {
             quality: cli.quality.clone(),
             speed: cli.effective_speed(),
-            dither: cli.dither_enabled(),
+            dither_level: cli.dither_level(),
             posterize: cli.posterize,
             strip: cli.strip,
             skip_if_larger: cli.skip_if_larger,

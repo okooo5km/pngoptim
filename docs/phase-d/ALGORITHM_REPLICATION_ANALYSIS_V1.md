@@ -372,15 +372,18 @@ pngquant /Users/5km/Downloads/demo.png --output /tmp/pngq-q6575-audit.png --qual
 | 场景 | 输出大小 | 质量结果 | 耗时 | 说明 |
 |---|---:|---:|---:|---|
 | 当前 `pngoptim` 默认 | `291,210` bytes | `quality_score=99`, `quality_mse=0.025` | `1.87s` | 与 `pngquant` 一样回到 `256-color / 高保真` 方向，但当前样本体积仍偏大 |
-| 当前 `pngoptim --quality 65-75` | `127,726` bytes | `quality_score=92`, `quality_mse=2.074` | `1.10s` | 第二轮 reference-first 修复后，质量和速度都继续收敛 |
+| 当前 `pngoptim --quality 65-75` | `158,492` bytes | `quality_score=91`, `quality_mse=2.551` | `参考样本 spot check` | 默认抖动语义已回到参考方向，不再与 `--nofs` 等价 |
+| 当前 `pngoptim --quality 65-75 --floyd=0.5` | `149,967` bytes | `quality_score=92`, `quality_mse=2.296` | `参考样本 spot check` | 抖动强度链路已生效，可做中间档折中 |
+| 当前 `pngoptim --quality 65-75 --nofs` | `127,726` bytes | `quality_score=92`, `quality_mse=2.074` | `1.10s` | 无抖动路径仍更小，但不再代表默认语义 |
 | `pngquant --quality 65-75` | `136,915` bytes | `MSE=5.210 (Q=82)` | `0.40s` | 参考实现，`19` 色 |
 | `pngquant` 默认 | `249KB` | `MSE=0.021 (Q=100)` | `0.40s` | 默认同样是 `256-color / 高保真` 路径 |
 
 补充观测：
 
-1. `--quality 65-75` 路径在第二轮修复后已经不再依赖“baseline + targeted”双候选，单图耗时从上一轮的 `2.22s` / `2.38s` 降到约 `1.10s`。
-2. 当前默认路径虽然仍偏大，但至少在方向上已与 `pngquant` 对齐为 `256-color / 高保真`，因此不该再被当成“完全错误语义”处理。
-3. 你前面看到的阴影阶梯问题，剩余根因已经更集中到 `remap_to_palette` finalize 和 `dither_row` 视觉细节，而不是继续在 histogram / mediancut 外层补护栏。
+1. `--quality 65-75` 路径在第二轮修复后已经不再依赖“baseline + targeted”双候选，慢路径已明显缩短。
+2. 默认抖动、半强度抖动和 `--nofs` 现在会产出三份不同结果，说明之前“开了抖动也等于没开”的语义偏差已经修掉。
+3. 当前默认路径虽然仍偏大，但至少在方向上已与 `pngquant` 对齐为 `256-color / 高保真`，因此不该再被当成“完全错误语义”处理。
+4. 你前面看到的阴影阶梯问题，剩余根因已经更集中到 `remap_to_palette` finalize 和 `dither_row` 视觉细节，而不是继续在 histogram / mediancut 外层补护栏。
 
 ### 10.2 本轮已修复的偏差
 
@@ -391,7 +394,10 @@ pngquant /Users/5km/Downloads/demo.png --output /tmp/pngq-q6575-audit.png --qual
 5. 将 `find_best_palette()` 的 trial 失败惩罚、`kmeans adjust_weight` 公式和 unused color replacement 进一步对齐到 `libimagequant/src/quant.rs` / `kmeans.rs`。
 6. 让 plain remap 的 `palette_error` 真正进入 dithering 的误差阈值决策。
 7. 去掉 `--quality` 模式额外跑 baseline 候选的自定义比较，质量请求现在只走目标约束候选。
-8. 对齐了 `hist.rs + mediancut.rs` 的两类关键细节：
+8. 去掉 `src/pipeline.rs` 中 plain/dither 候选赛马，改回“用户开了抖动就走抖动”的参考语义。
+9. 去掉 `src/palette_quant.rs` 中 remap 前按 8-bit RGBA 提前去重的错误收缩，保留内部 float palette 到 remap 完成后再自然收缩。
+10. 补齐 `--floyd` 的 `0..1` 强度参数，允许 `--floyd=0.5` 这类中间档，默认 `--floyd` 仍为 `1`。
+11. 对齐了 `hist.rs + mediancut.rs` 的两类关键细节：
    - histogram 不再做桶内平均色，改为“代表色 + perceptual weight + 16 cluster 起始箱”
    - mediancut 改为带 `total_box_error_below_target()` / `max_mse_per_color` / best-box split 的误差约束切分
 

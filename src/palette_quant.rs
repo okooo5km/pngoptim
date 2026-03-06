@@ -21,6 +21,7 @@ pub struct QuantizerSettings {
     pub feedback_loop_trials: u16,
     pub target_mse: Option<f64>,
     pub dither: bool,
+    pub dither_level: f32,
     pub use_dither_map: DitherMapMode,
     pub use_contrast_maps: bool,
 }
@@ -71,7 +72,10 @@ pub fn quantize_indexed(
         palette = vec![InternalPixel::default()];
     }
 
-    let final_palette = dedup_palette(&palette);
+    let final_palette = palette
+        .iter()
+        .map(|&color| (color, color.to_rgba(SRGB_OUTPUT_GAMMA)))
+        .collect::<Vec<_>>();
     remap_image(
         rgba,
         width,
@@ -87,7 +91,7 @@ pub fn quantizer_settings(
     max_colors: usize,
     speed: SpeedSettings,
     target_mse: Option<f64>,
-    dither: bool,
+    dither_level: f32,
 ) -> QuantizerSettings {
     QuantizerSettings {
         max_colors,
@@ -97,7 +101,8 @@ pub fn quantizer_settings(
         kmeans_iteration_limit: speed.kmeans_iteration_limit,
         feedback_loop_trials: speed.feedback_loop_trials,
         target_mse,
-        dither,
+        dither: dither_level > 0.0 && !speed.force_disable_dither,
+        dither_level,
         use_dither_map: speed.use_dither_map,
         use_contrast_maps: speed.use_contrast_maps,
     }
@@ -981,20 +986,6 @@ fn search_node(
     }
 }
 
-fn dedup_palette(palette: &[InternalPixel]) -> Vec<(InternalPixel, [u8; 4])> {
-    let mut out = Vec::new();
-    for &color in palette {
-        let rgba = color.to_rgba(SRGB_OUTPUT_GAMMA);
-        if out.iter().all(|(_, existing)| *existing != rgba) {
-            out.push((color, rgba));
-        }
-    }
-    if out.is_empty() {
-        out.push((InternalPixel::default(), [0, 0, 0, 0]));
-    }
-    out
-}
-
 fn remap_image(
     rgba: &[u8],
     width: usize,
@@ -1181,7 +1172,9 @@ fn remap_image_dithered(
     let mut counts = vec![0usize; palette.len()];
     let mut next_errors = vec![InternalPixel::default(); width + 2];
     let mut curr_errors = vec![InternalPixel::default(); width + 2];
-    let mut base_dithering_level = 15.0f32 / 16.0f32;
+    let mut base_dithering_level = (1.0 - settings.dither_level)
+        .mul_add(-(1.0 - settings.dither_level), 1.0)
+        * (15.0f32 / 16.0f32);
     if !dither_map.is_empty() {
         base_dithering_level *= 1.0 / 255.0;
     }
@@ -1590,7 +1583,7 @@ mod tests {
             255u8, 0, 0, 255, 250, 0, 0, 255, 0, 255, 0, 255, 0, 250, 0, 255, 0, 0, 255, 255, 0, 0,
             250, 255,
         ];
-        let settings = quantizer_settings(16, SpeedSettings::from_speed(4), None, false);
+        let settings = quantizer_settings(16, SpeedSettings::from_speed(4), None, 0.0);
         let out = quantize_indexed(&rgba, 3, 2, settings);
         assert_eq!(out.indices.len(), 6);
         assert!(!out.palette.is_empty());
@@ -1601,12 +1594,12 @@ mod tests {
         let rgba = vec![
             255u8, 0, 0, 255, 254, 1, 0, 255, 253, 2, 0, 255, 252, 3, 0, 255,
         ];
-        let mut direct_settings = quantizer_settings(16, SpeedSettings::from_speed(4), None, false);
+        let mut direct_settings = quantizer_settings(16, SpeedSettings::from_speed(4), None, 0.0);
         direct_settings.input_posterize_bits = 0;
         let direct = quantize_indexed(&rgba, 2, 2, direct_settings);
 
         let mut posterized_settings =
-            quantizer_settings(16, SpeedSettings::from_speed(4), None, false);
+            quantizer_settings(16, SpeedSettings::from_speed(4), None, 0.0);
         posterized_settings.input_posterize_bits = 2;
         let posterized = quantize_indexed(&rgba, 2, 2, posterized_settings);
 
@@ -1618,7 +1611,7 @@ mod tests {
         let rgba = (0..64u8)
             .flat_map(|v| [v, 255 - v, v / 2, 255])
             .collect::<Vec<_>>();
-        let settings = quantizer_settings(4, SpeedSettings::from_speed(4), None, false);
+        let settings = quantizer_settings(4, SpeedSettings::from_speed(4), None, 0.0);
         let out = quantize_indexed(&rgba, 8, 8, settings);
         assert!(out.palette.len() <= 4);
     }
@@ -1651,6 +1644,7 @@ mod tests {
             feedback_loop_trials: 1,
             target_mse: None,
             dither: true,
+            dither_level: 1.0,
             use_dither_map: DitherMapMode::None,
             use_contrast_maps: false,
         };
