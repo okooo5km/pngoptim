@@ -131,15 +131,15 @@
 | RF-2 | Partially Done | `quant.rs` + `mediancut.rs` + `kmeans.rs` | 对齐 feedback loop、palette search、unused color replacement | 已有骨架，但误差约束收缩仍不稳定 |
 | RF-3 | Done | `nearest.rs` | 对齐 VP-tree nearest、likely-index、剪枝逻辑 | 已完成，性能回退已大幅收回 |
 | RF-4 | Partially Done | `remap.rs::remap_to_palette` | 对齐 remap 阶段 palette 统计回灌、background/importance 处理 | plain remap 反馈已接入，background/importance 与误差口径仍缺 |
-| RF-5 | Pending | `remap.rs::dither_map` + `remap_to_palette_floyd` | 对齐 dither map、selective Floyd、background-aware 分支 | 当前未实现 |
+| RF-5 | Partially Done | `remap.rs::dither_map` + `remap_to_palette_floyd` | 对齐 dither map、selective Floyd、background-aware 分支 | core subset 已接入，background-aware 与质量收益仍不足 |
 | RF-6 | Pending | `pngquant.c` + `quant.rs` | 对齐 `skip-if-larger` 启发式和 remap 后质量决策 | 当前仍是粗糙版 |
 | RF-7 | Pending | 全链路 | 重跑 quality/perf/stability/release 门禁，形成新基线 | 在 RF-4/5 完成后执行 |
 
 ### 当前硬阻塞与下一步
 1. 当前主线已把 `demo.png` 的默认输出质量从 `quality_score=45` 提升到 `56`，最近一次 RF-4 spot check 为 `quality_mse=14.463`, `131912 bytes`；但在 `--quality 65-75` 下仍只有 `actual=57`，尚未满足最低质量门槛。
-2. naive 全图 Floyd 已被证明方向错误：会放大输出并拉低质量，后续必须实现 `dither map + selective dithering`，不能把全图误差扩散当作 pngquant 等价物。
+2. naive 全图 Floyd 已被证明方向错误：会放大输出并拉低质量；当前已接入 `dither map + selective Floyd` 的核心子集，但 `demo.png` 默认输出仍约 `131920 bytes`、`quality_score=56`，说明 background-aware 分支与更完整的 dither 决策仍然缺失。
 3. `Nearest` 结构已按 `libimagequant/src/nearest.rs` 的 VP-tree 思路接入主线，原先的 perf 大回退已显著收回；当前主要缺口重新回到质量与 remap/dither 主链，而不是 nearest search。
-4. 当前最合理的执行顺序已经调整为：`RF-5 dither map + selective Floyd` -> `RF-4 background/importance/remap error 收口` -> `RF-6 skip-if-larger / 质量决策对齐` -> `RF-7 全门禁回归`。
+4. 当前最合理的执行顺序已经调整为：`RF-5 background-aware / dither decision 收口` -> `RF-4 background/importance/remap error 收口` -> `RF-6 skip-if-larger / 质量决策对齐` -> `RF-7 全门禁回归`。
 
 ### 最近更新
 1. 2026-03-05：确认参考仓库本地路径与远程可达性，并锁定 `main` 分支 commit。
@@ -186,6 +186,7 @@
 42. 2026-03-06：`Nearest` 对齐后，perf 样本显著恢复：`perf-001-large-gradient-noise` 从 `35490.128 ms` 降到 `5085.685 ms`，`perf-002-large-alpha-pattern` 从 `104049.867 ms` 降到 `11901.303 ms`；`demo.png` 质量保持在 `quality_score=56/57`，说明下一步瓶颈已转移到 `remap.rs` / selective dithering。
 43. 2026-03-06：对算法复刻轨道重新规划，废弃过粗的 `R1/R2/R3` 执行粒度，改为 `RF-1 .. RF-7` 的 reference-first 模块计划；后续不再按“先写近似实现再逐步修正”的方式推进。
 44. 2026-03-06：完成 RF-4 第一段 `remap_to_palette` 对齐：plain remap 已改为真实像素统计回灌 + 最终 remap 两段式收敛，`compat` 通过（`reports/compat/rf4-compat-verify/summary.md`），`smoke` 通过（`reports/smoke/rf4-smoke-verify/summary.md`）；但 `demo.png` 仅提升到 `quality_mse=14.463`, `131912 bytes`，`--quality 65-75` 仍失败（`actual=57`），说明下一主攻点已转到 `RF-5 selective dithering`。
+45. 2026-03-06：完成 RF-5 核心子集：按 `image.rs` / `remap.rs` 思路接入 contrast-map 驱动的 selective Floyd、serpentine 扫描、`max_dither_error` 限制和 remapped guess；`compat` 通过（`reports/compat/rf5-compat-verify/summary.md`），`smoke` 通过（`reports/smoke/rf5-smoke-verify/summary.md`），perf 样本为 `5886.829 ms` / `15419.006 ms`。但 `demo.png` 默认输出仍为约 `131920 bytes`, `quality_score=56`，`--quality 65-75` 仍失败（`actual=57`），说明 RF-5 仍需继续补 background-aware 分支和更完整的 dither 决策。
 
 ### 更新规则
 1. 每次推进必须更新对应阶段状态：`Not Started` / `In Progress` / `Blocked` / `Done`。

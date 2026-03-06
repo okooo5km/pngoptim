@@ -1,7 +1,9 @@
 use std::cmp::Ordering;
 use std::collections::HashMap;
 
-use crate::quality::{InternalPixel, SRGB_OUTPUT_GAMMA, SpeedSettings, gamma_lut};
+use crate::quality::{
+    DitherMapMode, InternalPixel, SRGB_OUTPUT_GAMMA, SpeedSettings, gamma_lut, quality_to_mse,
+};
 
 #[derive(Debug, Clone)]
 pub struct IndexedImage {
@@ -18,6 +20,7 @@ pub struct QuantizerSettings {
     pub feedback_loop_trials: u16,
     pub target_mse: Option<f64>,
     pub dither: bool,
+    pub use_dither_map: DitherMapMode,
 }
 
 pub fn quantize_indexed(
@@ -51,14 +54,7 @@ pub fn quantize_indexed(
     }
 
     let final_palette = dedup_palette(&palette);
-    remap_image(
-        rgba,
-        width,
-        height,
-        &final_palette,
-        settings.input_posterize_bits,
-        settings.dither,
-    )
+    remap_image(rgba, width, height, &final_palette, settings)
 }
 
 pub fn max_colors_from_quality_speed(quality_target: u8, speed: u8) -> usize {
@@ -83,6 +79,7 @@ pub fn quantizer_settings(
         feedback_loop_trials: speed.feedback_loop_trials,
         target_mse,
         dither,
+        use_dither_map: speed.use_dither_map,
     }
 }
 
@@ -793,14 +790,13 @@ fn remap_image(
     width: usize,
     height: usize,
     palette: &[(InternalPixel, [u8; 4])],
-    input_posterize_bits: u8,
-    dither: bool,
+    settings: QuantizerSettings,
 ) -> IndexedImage {
-    let (palette, mut indices, counts) = if dither {
-        let (indices, counts) = remap_image_dithered(rgba, width, height, palette);
+    let (palette, mut indices, counts) = if settings.dither {
+        let (indices, counts) = remap_image_dithered(rgba, width, height, palette, settings);
         (palette.to_vec(), indices, counts)
     } else {
-        remap_image_plain(rgba, palette, input_posterize_bits)
+        remap_image_plain(rgba, palette, settings.input_posterize_bits)
     };
 
     let mut order = (0..palette.len())
@@ -919,6 +915,7 @@ fn remap_image_dithered(
     width: usize,
     height: usize,
     palette: &[(InternalPixel, [u8; 4])],
+    settings: QuantizerSettings,
 ) -> (Vec<u8>, Vec<usize>) {
     let gamma = gamma_lut(SRGB_OUTPUT_GAMMA);
     let palette_points = palette.iter().map(|entry| entry.0).collect::<Vec<_>>();
@@ -927,10 +924,25 @@ fn remap_image_dithered(
         .chunks_exact(4)
         .map(|px| InternalPixel::from_rgba(&gamma, px))
         .collect::<Vec<_>>();
+    let plain_pass = remap_image_plain_pass(rgba, &palette_points);
+    let dither_map = if settings.use_dither_map != DitherMapMode::None {
+        build_dither_map(&pixels, width, height, &plain_pass.indices, &palette_points)
+    } else {
+        Vec::new()
+    };
     let mut indices = vec![0u8; pixels.len()];
     let mut counts = vec![0usize; palette.len()];
     let mut next_errors = vec![InternalPixel::default(); width + 2];
     let mut curr_errors = vec![InternalPixel::default(); width + 2];
+    let mut base_dithering_level = 15.0f32 / 16.0f32;
+    if !dither_map.is_empty() {
+        base_dithering_level *= 1.0 / 255.0;
+    }
+    let max_dither_error = settings
+        .target_mse
+        .unwrap_or_else(|| quality_to_mse(80))
+        .mul_add(2.4, 0.0)
+        .max(quality_to_mse(35)) as f32;
 
     for row in 0..height {
         std::mem::swap(&mut curr_errors, &mut next_errors);
@@ -941,25 +953,43 @@ fn remap_image_dithered(
         for offset in 0..width {
             let x = if even { offset } else { width - 1 - offset };
             let idx = row * width + x;
-            let mut color = pixels[idx];
-            let err = curr_errors[x + 1];
-            color.a = (color.a + err.a).clamp(0.0, 1.0);
-            color.r = (color.r + err.r).clamp(0.0, 1.1);
-            color.g = (color.g + err.g).clamp(0.0, 1.1);
-            color.b = (color.b + err.b).clamp(0.0, 1.1);
+            let mut dither_level = base_dithering_level;
+            if let Some(&level) = dither_map.get(idx) {
+                dither_level *= f32::from(level);
+            }
 
-            let pal_idx = tree.search(color, last_match).0;
+            let color = get_dithered_pixel(
+                dither_level,
+                max_dither_error,
+                curr_errors[x + 1],
+                pixels[idx],
+            );
+
+            let guess = if !dither_map.is_empty() {
+                plain_pass.indices[idx] as usize
+            } else {
+                last_match
+            };
+            let (pal_idx, _) = tree.search(color, guess);
             last_match = pal_idx;
             indices[idx] = pal_idx as u8;
             counts[pal_idx] += 1;
 
             let out = palette[pal_idx].0;
-            let diff = InternalPixel {
+            let mut diff = InternalPixel {
                 a: color.a - out.a,
                 r: color.r - out.r,
                 g: color.g - out.g,
                 b: color.b - out.b,
             };
+            if diff.r.mul_add(diff.r, diff.g * diff.g) + diff.b.mul_add(diff.b, diff.a * diff.a)
+                > max_dither_error
+            {
+                diff.a *= 0.75;
+                diff.r *= 0.75;
+                diff.g *= 0.75;
+                diff.b *= 0.75;
+            }
 
             if even {
                 add_scaled_error(&mut curr_errors[x + 2], diff, 7.0 / 16.0);
@@ -976,6 +1006,244 @@ fn remap_image_dithered(
     }
 
     (indices, counts)
+}
+
+fn get_dithered_pixel(
+    dither_level: f32,
+    max_dither_error: f32,
+    err: InternalPixel,
+    px: InternalPixel,
+) -> InternalPixel {
+    let scaled = InternalPixel {
+        a: err.a * dither_level,
+        r: err.r * dither_level,
+        g: err.g * dither_level,
+        b: err.b * dither_level,
+    };
+    let dither_error = scaled.r.mul_add(scaled.r, scaled.g * scaled.g)
+        + scaled.b.mul_add(scaled.b, scaled.a * scaled.a);
+    if dither_error < 2.0 / 256.0 / 256.0 {
+        return px;
+    }
+
+    let mut ratio = 1.0f32;
+    const MAX_OVERFLOW: f32 = 1.1;
+    const MAX_UNDERFLOW: f32 = -0.1;
+    ratio = clamp_dither_ratio(px.r, scaled.r, ratio, MAX_OVERFLOW, MAX_UNDERFLOW);
+    ratio = clamp_dither_ratio(px.g, scaled.g, ratio, MAX_OVERFLOW, MAX_UNDERFLOW);
+    ratio = clamp_dither_ratio(px.b, scaled.b, ratio, MAX_OVERFLOW, MAX_UNDERFLOW);
+    if dither_error > max_dither_error {
+        ratio *= 0.8;
+    }
+
+    InternalPixel {
+        a: (px.a + scaled.a).clamp(0.0, 1.0),
+        r: scaled.r.mul_add(ratio, px.r),
+        g: scaled.g.mul_add(ratio, px.g),
+        b: scaled.b.mul_add(ratio, px.b),
+    }
+}
+
+fn clamp_dither_ratio(
+    value: f32,
+    delta: f32,
+    current_ratio: f32,
+    max_overflow: f32,
+    max_underflow: f32,
+) -> f32 {
+    if delta == 0.0 {
+        return current_ratio;
+    }
+    if value + delta > max_overflow {
+        current_ratio.min((max_overflow - value) / delta)
+    } else if value + delta < max_underflow {
+        current_ratio.min((max_underflow - value) / delta)
+    } else {
+        current_ratio
+    }
+}
+
+fn build_dither_map(
+    pixels: &[InternalPixel],
+    width: usize,
+    height: usize,
+    remapped_indices: &[u8],
+    palette: &[InternalPixel],
+) -> Vec<u8> {
+    if width < 4 || height < 4 || pixels.len() != width.saturating_mul(height) {
+        return Vec::new();
+    }
+
+    let (noise, mut edges) = compute_contrast_maps(pixels, width, height);
+    if edges.is_empty() {
+        return edges;
+    }
+
+    for row in 0..height {
+        let row_start = row * width;
+        let row_pixels = &remapped_indices[row_start..row_start + width];
+        let mut last_pixel = row_pixels[0];
+        let mut last_col = 0usize;
+
+        for col in 1..width {
+            let px = row_pixels[col];
+            let transparent = palette[px as usize].a <= (1.0 / 255.0 * 0.625) as f32;
+            if transparent {
+                continue;
+            }
+            if px != last_pixel || col == width - 1 {
+                let mut neighbor_count = 10usize * (col - last_col);
+                for i in last_col..col {
+                    if row > 0 && remapped_indices[(row - 1) * width + i] == last_pixel {
+                        neighbor_count += 15;
+                    }
+                    if row + 1 < height && remapped_indices[(row + 1) * width + i] == last_pixel {
+                        neighbor_count += 15;
+                    }
+                }
+
+                for i in last_col..=col {
+                    let edge = edges[row_start + i];
+                    let adjusted = (f32::from(u16::from(edge) + 128)
+                        * (255.0 / (255.0 + 128.0))
+                        * (1.0 - 20.0 / (20.0 + neighbor_count as f32)))
+                        as u8;
+                    edges[row_start + i] = adjusted.min(noise[row_start + i]);
+                }
+
+                last_col = col;
+                last_pixel = px;
+            }
+        }
+    }
+
+    edges
+}
+
+fn compute_contrast_maps(
+    pixels: &[InternalPixel],
+    width: usize,
+    height: usize,
+) -> (Vec<u8>, Vec<u8>) {
+    let mut noise = vec![0u8; width * height];
+    let mut edges = vec![0u8; width * height];
+
+    for row in 0..height {
+        let prev_row = row.saturating_sub(1);
+        let next_row = (row + 1).min(height - 1);
+        for col in 0..width {
+            let prev = pixels[row * width + col.saturating_sub(1)];
+            let curr = pixels[row * width + col];
+            let next = pixels[row * width + (col + 1).min(width - 1)];
+            let prev_line = pixels[prev_row * width + col];
+            let next_line = pixels[next_row * width + col];
+
+            let horiz = InternalPixel {
+                a: (prev.a + next.a - curr.a * 2.0).abs(),
+                r: (prev.r + next.r - curr.r * 2.0).abs(),
+                g: (prev.g + next.g - curr.g * 2.0).abs(),
+                b: (prev.b + next.b - curr.b * 2.0).abs(),
+            };
+            let vert = InternalPixel {
+                a: (prev_line.a + next_line.a - curr.a * 2.0).abs(),
+                r: (prev_line.r + next_line.r - curr.r * 2.0).abs(),
+                g: (prev_line.g + next_line.g - curr.g * 2.0).abs(),
+                b: (prev_line.b + next_line.b - curr.b * 2.0).abs(),
+            };
+
+            let horiz_max = horiz.a.max(horiz.r).max(horiz.g.max(horiz.b));
+            let vert_max = vert.a.max(vert.r).max(vert.g.max(vert.b));
+            let edge = horiz_max.max(vert_max);
+            let mut z = (horiz_max - vert_max).abs().mul_add(-0.5, edge);
+            z = 1.0 - z.max(horiz_max.min(vert_max));
+            z *= z;
+            z *= z;
+            let idx = row * width + col;
+            noise[idx] = z.mul_add(176.0, 80.0) as u8;
+            edges[idx] = ((1.0 - edge).clamp(0.0, 1.0) * 256.0) as u8;
+        }
+    }
+
+    let mut tmp = vec![0u8; width * height];
+    max3(&noise, &mut tmp, width, height);
+    max3(&tmp, &mut noise, width, height);
+    blur(&mut noise, &mut tmp, width, height, 3);
+    max3(&noise, &mut tmp, width, height);
+    min3(&tmp, &mut noise, width, height);
+    min3(&noise, &mut tmp, width, height);
+    min3(&tmp, &mut noise, width, height);
+    min3(&edges, &mut tmp, width, height);
+    max3(&tmp, &mut edges, width, height);
+    for idx in 0..edges.len() {
+        edges[idx] = edges[idx].min(noise[idx]);
+    }
+
+    (noise, edges)
+}
+
+fn max3(src: &[u8], dst: &mut [u8], width: usize, height: usize) {
+    op3(src, dst, width, height, |a, b| a.max(b));
+}
+
+fn min3(src: &[u8], dst: &mut [u8], width: usize, height: usize) {
+    op3(src, dst, width, height, |a, b| a.min(b));
+}
+
+fn op3(src: &[u8], dst: &mut [u8], width: usize, height: usize, op: impl Fn(u8, u8) -> u8) {
+    for row in 0..height {
+        let row_slice = &src[row * width..][..width];
+        let dst_slice = &mut dst[row * width..][..width];
+        let prev_row = &src[row.saturating_sub(1) * width..][..width];
+        let next_row = &src[(row + 1).min(height - 1) * width..][..width];
+
+        let mut curr = row_slice[0];
+        let mut next = row_slice[0];
+        for col in 0..width - 1 {
+            let prev = curr;
+            curr = next;
+            next = row_slice[col + 1];
+            let t1 = op(prev, next);
+            let t2 = op(next_row[col], prev_row[col]);
+            dst_slice[col] = op(curr, op(t1, t2));
+        }
+        let t1 = op(curr, next);
+        let t2 = op(next_row[width - 1], prev_row[width - 1]);
+        dst_slice[width - 1] = op(curr, op(t1, t2));
+    }
+}
+
+fn blur(src_dst: &mut [u8], tmp: &mut [u8], width: usize, height: usize, size: u16) {
+    transposing_1d_blur(src_dst, tmp, width, height, size);
+    transposing_1d_blur(tmp, src_dst, height, width, size);
+}
+
+fn transposing_1d_blur(src: &[u8], dst: &mut [u8], width: usize, height: usize, size: u16) {
+    let radius = size as usize;
+    if width < 2 * radius + 1 || height < 2 * radius + 1 {
+        return;
+    }
+
+    for (row_idx, row) in src.chunks_exact(width).enumerate() {
+        let mut sum = u16::from(row[0]) * size;
+        for &value in &row[..radius] {
+            sum += u16::from(value);
+        }
+        for col in 0..radius {
+            sum -= u16::from(row[0]);
+            sum += u16::from(row[col + radius]);
+            dst[col * height + row_idx] = (sum / (size * 2)) as u8;
+        }
+        for col in radius..width - radius {
+            sum -= u16::from(row[col - radius]);
+            sum += u16::from(row[col + radius]);
+            dst[col * height + row_idx] = (sum / (size * 2)) as u8;
+        }
+        for col in width - radius..width {
+            sum -= u16::from(row[col - radius]);
+            sum += u16::from(row[width - 1]);
+            dst[col * height + row_idx] = (sum / (size * 2)) as u8;
+        }
+    }
 }
 
 fn add_scaled_error(target: &mut InternalPixel, diff: InternalPixel, scale: f32) {
