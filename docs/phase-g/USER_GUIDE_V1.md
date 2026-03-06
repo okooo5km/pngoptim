@@ -52,6 +52,9 @@ target/release/pngoptim dataset/functional/pngquant_test.png dataset/functional/
 6. `--force`：允许覆盖输出文件
 7. `--quiet`：静默模式
 
+说明：
+成功输出中的 `requested_quality=min-max` 表示用户请求的质量区间，`quality_score` 表示当前实现内部估算的实际质量分数，两者不是同一个字段。
+
 ## 5. 退出码约定
 
 1. `0`：成功

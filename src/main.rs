@@ -4,10 +4,13 @@ mod palette_quant;
 mod pipeline;
 
 use clap::Parser;
-use cli::{Cli, OutputTarget};
+use cli::{Cli, OutputTarget, QualityRange};
 use error::AppError;
-use pipeline::{PipelineOptions, process_png_bytes, process_png_file, write_output_file};
+use pipeline::{
+    PipelineOptions, PipelineResult, process_png_bytes, process_png_file, write_output_file,
+};
 use std::io::{Read, Write};
+use std::path::Path;
 
 #[derive(Debug, Clone, Copy)]
 struct RunSummary {
@@ -79,15 +82,7 @@ fn run(cli: Cli) -> Result<(), AppError> {
                     );
                 }
                 if !cli.quiet {
-                    println!(
-                        "ok: {}x{}, quality={}, {} -> {} bytes, wrote {}",
-                        result.width,
-                        result.height,
-                        result.quality_score,
-                        result.input_bytes,
-                        result.output_bytes,
-                        path.display()
-                    );
+                    println!("{}", format_success_message(&result, &path, cli.quality));
                 }
             }
             (Ok(result), OutputTarget::Stdout) => {
@@ -135,6 +130,30 @@ fn run(cli: Cli) -> Result<(), AppError> {
     Ok(())
 }
 
+fn format_success_message(
+    result: &PipelineResult,
+    path: &Path,
+    requested_quality: Option<QualityRange>,
+) -> String {
+    let quality_part = match requested_quality {
+        Some(range) => format!(
+            "requested_quality={}-{}, quality_score={}",
+            range.min, range.max, result.quality_score
+        ),
+        None => format!("quality_score={}", result.quality_score),
+    };
+
+    format!(
+        "ok: {}x{}, {}, {} -> {} bytes, wrote {}",
+        result.width,
+        result.height,
+        quality_part,
+        result.input_bytes,
+        result.output_bytes,
+        path.display()
+    )
+}
+
 fn main() {
     let cli = match Cli::try_parse() {
         Ok(cli) => cli,
@@ -148,5 +167,48 @@ fn main() {
     if let Err(err) = run(cli) {
         eprintln!("error: {err}");
         std::process::exit(err.exit_code());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::format_success_message;
+    use crate::cli::QualityRange;
+    use crate::pipeline::{PipelineMetrics, PipelineResult};
+    use std::path::Path;
+
+    fn sample_result() -> PipelineResult {
+        PipelineResult {
+            width: 10,
+            height: 20,
+            input_bytes: 1000,
+            output_bytes: 400,
+            quality_score: 99,
+            png_data: Vec::new(),
+            metrics: PipelineMetrics {
+                decode_ms: 0.0,
+                quantize_ms: 0.0,
+                encode_ms: 0.0,
+                total_ms: 0.0,
+            },
+        }
+    }
+
+    #[test]
+    fn success_message_includes_requested_quality_range() {
+        let msg = format_success_message(
+            &sample_result(),
+            Path::new("/tmp/out.png"),
+            Some(QualityRange { min: 65, max: 75 }),
+        );
+        assert!(msg.contains("requested_quality=65-75"));
+        assert!(msg.contains("quality_score=99"));
+    }
+
+    #[test]
+    fn success_message_uses_quality_score_without_request_range() {
+        let msg = format_success_message(&sample_result(), Path::new("/tmp/out.png"), None);
+        assert!(msg.contains("quality_score=99"));
+        assert!(!msg.contains("requested_quality="));
     }
 }
