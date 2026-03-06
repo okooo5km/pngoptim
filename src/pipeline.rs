@@ -8,13 +8,14 @@ use std::time::Instant;
 
 use crate::cli::QualityRange;
 use crate::error::AppError;
-use crate::palette_quant::{max_colors_from_quality_speed, quantize_indexed};
+use crate::palette_quant::quantize_indexed;
+use crate::quality::{QualityMetrics, SpeedSettings, evaluate_quality_against_rgba};
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct PipelineOptions {
     pub quality: Option<QualityRange>,
     pub speed: u8,
-    pub dither: bool,
+    pub _dither: bool,
     pub posterize: Option<u8>,
     pub strip: bool,
     pub skip_if_larger: bool,
@@ -27,6 +28,7 @@ pub struct PipelineResult {
     pub input_bytes: u64,
     pub output_bytes: u64,
     pub quality_score: u8,
+    pub quality_mse: f64,
     pub png_data: Vec<u8>,
     pub metrics: PipelineMetrics,
 }
@@ -79,25 +81,23 @@ pub fn process_png_bytes(
     let decode_ms = t_decode.elapsed().as_secs_f64() * 1000.0;
 
     let t_quantize = Instant::now();
-    let quality_target = options.quality.map(QualityRange::target).unwrap_or(75);
-    let mut max_colors = max_colors_from_quality_speed(quality_target, options.speed);
-    if options.dither {
-        max_colors = max_colors.saturating_sub(8).max(16);
-    }
-
-    let mut indexed = quantize_indexed(rgba.as_raw(), width as usize, height as usize, max_colors);
-    if let Some(bits) = options.posterize {
-        apply_posterize_palette(&mut indexed.palette, bits);
-    }
+    let speed_settings = SpeedSettings::from_speed(options.speed);
+    let candidate = select_palette_candidate(
+        rgba.as_raw(),
+        width as usize,
+        height as usize,
+        options.quality.as_ref(),
+        options.posterize.unwrap_or(0),
+        speed_settings,
+    );
     let quantize_ms = t_quantize.elapsed().as_secs_f64() * 1000.0;
 
-    let quality_score = score_from_mean_abs_diff(indexed.mean_abs_diff);
-    if let Some(range) = options.quality
-        && quality_score < range.min
+    if let Some(range) = options.quality.as_ref()
+        && candidate.quality.quality_score < range.min
     {
         return Err(AppError::QualityTooLow {
             minimum: range.min,
-            actual: quality_score,
+            actual: candidate.quality.quality_score,
         });
     }
 
@@ -105,8 +105,8 @@ pub fn process_png_bytes(
     let png_data = encode_indexed_png_to_vec(
         width,
         height,
-        &indexed.indices,
-        &indexed.palette,
+        &candidate.indexed.indices,
+        &candidate.indexed.palette,
         metadata.as_ref(),
         options.strip,
         options.speed,
@@ -125,7 +125,8 @@ pub fn process_png_bytes(
         height,
         input_bytes: input_bytes.len() as u64,
         output_bytes: png_data.len() as u64,
-        quality_score,
+        quality_score: candidate.quality.quality_score,
+        quality_mse: candidate.quality.standard_mse,
         png_data,
         metrics: PipelineMetrics {
             decode_ms,
@@ -134,6 +135,97 @@ pub fn process_png_bytes(
             total_ms,
         },
     })
+}
+
+#[derive(Debug, Clone)]
+struct QuantizeCandidate {
+    indexed: crate::palette_quant::IndexedImage,
+    quality: QualityMetrics,
+}
+
+fn select_palette_candidate(
+    rgba: &[u8],
+    width: usize,
+    height: usize,
+    quality: Option<&QualityRange>,
+    output_posterize_bits: u8,
+    speed_settings: SpeedSettings,
+) -> QuantizeCandidate {
+    let evaluate = |max_colors: usize| {
+        evaluate_candidate(
+            rgba,
+            width,
+            height,
+            max_colors,
+            output_posterize_bits,
+            speed_settings.input_posterize_bits,
+        )
+    };
+
+    let default_colors = 256usize;
+
+    let high_quality = evaluate(default_colors);
+    let Some(range) = quality else {
+        return high_quality;
+    };
+
+    if high_quality.quality.quality_score < range.max {
+        return high_quality;
+    }
+
+    let mut low = 2usize;
+    let mut high = default_colors;
+    let mut best_colors = default_colors;
+    let mut best = high_quality;
+    let mut budget = speed_settings.search_budget();
+
+    while low <= high && budget > 0 {
+        let mid = low + (high - low) / 2;
+        let candidate = evaluate(mid);
+        if candidate.quality.quality_score >= range.max {
+            best_colors = mid;
+            best = candidate;
+            high = mid.saturating_sub(1);
+        } else {
+            low = mid.saturating_add(1);
+        }
+        budget -= 1;
+    }
+
+    for colors in best_colors.saturating_sub(4).max(2)..best_colors {
+        let candidate = evaluate(colors);
+        if candidate.quality.quality_score >= range.max {
+            best = candidate;
+        }
+    }
+
+    best
+}
+
+fn evaluate_candidate(
+    rgba: &[u8],
+    width: usize,
+    height: usize,
+    max_colors: usize,
+    output_posterize_bits: u8,
+    input_posterize_bits: u8,
+) -> QuantizeCandidate {
+    let mut indexed = quantize_indexed(rgba, width, height, max_colors, input_posterize_bits);
+    if output_posterize_bits > 0 {
+        apply_posterize_palette(&mut indexed.palette, output_posterize_bits);
+    }
+    let remapped_rgba = remapped_rgba_from_indices(&indexed.indices, &indexed.palette);
+    let quality = evaluate_quality_against_rgba(rgba, &remapped_rgba);
+    QuantizeCandidate { indexed, quality }
+}
+
+fn remapped_rgba_from_indices(indices: &[u8], palette: &[[u8; 4]]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(indices.len() * 4);
+    for &idx in indices {
+        let px = palette[idx as usize];
+        out.extend_from_slice(&px);
+    }
+    out
 }
 
 pub fn write_output_file(path: &Path, png_data: &[u8], force: bool) -> Result<(), AppError> {
@@ -396,16 +488,11 @@ fn apply_posterize_palette(palette: &mut [[u8; 4]], bits: u8) {
     }
 }
 
-fn score_from_mean_abs_diff(mean_abs_diff: f64) -> u8 {
-    let score = (100.0 - (mean_abs_diff / 255.0 * 100.0)).clamp(0.0, 100.0);
-    score.round() as u8
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
         apply_posterize_palette, indexed_bit_depth, pack_indices_by_bit_depth,
-        score_from_mean_abs_diff,
+        remapped_rgba_from_indices,
     };
 
     #[test]
@@ -416,17 +503,18 @@ mod tests {
     }
 
     #[test]
-    fn quality_score_works() {
-        assert_eq!(score_from_mean_abs_diff(0.0), 100);
-        assert!(score_from_mean_abs_diff(230.0) < 20);
-    }
-
-    #[test]
     fn bit_depth_selection_matches_palette_size() {
         assert_eq!(indexed_bit_depth(2), png::BitDepth::One);
         assert_eq!(indexed_bit_depth(4), png::BitDepth::Two);
         assert_eq!(indexed_bit_depth(16), png::BitDepth::Four);
         assert_eq!(indexed_bit_depth(17), png::BitDepth::Eight);
+    }
+
+    #[test]
+    fn remapped_rgba_is_reconstructed_from_palette_indices() {
+        let palette = vec![[1u8, 2, 3, 4], [5u8, 6, 7, 8]];
+        let rgba = remapped_rgba_from_indices(&[1, 0], &palette);
+        assert_eq!(rgba, vec![5, 6, 7, 8, 1, 2, 3, 4]);
     }
 
     #[test]

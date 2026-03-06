@@ -44,7 +44,7 @@ target/release/pngoptim dataset/functional/pngquant_test.png dataset/functional/
 
 ## 4. 常用参数
 
-1. `--quality min-max`：质量区间（例如 `55-75`）
+1. `--quality`：支持 `N`、`-N`、`N-`、`min-max` 四种写法，例如 `70`、`-80`、`65-`、`55-75`
 2. `--speed 1..11`：编码速度档位
 3. `--strip`：剥离元数据
 4. `--posterize 0..8`：色阶量化
@@ -53,7 +53,7 @@ target/release/pngoptim dataset/functional/pngquant_test.png dataset/functional/
 7. `--quiet`：静默模式
 
 说明：
-成功输出中的 `requested_quality=min-max` 表示用户请求的质量区间，`quality_score` 表示当前实现内部估算的实际质量分数，两者不是同一个字段。
+成功输出中的 `requested_quality` 表示用户传入的质量写法；若它会被展开成 pngquant 兼容区间，输出里会额外显示 `effective_quality=min-max`。`quality_score` 与 `quality_mse` 则表示当前结果的实际质量估计。
 
 ## 5. 退出码约定
 

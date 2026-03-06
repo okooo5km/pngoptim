@@ -6,7 +6,6 @@ const INVALID_SLOT: u16 = u16::MAX;
 pub struct IndexedImage {
     pub palette: Vec<[u8; 4]>,
     pub indices: Vec<u8>,
-    pub mean_abs_diff: f64,
 }
 
 pub fn quantize_indexed(
@@ -14,21 +13,22 @@ pub fn quantize_indexed(
     width: usize,
     height: usize,
     max_colors: usize,
+    input_posterize_bits: u8,
 ) -> IndexedImage {
     let pixel_count = width.saturating_mul(height);
     if pixel_count == 0 {
         return IndexedImage {
             palette: vec![[0, 0, 0, 0]],
             indices: Vec::new(),
-            mean_abs_diff: 0.0,
         };
     }
 
     let max_colors = max_colors.clamp(2, 256);
+    let input_posterize_bits = input_posterize_bits.min(4);
 
     let mut hist = vec![0u32; BUCKET_COUNT];
     for px in rgba.chunks_exact(4) {
-        let key = bucket_color_key(px[0], px[1], px[2], px[3]) as usize;
+        let key = bucket_color_key(px[0], px[1], px[2], px[3], input_posterize_bits) as usize;
         hist[key] = hist[key].saturating_add(1);
     }
 
@@ -50,16 +50,16 @@ pub fn quantize_indexed(
 
     let mut bucket_to_index = vec![INVALID_SLOT; BUCKET_COUNT];
     for (idx, color) in palette.iter().enumerate() {
-        let key = bucket_color_key(color[0], color[1], color[2], color[3]) as usize;
+        let key =
+            bucket_color_key(color[0], color[1], color[2], color[3], input_posterize_bits) as usize;
         bucket_to_index[key] = idx as u16;
     }
 
     let mut nearest_cache = vec![INVALID_SLOT; BUCKET_COUNT];
     let mut indices = Vec::with_capacity(pixel_count);
-    let mut total_abs_diff: u64 = 0;
 
     for px in rgba.chunks_exact(4) {
-        let key = bucket_color_key(px[0], px[1], px[2], px[3]) as usize;
+        let key = bucket_color_key(px[0], px[1], px[2], px[3], input_posterize_bits) as usize;
         let idx = if bucket_to_index[key] != INVALID_SLOT {
             bucket_to_index[key] as u8
         } else if nearest_cache[key] != INVALID_SLOT {
@@ -69,38 +69,40 @@ pub fn quantize_indexed(
             nearest_cache[key] = idx as u16;
             idx
         };
-
-        let q = palette[idx as usize];
-        total_abs_diff += px[0].abs_diff(q[0]) as u64;
-        total_abs_diff += px[1].abs_diff(q[1]) as u64;
-        total_abs_diff += px[2].abs_diff(q[2]) as u64;
-        total_abs_diff += px[3].abs_diff(q[3]) as u64;
         indices.push(idx);
     }
 
-    let mean_abs_diff = total_abs_diff as f64 / (pixel_count as f64 * 4.0);
-
-    IndexedImage {
-        palette,
-        indices,
-        mean_abs_diff,
-    }
+    IndexedImage { palette, indices }
 }
 
+#[cfg(test)]
 pub fn max_colors_from_quality_speed(quality_target: u8, speed: u8) -> usize {
-    let quality_component = 16 + (usize::from(quality_target) * 180 / 100); // 16..196
-    let speed_penalty = usize::from(speed.saturating_sub(1)) * 14; // 0..140
+    let quality_component = 16 + (usize::from(quality_target) * 180 / 100);
+    let speed_penalty = usize::from(speed.saturating_sub(1)) * 14;
     quality_component
         .saturating_sub(speed_penalty)
         .clamp(16, 256)
 }
 
-fn bucket_color_key(r: u8, g: u8, b: u8, a: u8) -> u32 {
-    let rb = r >> 3; // 5 bits
-    let gb = g >> 3; // 5 bits
-    let bb = b >> 3; // 5 bits
-    let ab = a >> 4; // 4 bits
+fn bucket_color_key(r: u8, g: u8, b: u8, a: u8, posterize_bits: u8) -> u32 {
+    let r = posterize_channel(r, posterize_bits);
+    let g = posterize_channel(g, posterize_bits);
+    let b = posterize_channel(b, posterize_bits);
+    let a = posterize_channel(a, posterize_bits);
+
+    let rb = r >> 3;
+    let gb = g >> 3;
+    let bb = b >> 3;
+    let ab = a >> 4;
     ((rb as u32) << 14) | ((gb as u32) << 9) | ((bb as u32) << 4) | (ab as u32)
+}
+
+fn posterize_channel(channel: u8, bits: u8) -> u8 {
+    if bits == 0 {
+        channel
+    } else {
+        channel & !((1u8 << bits) - 1)
+    }
 }
 
 fn decode_bucket_color(key: u32) -> [u8; 4] {
@@ -156,8 +158,18 @@ mod tests {
             255u8, 0, 0, 255, 250, 0, 0, 255, 0, 255, 0, 255, 0, 250, 0, 255, 0, 0, 255, 255, 0, 0,
             250, 255,
         ];
-        let out = quantize_indexed(&rgba, 3, 2, 16);
+        let out = quantize_indexed(&rgba, 3, 2, 16, 0);
         assert_eq!(out.indices.len(), 6);
         assert!(!out.palette.is_empty());
+    }
+
+    #[test]
+    fn input_posterize_reduces_palette_variety() {
+        let rgba = vec![
+            255u8, 0, 0, 255, 254, 1, 0, 255, 253, 2, 0, 255, 252, 3, 0, 255,
+        ];
+        let direct = quantize_indexed(&rgba, 2, 2, 16, 0);
+        let posterized = quantize_indexed(&rgba, 2, 2, 16, 2);
+        assert!(posterized.palette.len() <= direct.palette.len());
     }
 }

@@ -147,6 +147,8 @@
 29. 2026-03-06：新增 `xtask ci-trends` 与 `ci-trend-dashboard` workflow，生成趋势报告 `ci-trends-v1-20260306`，阶段 G 最后一个缺口收口，状态更新为 `Done`。
 30. 2026-03-06：刷新最终发布包为 `public-release-v1-20260306-g2-verify`，将趋势看板文档与 workflow 一并纳入发布清单（24 个文件）。
 31. 2026-03-06：完成 `pngquant` / `libimagequant` 深度实现分析，确认当前实现与参考主链在 `quality` 语义、histogram、palette search、remap、dither 上存在架构级差距，新增 `docs/phase-d/ALGORITHM_REPLICATION_ANALYSIS_V1.md` 并启动 `Algorithm Replication` 附加产品轨道。
+32. 2026-03-06：启动 R1，已将 `--quality` 解析扩展为 `N / -N / N- / min-max`，引入 libimagequant 风格 `quality <-> MSE` 标尺、speed 策略骨架与基于质量目标的最小色数搜索桥接实现，为后续 R2 的 palette search 重写清理接口。
+33. 2026-03-06：执行 R1 回归验证：`compat` 通过（`reports/compat/r1-compat-verify/summary.md`），但 `smoke` 在新质量门禁下仅 `2/9` 通过（`reports/smoke/r1-smoke-verify/summary.md`），确认当前旧量化器在真实质量标尺下已不能满足既有阶段 D 结论，需进入 R2 重写核心 palette search / remap。
 
 ### 更新规则
 1. 每次推进必须更新对应阶段状态：`Not Started` / `In Progress` / `Blocked` / `Done`。

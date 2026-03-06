@@ -2,6 +2,7 @@ mod cli;
 mod error;
 mod palette_quant;
 mod pipeline;
+mod quality;
 
 use clap::Parser;
 use cli::{Cli, OutputTarget, QualityRange};
@@ -35,9 +36,9 @@ fn run(cli: Cli) -> Result<(), AppError> {
 
         let output_target = cli.output_for_input(input)?;
         let options = PipelineOptions {
-            quality: cli.quality,
-            speed: cli.speed,
-            dither: cli.dither_enabled(),
+            quality: cli.quality.clone(),
+            speed: cli.effective_speed(),
+            _dither: cli.dither_enabled(),
             posterize: cli.posterize,
             strip: cli.strip,
             skip_if_larger: cli.skip_if_larger,
@@ -82,7 +83,10 @@ fn run(cli: Cli) -> Result<(), AppError> {
                     );
                 }
                 if !cli.quiet {
-                    println!("{}", format_success_message(&result, &path, cli.quality));
+                    println!(
+                        "{}",
+                        format_success_message(&result, &path, cli.quality.as_ref())
+                    );
                 }
             }
             (Ok(result), OutputTarget::Stdout) => {
@@ -133,14 +137,26 @@ fn run(cli: Cli) -> Result<(), AppError> {
 fn format_success_message(
     result: &PipelineResult,
     path: &Path,
-    requested_quality: Option<QualityRange>,
+    requested_quality: Option<&QualityRange>,
 ) -> String {
     let quality_part = match requested_quality {
-        Some(range) => format!(
-            "requested_quality={}-{}, quality_score={}",
-            range.min, range.max, result.quality_score
+        Some(range) if range.requested() == range.effective() => format!(
+            "requested_quality={}, quality_score={}, quality_mse={:.3}",
+            range.requested(),
+            result.quality_score,
+            result.quality_mse
         ),
-        None => format!("quality_score={}", result.quality_score),
+        Some(range) => format!(
+            "requested_quality={}, effective_quality={}, quality_score={}, quality_mse={:.3}",
+            range.requested(),
+            range.effective(),
+            result.quality_score,
+            result.quality_mse
+        ),
+        None => format!(
+            "quality_score={}, quality_mse={:.3}",
+            result.quality_score, result.quality_mse
+        ),
     };
 
     format!(
@@ -184,6 +200,7 @@ mod tests {
             input_bytes: 1000,
             output_bytes: 400,
             quality_score: 99,
+            quality_mse: 5.21,
             png_data: Vec::new(),
             metrics: PipelineMetrics {
                 decode_ms: 0.0,
@@ -199,10 +216,15 @@ mod tests {
         let msg = format_success_message(
             &sample_result(),
             Path::new("/tmp/out.png"),
-            Some(QualityRange { min: 65, max: 75 }),
+            Some(&QualityRange {
+                raw: "65-75".to_string(),
+                min: 65,
+                max: 75,
+            }),
         );
         assert!(msg.contains("requested_quality=65-75"));
         assert!(msg.contains("quality_score=99"));
+        assert!(msg.contains("quality_mse=5.210"));
     }
 
     #[test]
@@ -210,5 +232,20 @@ mod tests {
         let msg = format_success_message(&sample_result(), Path::new("/tmp/out.png"), None);
         assert!(msg.contains("quality_score=99"));
         assert!(!msg.contains("requested_quality="));
+    }
+
+    #[test]
+    fn success_message_shows_effective_quality_for_single_value_request() {
+        let msg = format_success_message(
+            &sample_result(),
+            Path::new("/tmp/out.png"),
+            Some(&QualityRange {
+                raw: "70".to_string(),
+                min: 63,
+                max: 70,
+            }),
+        );
+        assert!(msg.contains("requested_quality=70"));
+        assert!(msg.contains("effective_quality=63-70"));
     }
 }

@@ -2,16 +2,22 @@ use clap::Parser;
 use std::path::{Path, PathBuf};
 
 use crate::error::AppError;
+use crate::quality::SpeedSettings;
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QualityRange {
+    pub raw: String,
     pub min: u8,
     pub max: u8,
 }
 
 impl QualityRange {
-    pub fn target(self) -> u8 {
-        ((u16::from(self.min) + u16::from(self.max)) / 2) as u8
+    pub fn requested(&self) -> &str {
+        &self.raw
+    }
+
+    pub fn effective(&self) -> String {
+        format!("{}-{}", self.min, self.max)
     }
 }
 
@@ -31,7 +37,11 @@ pub struct Cli {
     #[arg(long = "ext", default_value = "-mvp.png", value_name = "SUFFIX")]
     pub ext: String,
 
-    #[arg(long = "quality", value_parser = parse_quality_range)]
+    #[arg(
+        long = "quality",
+        value_parser = parse_quality_range,
+        value_name = "N | -N | N- | MIN-MAX"
+    )]
     pub quality: Option<QualityRange>,
 
     #[arg(long = "speed", default_value_t = 4, value_parser = clap::value_parser!(u8).range(1..=11))]
@@ -108,7 +118,14 @@ impl Cli {
     }
 
     pub fn dither_enabled(&self) -> bool {
+        if SpeedSettings::from_speed(self.speed).force_disable_dither {
+            return false;
+        }
         !self.nofs || self.floyd
+    }
+
+    pub fn effective_speed(&self) -> u8 {
+        SpeedSettings::from_speed(self.speed).effective_speed
     }
 
     pub fn output_for_input(&self, input: &str) -> Result<OutputTarget, AppError> {
@@ -146,25 +163,44 @@ fn default_output_path(input: &Path, ext: &str) -> PathBuf {
 }
 
 pub fn parse_quality_range(raw: &str) -> Result<QualityRange, String> {
-    let (min_raw, max_raw) = raw
-        .split_once('-')
-        .ok_or_else(|| "quality must be in min-max format, e.g. 60-85".to_string())?;
-
-    let min = min_raw
-        .parse::<u8>()
-        .map_err(|_| "quality min must be 0..100".to_string())?;
-    let max = max_raw
-        .parse::<u8>()
-        .map_err(|_| "quality max must be 0..100".to_string())?;
-
-    if min > max {
-        return Err("quality min must be <= max".to_string());
-    }
-    if max > 100 {
-        return Err("quality max must be 0..100".to_string());
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Err("quality must not be empty".to_string());
     }
 
-    Ok(QualityRange { min, max })
+    let (min, max) = if let Some(target_raw) = raw.strip_prefix('-') {
+        (0, parse_quality_value(target_raw, "quality target")?)
+    } else if let Some(min_raw) = raw.strip_suffix('-') {
+        (parse_quality_value(min_raw, "quality minimum")?, 100)
+    } else if let Some((min_raw, max_raw)) = raw.split_once('-') {
+        let min = parse_quality_value(min_raw, "quality minimum")?;
+        let max = parse_quality_value(max_raw, "quality target")?;
+        if min > max {
+            return Err("quality minimum must be <= quality target".to_string());
+        }
+        (min, max)
+    } else {
+        let target = parse_quality_value(raw, "quality target")?;
+        (((u16::from(target) * 9) / 10) as u8, target)
+    };
+
+    Ok(QualityRange {
+        raw: raw.to_string(),
+        min,
+        max,
+    })
+}
+
+fn parse_quality_value(raw: &str, label: &str) -> Result<u8, String> {
+    raw.parse::<u8>()
+        .map_err(|_| format!("{label} must be 0..100"))
+        .and_then(|value| {
+            if value <= 100 {
+                Ok(value)
+            } else {
+                Err(format!("{label} must be 0..100"))
+            }
+        })
 }
 
 #[cfg(test)]
@@ -179,6 +215,28 @@ mod tests {
         let range = parse_quality_range("55-80").expect("parse quality");
         assert_eq!(range.min, 55);
         assert_eq!(range.max, 80);
+        assert_eq!(range.requested(), "55-80");
+        assert_eq!(range.effective(), "55-80");
+    }
+
+    #[test]
+    fn parse_quality_single_value_uses_pngquant_defaults() {
+        let range = parse_quality_range("70").expect("parse quality");
+        assert_eq!(range.min, 63);
+        assert_eq!(range.max, 70);
+        assert_eq!(range.requested(), "70");
+        assert_eq!(range.effective(), "63-70");
+    }
+
+    #[test]
+    fn parse_quality_supports_open_ranges() {
+        let upper_only = parse_quality_range("-80").expect("parse quality");
+        assert_eq!(upper_only.min, 0);
+        assert_eq!(upper_only.max, 80);
+
+        let lower_only = parse_quality_range("65-").expect("parse quality");
+        assert_eq!(lower_only.min, 65);
+        assert_eq!(lower_only.max, 100);
     }
 
     #[test]
