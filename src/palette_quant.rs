@@ -11,6 +11,12 @@ pub struct IndexedImage {
     pub indices: Vec<u8>,
 }
 
+#[derive(Debug, Clone)]
+struct ContrastMaps {
+    importance_map: Vec<u8>,
+    edges: Vec<u8>,
+}
+
 #[derive(Debug, Clone, Copy)]
 struct PaletteEntry {
     color: InternalPixel,
@@ -60,20 +66,20 @@ pub fn quantize_indexed(
         } else {
             None
         };
-    let importance_map = if settings.use_contrast_maps {
-        contrast_pixels
-            .as_deref()
-            .and_then(|pixels| build_importance_map(pixels, width, height))
-    } else {
-        None
-    };
+    let contrast_maps = contrast_pixels
+        .as_deref()
+        .and_then(|pixels| build_contrast_maps(pixels, width, height));
+    let importance_map = contrast_maps
+        .as_ref()
+        .map(|maps| maps.importance_map.as_slice());
+    let edges_map = contrast_maps.as_ref().map(|maps| maps.edges.as_slice());
     let histogram = build_histogram(
         rgba,
         width,
         settings.input_posterize_bits,
         settings.max_histogram_entries,
         &gamma,
-        importance_map.as_deref(),
+        importance_map,
     );
 
     let (mut palette, palette_error) = find_best_palette(&histogram, settings);
@@ -96,7 +102,8 @@ pub fn quantize_indexed(
         &final_palette,
         palette_error,
         settings,
-        importance_map.as_deref(),
+        importance_map,
+        edges_map,
         contrast_pixels.as_deref(),
     )
 }
@@ -1173,6 +1180,7 @@ fn remap_image(
     palette_error: Option<f64>,
     settings: QuantizerSettings,
     importance_map: Option<&[u8]>,
+    edges_map: Option<&[u8]>,
     contrast_pixels: Option<&[InternalPixel]>,
 ) -> IndexedImage {
     let (palette, mut indices, counts) = if settings.dither {
@@ -1184,6 +1192,7 @@ fn remap_image(
             palette_error,
             settings,
             importance_map,
+            edges_map,
             contrast_pixels,
         )
     } else {
@@ -1326,6 +1335,7 @@ fn remap_image_dithered(
     palette_error: Option<f64>,
     settings: QuantizerSettings,
     importance_map: Option<&[u8]>,
+    edges_map: Option<&[u8]>,
     contrast_pixels: Option<&[InternalPixel]>,
 ) -> (Vec<(InternalPixel, [u8; 4])>, Vec<u8>, Vec<usize>) {
     let mut palette_points = palette.iter().map(|entry| entry.0).collect::<Vec<_>>();
@@ -1349,9 +1359,12 @@ fn remap_image_dithered(
     // skipped for very large images, do one plain remap pass first so Floyd uses an
     // actual full-image palette refinement instead of the histogram-only estimate.
     let plain_pass = Some(finalize_plain_remap(rgba, &mut palette_points, importance_map));
+    let output_image_is_remapped = generate_dither_map;
     let dither_map = if let Some(plain_pass) = plain_pass.as_ref() {
         if generate_dither_map {
             build_dither_map(pixels, width, height, &plain_pass.indices, &palette_points)
+        } else if settings.use_dither_map != DitherMapMode::None {
+            edges_map.map_or_else(Vec::new, |edges| edges.to_vec())
         } else {
             Vec::new()
         }
@@ -1398,7 +1411,7 @@ fn remap_image_dithered(
                 pixels[idx],
             );
 
-            let plain_idx = if plain_pass.is_some() {
+            let plain_idx = if output_image_is_remapped {
                 plain_pass
                     .as_ref()
                     .map(|pass| pass.indices[idx] as usize)
@@ -1505,11 +1518,19 @@ fn clamp_dither_ratio(
     }
 }
 
-fn build_importance_map(pixels: &[InternalPixel], width: usize, height: usize) -> Option<Vec<u8>> {
+fn build_contrast_maps(
+    pixels: &[InternalPixel],
+    width: usize,
+    height: usize,
+) -> Option<ContrastMaps> {
     if width < 4 || height < 4 || pixels.len() != width.saturating_mul(height) {
         return None;
     }
-    Some(compute_contrast_maps(pixels, width, height).0)
+    let (importance_map, edges) = compute_contrast_maps(pixels, width, height);
+    Some(ContrastMaps {
+        importance_map,
+        edges,
+    })
 }
 
 fn build_dither_map(
@@ -1856,8 +1877,17 @@ mod tests {
         };
 
         let (plain_palette, _, _) = super::remap_image_plain(&rgba, &palette, 0, Some(&[255, 1]));
-        let (palette, indices, counts) =
-            remap_image_dithered(&rgba, 2, 1, &palette, None, settings, Some(&[255, 1]), None);
+        let (palette, indices, counts) = remap_image_dithered(
+            &rgba,
+            2,
+            1,
+            &palette,
+            None,
+            settings,
+            Some(&[255, 1]),
+            None,
+            None,
+        );
 
         assert_eq!(indices.len(), 2);
         assert_eq!(counts[0], 2);
