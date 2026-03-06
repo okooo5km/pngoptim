@@ -26,6 +26,7 @@
 3. 算法目标不是“完全自己发明一套”，而是尽可能对齐 `pngquant` / `libimagequant` 的成熟实现思路。
 4. 目前不直接复制或链接参考实现代码进入主线，不是出于教条式自研，而是因为当前项目已按 MIT 发布，直接引入参考实现代码需要先明确许可证策略与仓库治理方案。
 5. 如果后续决定直接复用参考实现代码，必须先把许可证、分发方式、仓库结构和发布策略记录进文档，再执行代码接入。
+6. 后续所有算法复刻工作采用 `reference-first` 纪律：先对照本地参考仓库对应模块提炼实现细节、启发式和边界条件，再编码；禁止脱离参考实现结构凭感觉连续打补丁。
 
 ## 2. 分阶段开发规划（不设周期，仅阶段）
 
@@ -169,6 +170,7 @@
 37. 2026-03-06：将“Rust-only 主线编排”和“参考实现可借鉴但受许可证约束”的决策写入阶段记忆，避免后续在实现路线与依赖策略上反复横跳。
 38. 2026-03-06：完成 R2.1 第一版反馈式 palette search：将 `target_mse` 与 `feedback_loop_trials` 接入 Rust quantizer，并把 histogram 权重反馈到后续 median cut；`compat` 通过（`reports/compat/r2-1d-compat-verify/summary.md`），`smoke` 通过（`reports/smoke/r2-1d-smoke-verify/summary.md`）。
 39. 2026-03-06：为中等复杂度直方图新增 1 次真实像素 remap 收敛，`demo.png` 默认输出提升到 `quality_score=56`, `quality_mse=14.644`, `131278 bytes`；但 `--quality 65-75` 仍失败（`actual=57`），且 `perf-002-large-alpha-pattern` 仍为当前主要性能回退样本（`104049.867 ms`）。
+40. 2026-03-06：确认算法推进方法调整为 `reference-first`：后续 R2/R3 只按 `pngquant.c`、`libimagequant/src/attr.rs`、`quant.rs`、`mediancut.rs`、`kmeans.rs`、`nearest.rs`、`remap.rs` 的对应模块逐段复刻，不再以“自拟近似方案”为主。
 
 ### 更新规则
 1. 每次推进必须更新对应阶段状态：`Not Started` / `In Progress` / `Blocked` / `Done`。

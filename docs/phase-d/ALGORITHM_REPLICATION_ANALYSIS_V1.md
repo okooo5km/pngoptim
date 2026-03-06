@@ -20,6 +20,31 @@
 3. 当前不直接复制或链接参考实现代码进入 MIT 主线，原因是许可证策略尚未调整；这属于许可证与分发治理问题，不是技术路线上的教条限制。
 4. 如果后续决定直接复用参考实现代码，必须先在仓库文档中记录许可证、分发、仓库结构和发布策略变更。
 
+## 1.2 Reference-First 执行顺序
+
+后续算法工作按下面顺序推进，先读参考实现，再编码：
+
+1. `pngquant.c`
+   - 关注 CLI 语义、`quality`/`skip-if-larger`/I/O/metadata 的入口决策。
+2. `libimagequant/src/attr.rs`
+   - 关注 `speed`、`feedback_loop_trials`、`kmeans_iterations`、posterization、dither-map 开关。
+3. `libimagequant/src/quant.rs`
+   - 关注 `find_best_palette()`、`target_mse/max_mse`、feedback loop、最终 refine 退出条件。
+4. `libimagequant/src/mediancut.rs`
+   - 关注 box split 优先级、误差约束、颜色权重。
+5. `libimagequant/src/kmeans.rs`
+   - 关注 remap 后统计回灌、unused color replacement、权重调整。
+6. `libimagequant/src/nearest.rs`
+   - 关注 VP-tree nearest search。
+7. `libimagequant/src/remap.rs`
+   - 关注 remap 阶段 palette 再收敛、dither map、selective Floyd、background-aware 分支。
+
+约束：
+
+1. 每个子阶段至少要能指出“参考实现的对应模块 + 我们当前缺口 + 本轮只补哪一块”。
+2. 没有完成对应参考模块阅读前，不进入编码。
+3. 任何明显偏离参考结构的实现，都必须先说明偏离原因和预期收益。
+
 ## 2. 参考实现职责边界
 
 ### 2.1 `pngquant` 负责什么
