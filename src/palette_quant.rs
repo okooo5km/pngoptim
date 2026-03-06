@@ -1222,10 +1222,8 @@ fn remap_image_plain(
     importance_map: Option<&[u8]>,
 ) -> (Vec<(InternalPixel, [u8; 4])>, Vec<u8>, Vec<usize>) {
     let mut palette_points = palette.iter().map(|entry| entry.0).collect::<Vec<_>>();
-    let final_pass = finalize_plain_remap(rgba, &mut palette_points, importance_map);
-    let mut rounded_palette_points = palette_points.clone();
-    let output_palette =
-        round_palette_for_output_in_place(&mut rounded_palette_points, output_posterize_bits);
+    let output_palette = round_palette_for_output_in_place(&mut palette_points, output_posterize_bits);
+    let final_pass = remap_image_plain_pass(rgba, &palette_points, importance_map);
 
     let remapped_palette = palette_points
         .into_iter()
@@ -1331,6 +1329,8 @@ fn remap_image_dithered(
     contrast_pixels: Option<&[InternalPixel]>,
 ) -> (Vec<(InternalPixel, [u8; 4])>, Vec<u8>, Vec<usize>) {
     let mut palette_points = palette.iter().map(|entry| entry.0).collect::<Vec<_>>();
+    let output_palette =
+        round_palette_for_output_in_place(&mut palette_points, settings.output_posterize_bits);
     let gamma = gamma_lut(SRGB_OUTPUT_GAMMA);
     let owned_pixels;
     let pixels = if let Some(pixels) = contrast_pixels {
@@ -1345,18 +1345,19 @@ fn remap_image_dithered(
     let is_image_huge = width.saturating_mul(height) > 2000 * 2000;
     let generate_dither_map = settings.use_dither_map == DitherMapMode::Always
         || (!is_image_huge && settings.use_dither_map != DitherMapMode::None);
-    let plain_pass = generate_dither_map
-        .then(|| finalize_plain_remap(rgba, &mut palette_points, importance_map));
+    // Align the dither path with remap-to-palette finalize: even when the dither map is
+    // skipped for very large images, do one plain remap pass first so Floyd uses an
+    // actual full-image palette refinement instead of the histogram-only estimate.
+    let plain_pass = Some(finalize_plain_remap(rgba, &mut palette_points, importance_map));
     let dither_map = if let Some(plain_pass) = plain_pass.as_ref() {
-        build_dither_map(pixels, width, height, &plain_pass.indices, &palette_points)
+        if generate_dither_map {
+            build_dither_map(pixels, width, height, &plain_pass.indices, &palette_points)
+        } else {
+            Vec::new()
+        }
     } else {
         Vec::new()
     };
-    let mut rounded_palette_points = palette_points.clone();
-    let output_palette = round_palette_for_output_in_place(
-        &mut rounded_palette_points,
-        settings.output_posterize_bits,
-    );
     let tree = NearestTree::new(&palette_points);
     let mut indices = vec![0u8; pixels.len()];
     let mut counts = vec![0usize; palette.len()];
@@ -1397,7 +1398,7 @@ fn remap_image_dithered(
                 pixels[idx],
             );
 
-            let plain_idx = if !dither_map.is_empty() {
+            let plain_idx = if plain_pass.is_some() {
                 plain_pass
                     .as_ref()
                     .map(|pass| pass.indices[idx] as usize)

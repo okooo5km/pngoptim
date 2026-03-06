@@ -371,18 +371,20 @@ pngquant /Users/5km/Downloads/demo.png --output /tmp/pngq-q6575-audit.png --qual
 
 | 场景 | 输出大小 | 质量结果 | 耗时 | 说明 |
 |---|---:|---:|---:|---|
-| 当前 `pngoptim --quality 65-75` | `153,467` bytes | `quality_score=88`, `quality_mse=3.314` | `1.00s` | 原始带 ICC 输入上，默认抖动已明显回落 |
-| 当前 `pngoptim --quality 65-75 --floyd=0.5` | `140,799` bytes | `quality_score=90`, `quality_mse=2.910` | `参考样本 spot check` | 半强度抖动已接近参考体积 |
-| 当前 `pngoptim --quality 65-75 --nofs` | `107,700` bytes | `quality_score=91`, `quality_mse=2.435` | `0.92s` | 原始带 ICC 输入上已接近 `pngquant --nofs` |
+| 当前 `pngoptim --quality 65-75` | `152,252` bytes | `quality_score=88`, `quality_mse=3.319` | `0.79s` | 默认抖动继续向参考收敛 |
+| 当前 `pngoptim --quality 65-75 --floyd=0.5` | `139,222` bytes | `quality_score=90`, `quality_mse=2.910` | `参考样本 spot check` | 半强度抖动已接近参考体积 |
+| 当前 `pngoptim --quality 65-75 --nofs` | `107,965` bytes | `quality_score=91`, `quality_mse=2.430` | `0.72s` | 原始带 ICC 输入上已接近 `pngquant --nofs` |
 | `pngquant --quality 65-75` | `136,915` bytes | `MSE=5.210 (Q=82)` | `0.55s` | 参考实现 |
 | `pngquant --quality 65-75 --nofs` | `104,038` bytes | `参考样本` | `0.45s` | 对照无抖动路径 |
 
 补充观测：
 
 1. `--quality 65-75` 路径已经不再依赖“baseline + targeted”双候选，慢路径缩短到了约 `1s`。
-2. 当前真正的硬根因已经确认：之前引入的 ICC 像素转换会把这张图的唯一颜色数从 `1499` 膨胀到 `9347`，直接污染 histogram、palette search 和 dithering 的输入分布。
-3. 去掉这条坏支路后，原始带 ICC 输入上的 `--nofs` 已从此前的 `127KB+` 级别回落到 `107,700 bytes`，已经接近 `pngquant --nofs` 的 `104,038 bytes`。
-4. 这说明静态 PNG 主链当前剩余差距已从“基础量化完全跑偏”收敛到“selective dithering 默认路径仍偏重”，而不是继续在 histogram / mediancut 外层补护栏。
+2. 当前真正的硬根因已经确认有两处：
+   - 之前引入的 ICC 像素转换会把这张图的唯一颜色数从 `1499` 膨胀到 `9347`
+   - remap / Floyd 前没有像 `init_int_palette()` 那样先按输出精度 round palette
+3. 去掉坏的 ICC 转换并补齐“先 round 再 remap/dither”后，原始带 ICC 输入上的默认抖动和半强度抖动都继续缩小，`--nofs` 保持在接近 `pngquant --nofs` 的区间。
+4. 这说明静态 PNG 主链当前剩余差距已从“基础量化完全跑偏”收敛到“大图无 dither-map 时的 selective Floyd 细节仍偏重”，而不是继续在 histogram / mediancut 外层补护栏。
 
 ### 10.2 本轮已修复的偏差
 
@@ -401,12 +403,14 @@ pngquant /Users/5km/Downloads/demo.png --output /tmp/pngq-q6575-audit.png --qual
    - mediancut 改为带 `total_box_error_below_target()` / `max_mse_per_color` / best-box split 的误差约束切分
 12. 移除了当前有害的 ICC 像素转换支路：现在保留 decoder 输出像素与原始色彩元数据，不再用错误转换把颜色基数从 `1499` 扩张到 `9347`。
 13. 将 indexed PNG 编码默认策略对齐到 `pngquant` 的 `PNG_FILTER_NONE + Deflate Level(9)`，并在 `speed >= 10` 时降到 `Level(1)`。
+14. 将 plain remap / Floyd 的 palette 使用顺序改回与 `init_int_palette()` 一致：先按输出 posterize 精度 round palette，再做 remap/dither。
+15. 对大图默认 Floyd 补上一次 plain remap feedback，让未生成 dither-map 的路径也能拿到更接近 `remap_to_palette()` 的 full-image finalize。
 
 ### 10.3 仍然存在的关键偏差
 
 1. 当前 plain remap / dither remap 还没有完整实现 `remap.rs::remap_to_palette()` 的 full-image K-Means finalize 结构。
 2. 当前 selective dithering 虽然已接入 core subset，但还没达到 `remap_to_palette_floyd()` 的整套 chunk warmup / background-aware / guess 策略。
-3. 默认抖动路径当前仍比 `pngquant` 默认路径大约高 `16.5KB`，说明 dither map / error diffusion 的默认强度还要继续收口。
+3. 默认抖动路径当前仍比 `pngquant` 默认路径大约高 `15.3KB`，说明大图无 dither-map 时的 error diffusion 细节还要继续收口。
 4. `--quality` 路径速度已明显改善，但相对 `pngquant` 仍慢约 `2x`，说明 quantizer 内部仍有可继续收紧的预算与 finalize 开销。
 
 ## 11. 当前判断
