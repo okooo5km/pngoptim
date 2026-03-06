@@ -387,6 +387,9 @@ pngquant /Users/5km/Downloads/demo.png --output /tmp/pngq-q6575-audit.png --qual
 2. 将 `kmeans_iteration_limit` 接入 [`src/quality.rs`](/Users/5km/Dev/Rust/pngoptim/src/quality.rs) 和 [`src/palette_quant.rs`](/Users/5km/Dev/Rust/pngoptim/src/palette_quant.rs)，预算口径向 `attr.rs` 靠拢。
 3. 将 feedback loop 的 K-Means 试探改回“每轮 1 次主迭代 + 最终单独 refine”的结构，不再在 trial 阶段连续做多轮收敛。
 4. 为 `--quality` 模式增加“高质量 256 色基线 + 目标质量候选”的内部比较护栏：如果目标候选未达到最低质量，不再把更差结果直接交给用户。
+5. 对齐了 `hist.rs + mediancut.rs` 的两类关键细节：
+   - histogram 不再做桶内平均色，改为“代表色 + perceptual weight + 16 cluster 起始箱”
+   - mediancut 改为带 `total_box_error_below_target()` / `max_mse_per_color` / best-box split 的误差约束切分
 
 ### 10.3 仍然存在的关键偏差
 
@@ -394,13 +397,14 @@ pngquant /Users/5km/Downloads/demo.png --output /tmp/pngq-q6575-audit.png --qual
 2. 当前 mediancut 仍未实现 `mediancut.rs` 中的 `total_box_error_below_target()`、`max_mse_per_color`、`take_best_splittable_box()` 这套误差约束切分逻辑。
 3. 当前 plain remap / dither remap 还没有完整实现 `remap.rs::remap_to_palette()` 的 full-image K-Means finalize 结构。
 4. 当前 selective dithering 虽然已接入 core subset，但还没达到 `remap_to_palette_floyd()` 的整套 chunk warmup / background-aware / guess 策略。
+5. 默认无 `--quality` 路径现在过于保守：在当前样本上已拉到 `255` 色、`291,209 bytes`，说明默认策略还需要单独校回到更接近 `pngquant` 的收缩行为。
 
 ## 11. 当前判断
 
 1. 静态 PNG 主线不该再被笼统写成“彻底完成”；更准确的状态是“工程主线完成，但静态量化算法仍在 reference-first 复查和收口中”。
 2. 这不是要推翻现有 Rust 主线，而是要把剩余偏差重新压回参考实现模块上去解决。
 3. 继续推进的优先级应该是：
-   1. `hist.rs` 权重与 cluster 细节对齐
-   2. `mediancut.rs` 的误差约束切分对齐
-   3. `remap.rs::remap_to_palette` 的 full-image finalize 对齐
-   4. 最后再继续压 `--quality` 模式的速度与输出体积
+   1. `remap.rs::remap_to_palette` 的 full-image finalize 对齐
+   2. `remap.rs::remap_to_palette_floyd` 的剩余视觉细节对齐
+   3. 默认无 `--quality` 路径的颜色收缩行为校回
+   4. 最后再继续压 `--quality` 模式的速度

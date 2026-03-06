@@ -149,15 +149,16 @@
 
 ### 当前硬阻塞与下一步
 1. 阶段 H 目前暂缓，主任务切回静态 PNG 的 `reference-first` 复查。原因很明确：用户样本已证明当前静态量化主链在平滑阴影和 `--quality` 路径上仍存在可感知差距，不适合在这个状态下继续扩新格式能力。
-2. 当前最硬的阻塞不是工程链路，而是 `libimagequant` 细节对齐仍不完整：
-   - `hist.rs` 的 `perceptual_weight` / `mc_color_weight` / cluster 初始化
-   - `mediancut.rs` 的 `total_box_error_below_target()` / `max_mse_per_color` / best-box split
+2. 当前最硬的阻塞已经进一步收敛到 remap 主链与默认策略：
    - `remap.rs::remap_to_palette` 的 full-image K-Means finalize
-3. 本轮已经先收掉一个最明显的结构偏差：`src/pipeline.rs` 不再在 `--quality` 模式下做外层色数二分；质量约束改回 quantizer 内部，`--quality 65-75` 样本耗时已从约 `7.58s` 降到约 `2.38s`。
+   - `remap.rs::remap_to_palette_floyd` 的剩余视觉细节
+   - 默认无 `--quality` 路径的颜色收缩行为仍偏保守
+3. `src/pipeline.rs` 已不再在 `--quality` 模式下做外层色数二分；质量约束改回 quantizer 内部，`--quality` 的慢路径已明显缩短。
 4. 当前 `demo.png` spot check 的真实状态是：
-   - `pngoptim --quality 65-75`: `141,651 bytes`, `quality_score=81`, `quality_mse=5.608`, `2.38s`
+   - `pngoptim --quality 65-75`: `114,629 bytes`, `quality_score=90`, `quality_mse=2.927`, `2.22s`
+   - `pngoptim` 默认：`291,209 bytes`, `quality_score=99`, `quality_mse=0.025`, `1.52s`
    - `pngquant --quality 65-75`: `136,915 bytes`, `MSE=5.210 (Q=82)`, `0.40s`
-5. 这说明质量已经拉回到接近参考实现，但体积与速度仍落后；下一步必须继续对齐 `hist.rs` / `mediancut.rs` / `remap.rs`，而不是继续扩展 APNG 或做编码层微调。
+5. 这说明 `hist.rs + mediancut.rs` 对齐已经显著提升了 `--quality` 路径，但默认路径也被一并推向高保真保守模式；下一步必须继续对齐 `remap.rs`，再把默认策略单独校回。
 
 ### 最近更新
 1. 2026-03-05：确认参考仓库本地路径与远程可达性，并锁定 `main` 分支 commit。
@@ -216,6 +217,7 @@
 54. 2026-03-06：完成 H1 首版实现：新增 `src/apng.rs`，提供 `decode_apng` / `compose_frames` / `encode_apng`，当前先支持 `RGBA8` APNG；已覆盖 static PNG 非 APNG 判别、separate default image 识别、`dispose_op=Previous` 与 `blend_op=Over` compositing，以及 encode/decode round-trip（`cargo test apng -- --nocapture` 全绿）。
 55. 2026-03-06：基于用户真实样本重新打开静态 PNG 复查：确认当前实现虽已完成工程化主线，但在平滑阴影与 `--quality` 路径上仍存在 reference drift；`Algorithm Replication` 轨道状态由 `Done` 调整为 `In Progress`，阶段 H 暂缓。
 56. 2026-03-06：完成第一轮静态 PNG 复查修复：移除 `src/pipeline.rs` 中外层 `quality -> colors` 二分搜索，引入 `kmeans_iteration_limit`，将 feedback loop 结构改回“trial 一次主迭代 + 最终单独 refine”，并为 `--quality` 增加“高质量 256 色基线 + 目标质量候选”的内部护栏；回归验证 `smoke` 通过（`reports/smoke/static-quality-guard-20260306-r1/summary.md`），`compat` 通过（`reports/compat/static-quality-guard-compat-20260306-r1/summary.md`）。`demo.png --quality 65-75` 当前结果为 `141,651 bytes`, `quality_score=81`, `quality_mse=5.608`, `2.38s`，已明显优于修复前的低质量退化，但相较 `pngquant` 的 `136,915 bytes`, `Q=82`, `0.40s` 仍有体积和速度差距。
+57. 2026-03-06：完成 `hist.rs + mediancut.rs` 第一轮对齐：histogram 不再做桶内平均色，改为“代表色 + perceptual weight + 16 cluster 起始箱”；mediancut 改为带 `total_box_error_below_target()` / `max_mse_per_color` / best-box split 的误差约束切分。回归验证 `smoke` 通过（`reports/smoke/hist-mediancut-20260306-r1/summary.md`），`compat` 通过（`reports/compat/hist-mediancut-compat-20260306-r1/summary.md`）。`demo.png --quality 65-75` 当前结果提升为 `114,629 bytes`, `quality_score=90`, `quality_mse=2.927`, `2.22s`；但默认无 `--quality` 路径同时回退到过于保守的 `291,209 bytes`, `quality_score=99`，说明下一步必须继续对齐 `remap.rs` 并校回默认策略。
 
 ### 更新规则
 1. 每次推进必须更新对应阶段状态：`Not Started` / `In Progress` / `Blocked` / `Done`。

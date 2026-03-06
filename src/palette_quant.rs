@@ -70,7 +70,7 @@ pub fn quantize_indexed(
     if palette.is_empty() {
         palette = vec![InternalPixel::default()];
     }
-    if histogram.len() <= 4_096 {
+    if histogram.items.len() <= 4_096 {
         refine_palette_from_pixels(rgba, &mut palette, settings.input_posterize_bits, 1);
     }
 
@@ -109,19 +109,32 @@ pub fn quantizer_settings(
 #[derive(Debug, Clone, Copy)]
 struct HistItem {
     color: InternalPixel,
-    weight: f32,
     adjusted_weight: f32,
+    perceptual_weight: f32,
+    mc_color_weight: f32,
+    sort_value: u32,
     likely_palette_index: u16,
 }
 
 #[derive(Default)]
 struct HistAccumulator {
-    count: u32,
     importance_sum: f64,
-    sum_a: f64,
-    sum_r: f64,
-    sum_g: f64,
-    sum_b: f64,
+    representative: [u8; 4],
+    cluster_index: u8,
+    initialized: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct Cluster {
+    begin: usize,
+    end: usize,
+}
+
+#[derive(Debug, Clone, Default)]
+struct HistogramData {
+    items: Vec<HistItem>,
+    total_perceptual_weight: f64,
+    clusters: [Cluster; MAX_CLUSTERS],
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -129,8 +142,10 @@ struct ColorBox {
     start: usize,
     end: usize,
     average: InternalPixel,
-    total_weight: f64,
+    adjusted_weight_sum: f64,
     variance: [f64; 4],
+    total_error: Option<f64>,
+    max_error: f32,
 }
 
 impl ColorBox {
@@ -139,7 +154,7 @@ impl ColorBox {
             return None;
         }
 
-        let mut total_weight = 0.0f64;
+        let mut adjusted_weight_sum = 0.0f64;
         let mut sum_a = 0.0f64;
         let mut sum_r = 0.0f64;
         let mut sum_g = 0.0f64;
@@ -147,39 +162,43 @@ impl ColorBox {
 
         for item in &items[start..end] {
             let weight = f64::from(item.adjusted_weight);
-            total_weight += weight;
+            adjusted_weight_sum += weight;
             sum_a += f64::from(item.color.a) * weight;
             sum_r += f64::from(item.color.r) * weight;
             sum_g += f64::from(item.color.g) * weight;
             sum_b += f64::from(item.color.b) * weight;
         }
 
-        if total_weight == 0.0 {
+        if adjusted_weight_sum == 0.0 {
             return None;
         }
 
         let average = InternalPixel {
-            a: (sum_a / total_weight) as f32,
-            r: (sum_r / total_weight) as f32,
-            g: (sum_g / total_weight) as f32,
-            b: (sum_b / total_weight) as f32,
+            a: (sum_a / adjusted_weight_sum) as f32,
+            r: (sum_r / adjusted_weight_sum) as f32,
+            g: (sum_g / adjusted_weight_sum) as f32,
+            b: (sum_b / adjusted_weight_sum) as f32,
         };
 
         let mut variance = [0.0; 4];
+        let mut max_error = 0.0f32;
         for item in &items[start..end] {
             let weight = f64::from(item.adjusted_weight);
             variance[0] += f64::from((item.color.a - average.a).powi(2)) * weight;
             variance[1] += f64::from((item.color.r - average.r).powi(2)) * weight;
             variance[2] += f64::from((item.color.g - average.g).powi(2)) * weight;
             variance[3] += f64::from((item.color.b - average.b).powi(2)) * weight;
+            max_error = max_error.max(average.diff(item.color));
         }
 
         Some(Self {
             start,
             end,
             average,
-            total_weight,
+            adjusted_weight_sum,
             variance,
+            total_error: None,
+            max_error,
         })
     }
 
@@ -187,19 +206,84 @@ impl ColorBox {
         self.end - self.start
     }
 
-    fn dominant_channel(self) -> usize {
-        self.variance
-            .iter()
-            .enumerate()
-            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(Ordering::Equal))
-            .map(|(idx, _)| idx)
-            .unwrap_or(0)
+    fn prepare_sort(self, items: &mut [HistItem]) {
+        let mut channels = [
+            (0usize, self.variance[0] as f32),
+            (1usize, self.variance[1] as f32),
+            (2usize, self.variance[2] as f32),
+            (3usize, self.variance[3] as f32),
+        ];
+        channels.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal));
+
+        for item in &mut items[self.start..self.end] {
+            let comps = color_components(item.color);
+            let primary = (comps[channels[0].0] * 65535.0).clamp(0.0, 65535.0) as u16;
+            let secondary =
+                ((comps[channels[2].0] + comps[channels[1].0] / 2.0 + comps[channels[3].0] / 4.0)
+                    * 65535.0)
+                    .clamp(0.0, 65535.0) as u16;
+            item.sort_value = (u32::from(primary) << 16) | u32::from(secondary);
+        }
     }
 
-    fn score(self) -> f64 {
-        self.total_weight * self.variance[self.dominant_channel()]
+    fn compute_total_error(&mut self, items: &[HistItem]) -> f64 {
+        let avg = self.average;
+        let total_error = items[self.start..self.end]
+            .iter()
+            .map(|item| f64::from(avg.diff(item.color)) * f64::from(item.perceptual_weight))
+            .sum::<f64>();
+        self.total_error = Some(total_error);
+        total_error
+    }
+
+    fn prepare_color_weight_total(self, items: &mut [HistItem]) -> f64 {
+        let len = self.len();
+        let median = {
+            let slice = &mut items[self.start..self.end];
+            let (_, mid, _) = slice.select_nth_unstable_by_key(len / 2, |item| item.sort_value);
+            mid.color
+        };
+        items[self.start..self.end]
+            .iter_mut()
+            .map(|item| {
+                let weight = (median.diff(item.color).sqrt() * (2.0 + item.adjusted_weight)).sqrt();
+                item.mc_color_weight = weight;
+                f64::from(weight)
+            })
+            .sum()
+    }
+
+    fn split(self, items: &mut [HistItem]) -> Option<(Self, Self)> {
+        if self.len() <= 1 {
+            return None;
+        }
+
+        self.prepare_sort(items);
+        let half_weight = self.prepare_color_weight_total(items) / 2.0;
+
+        let local_split = {
+            let slice = &mut items[self.start..self.end];
+            slice.sort_unstable_by_key(|item| std::cmp::Reverse(item.sort_value));
+            let mut cumulative = 0.0f64;
+            let mut split = 1usize;
+            for idx in 0..slice.len() - 1 {
+                cumulative += f64::from(slice[idx].mc_color_weight);
+                if cumulative >= half_weight {
+                    split = idx + 1;
+                    break;
+                }
+            }
+            split.clamp(1, slice.len() - 1)
+        };
+
+        let split = self.start + local_split;
+        let left = Self::new(items, self.start, split)?;
+        let right = Self::new(items, split, self.end)?;
+        Some((left, right))
     }
 }
+
+const MAX_CLUSTERS: usize = 16;
 
 fn build_histogram(
     rgba: &[u8],
@@ -208,123 +292,244 @@ fn build_histogram(
     max_histogram_entries: u32,
     gamma: &[f32; 256],
     importance_map: Option<&[u8]>,
-) -> Vec<HistItem> {
+) -> HistogramData {
     let mut bits = initial_posterize_bits.min(4);
     loop {
         let mut map: HashMap<u32, HistAccumulator> = HashMap::new();
         for (pixel_idx, px) in rgba.chunks_exact(4).enumerate() {
             let key = pack_rgba_key(px, bits);
             let entry = map.entry(key).or_default();
-            let posterized = posterized_rgba(px, bits);
-            let color = InternalPixel::from_rgba(gamma, &posterized);
             let importance = f64::from(
                 importance_map
                     .and_then(|map| map.get(pixel_idx))
                     .copied()
                     .unwrap_or(255),
             );
-            entry.count = entry.count.saturating_add(1);
             entry.importance_sum += importance;
-            entry.sum_a += f64::from(color.a);
-            entry.sum_r += f64::from(color.r);
-            entry.sum_g += f64::from(color.g);
-            entry.sum_b += f64::from(color.b);
+            if !entry.initialized {
+                let rgba = [px[0], px[1], px[2], px[3]];
+                entry.representative = rgba;
+                entry.cluster_index = cluster_index(rgba);
+                entry.initialized = true;
+            }
         }
 
         if map.len() <= max_histogram_entries as usize || bits >= 4 {
-            return finalize_histogram(map);
+            return finalize_histogram(map, gamma);
         }
         bits += 1;
     }
 }
 
-fn finalize_histogram(map: HashMap<u32, HistAccumulator>) -> Vec<HistItem> {
-    let total_weight = map.values().map(|item| item.importance_sum).sum::<f64>() as f32;
-    let max_weight = ((0.1 / 255.0) * f64::from(total_weight)) as f32;
-
-    let mut out = map
-        .into_values()
-        .filter_map(|acc| {
-            if acc.count == 0 {
-                return None;
-            }
-            let inv = 1.0 / f64::from(acc.count);
-            let color = InternalPixel {
-                a: (acc.sum_a * inv) as f32,
-                r: (acc.sum_r * inv) as f32,
-                g: (acc.sum_g * inv) as f32,
-                b: (acc.sum_b * inv) as f32,
-            };
-            let weight = ((acc.importance_sum as f32) / 255.0).min(max_weight.max(1.0 / 255.0));
-            Some(HistItem {
-                color,
-                weight,
-                adjusted_weight: weight,
-                likely_palette_index: 0,
-            })
-        })
-        .collect::<Vec<_>>();
-
-    out.sort_by(|a, b| b.weight.partial_cmp(&a.weight).unwrap_or(Ordering::Equal));
-    out
-}
-
-fn median_cut_palette(histogram: &mut [HistItem], target_colors: usize) -> Vec<InternalPixel> {
-    let items = histogram;
-    let mut boxes = vec![ColorBox::new(items, 0, items.len()).expect("non-empty histogram")];
-
-    while boxes.len() < target_colors {
-        let Some((box_index, selected)) = boxes
-            .iter()
-            .copied()
-            .enumerate()
-            .filter(|(_, b)| b.len() > 1)
-            .max_by(|(_, a), (_, b)| a.score().partial_cmp(&b.score()).unwrap_or(Ordering::Equal))
-        else {
-            break;
-        };
-
-        let channel = selected.dominant_channel();
-        items[selected.start..selected.end].sort_by(|a, b| {
-            channel_value(a.color, channel)
-                .partial_cmp(&channel_value(b.color, channel))
-                .unwrap_or(Ordering::Equal)
-        });
-
-        let mut cumulative = 0.0f64;
-        let half = selected.total_weight / 2.0;
-        let mut split = selected.start + 1;
-        for idx in selected.start..selected.end - 1 {
-            cumulative += f64::from(items[idx].adjusted_weight);
-            if cumulative >= half {
-                split = idx + 1;
-                break;
-            }
-        }
-        split = split.clamp(selected.start + 1, selected.end - 1);
-
-        let left = ColorBox::new(&items, selected.start, split);
-        let right = ColorBox::new(&items, split, selected.end);
-        let (Some(left), Some(right)) = (left, right) else {
-            break;
-        };
-
-        boxes.swap_remove(box_index);
-        boxes.push(left);
-        boxes.push(right);
+fn finalize_histogram(map: HashMap<u32, HistAccumulator>, gamma: &[f32; 256]) -> HistogramData {
+    if map.is_empty() {
+        return HistogramData::default();
     }
 
-    boxes.iter().map(|b| b.average).collect()
+    let temp = map
+        .into_values()
+        .filter(|acc| acc.initialized && acc.importance_sum > 0.0)
+        .collect::<Vec<_>>();
+    if temp.is_empty() {
+        return HistogramData::default();
+    }
+
+    let mut counts = [0usize; MAX_CLUSTERS];
+    for item in &temp {
+        counts[item.cluster_index as usize] += 1;
+    }
+
+    let mut clusters = [Cluster::default(); MAX_CLUSTERS];
+    let mut next_begin = 0usize;
+    for (cluster, count) in clusters.iter_mut().zip(counts) {
+        cluster.begin = next_begin;
+        cluster.end = next_begin;
+        next_begin += count;
+    }
+
+    let max_perceptual_weight =
+        ((0.1 / 255.0) * temp.iter().map(|item| item.importance_sum).sum::<f64>()) as f32;
+    let mut items = vec![
+        HistItem {
+            color: InternalPixel::default(),
+            adjusted_weight: 0.0,
+            perceptual_weight: 0.0,
+            mc_color_weight: 0.0,
+            sort_value: 0,
+            likely_palette_index: 0,
+        };
+        temp.len()
+    ];
+    let mut total_perceptual_weight = 0.0f64;
+
+    for item in temp {
+        let cluster = &mut clusters[item.cluster_index as usize];
+        let next_index = cluster.end;
+        cluster.end += 1;
+
+        let weight = ((item.importance_sum as f32) / 255.0).min(max_perceptual_weight);
+        let weight = weight.max(1.0 / 255.0);
+        total_perceptual_weight += f64::from(weight);
+
+        items[next_index] = HistItem {
+            color: InternalPixel::from_rgba(gamma, &item.representative),
+            adjusted_weight: weight,
+            perceptual_weight: weight,
+            mc_color_weight: 0.0,
+            sort_value: 0,
+            likely_palette_index: 0,
+        };
+    }
+
+    HistogramData {
+        items,
+        total_perceptual_weight,
+        clusters,
+    }
 }
 
-fn find_best_palette(histogram: &[HistItem], settings: QuantizerSettings) -> Vec<InternalPixel> {
-    if histogram.is_empty() {
+fn median_cut_palette(
+    histogram: &mut HistogramData,
+    target_colors: usize,
+    target_mse: f64,
+    max_mse_per_color: f64,
+) -> Vec<InternalPixel> {
+    if histogram.items.is_empty() {
+        return vec![InternalPixel::default()];
+    }
+
+    let mut boxes = initial_color_boxes(histogram, target_colors);
+    let max_mse_per_color = max_mse_per_color.max(quality_to_mse(20));
+
+    while boxes.len() < target_colors {
+        let fraction_done = boxes.len() as f64 / target_colors as f64;
+        let current_max_mse = (fraction_done * 16.0).mul_add(max_mse_per_color, max_mse_per_color);
+        let Some(box_index) = take_best_splittable_box(&boxes, current_max_mse) else {
+            break;
+        };
+
+        let selected = boxes.swap_remove(box_index);
+        let Some((left, right)) = selected.split(&mut histogram.items) else {
+            break;
+        };
+        boxes.push(left);
+        boxes.push(right);
+
+        if total_box_error_below_target(
+            &mut boxes,
+            &histogram.items,
+            histogram.total_perceptual_weight,
+            target_mse,
+        ) {
+            break;
+        }
+    }
+
+    boxes_to_palette(&mut boxes, &mut histogram.items)
+}
+
+fn initial_color_boxes(histogram: &HistogramData, target_colors: usize) -> Vec<ColorBox> {
+    let used_boxes = histogram
+        .clusters
+        .iter()
+        .filter(|cluster| cluster.begin != cluster.end)
+        .count();
+    if used_boxes > 0 && used_boxes <= target_colors / 3 {
+        histogram
+            .clusters
+            .iter()
+            .filter(|cluster| cluster.begin != cluster.end)
+            .filter_map(|cluster| ColorBox::new(&histogram.items, cluster.begin, cluster.end))
+            .collect()
+    } else {
+        vec![
+            ColorBox::new(&histogram.items, 0, histogram.items.len()).expect("non-empty histogram"),
+        ]
+    }
+}
+
+fn take_best_splittable_box(boxes: &[ColorBox], max_mse: f64) -> Option<usize> {
+    boxes
+        .iter()
+        .enumerate()
+        .filter(|(_, color_box)| color_box.len() > 1)
+        .map(|(idx, color_box)| {
+            let mut score = color_box.adjusted_weight_sum * color_box.variance.iter().sum::<f64>();
+            if f64::from(color_box.max_error) > max_mse {
+                score = score * f64::from(color_box.max_error) / max_mse;
+            }
+            (idx, score)
+        })
+        .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(Ordering::Equal))
+        .map(|(idx, _)| idx)
+}
+
+fn total_box_error_below_target(
+    boxes: &mut [ColorBox],
+    items: &[HistItem],
+    total_perceptual_weight: f64,
+    target_mse: f64,
+) -> bool {
+    if !target_mse.is_finite() {
+        return false;
+    }
+
+    let target_total_error = target_mse * total_perceptual_weight;
+    let mut total_error = boxes
+        .iter()
+        .filter_map(|color_box| color_box.total_error)
+        .sum::<f64>();
+    if total_error > target_total_error {
+        return false;
+    }
+
+    for color_box in boxes
+        .iter_mut()
+        .filter(|color_box| color_box.total_error.is_none())
+    {
+        total_error += color_box.compute_total_error(items);
+        if total_error > target_total_error {
+            return false;
+        }
+    }
+    true
+}
+
+fn boxes_to_palette(boxes: &mut [ColorBox], items: &mut [HistItem]) -> Vec<InternalPixel> {
+    let mut palette = Vec::with_capacity(boxes.len());
+    for (palette_index, color_box) in boxes.iter_mut().enumerate() {
+        for item in &mut items[color_box.start..color_box.end] {
+            item.likely_palette_index = palette_index as u16;
+        }
+
+        let representative = if color_box.len() > 2 {
+            items[color_box.start..color_box.end]
+                .iter()
+                .min_by(|a, b| {
+                    color_box
+                        .average
+                        .diff(a.color)
+                        .partial_cmp(&color_box.average.diff(b.color))
+                        .unwrap_or(Ordering::Equal)
+                })
+                .map(|item| item.color)
+                .unwrap_or(color_box.average)
+        } else {
+            color_box.average
+        };
+        palette.push(representative);
+    }
+    palette
+}
+
+fn find_best_palette(histogram: &HistogramData, settings: QuantizerSettings) -> Vec<InternalPixel> {
+    if histogram.items.is_empty() {
         return vec![InternalPixel::default()];
     }
 
     let max_colors = settings.max_colors.clamp(2, 256);
-    let mut hist = histogram.to_vec();
-    let hist_items = hist.len();
+    let mut hist = histogram.clone();
+    let hist_items = hist.items.len();
     let total_trials = effective_feedback_trials(settings.feedback_loop_trials, hist_items);
     let final_iteration_limit =
         effective_kmeans_iteration_limit(settings.kmeans_iteration_limit, hist_items);
@@ -336,14 +541,14 @@ fn find_best_palette(histogram: &[HistItem], settings: QuantizerSettings) -> Vec
         has_quality_target,
     );
 
-    if hist.len() <= max_colors || total_trials == 0 || !has_quality_target {
-        let mut palette = if hist.len() <= max_colors {
-            hist.iter().map(|item| item.color).collect::<Vec<_>>()
+    if hist.items.len() <= max_colors || total_trials == 0 || !has_quality_target {
+        let mut palette = if hist.items.len() <= max_colors {
+            hist.items.iter().map(|item| item.color).collect::<Vec<_>>()
         } else {
-            median_cut_palette(&mut hist, max_colors)
+            median_cut_palette(&mut hist, max_colors, f64::INFINITY, f64::INFINITY)
         };
         let _ = refine_palette(
-            &mut hist,
+            &mut hist.items,
             &mut palette,
             final_iterations,
             false,
@@ -355,17 +560,18 @@ fn find_best_palette(histogram: &[HistItem], settings: QuantizerSettings) -> Vec
     let target_mse = settings.target_mse.unwrap_or(f64::INFINITY);
     let mut current_max_colors = max_colors;
     let mut trials_left = total_trials as i32;
-    let mut baseline_hist = histogram.to_vec();
-    let mut baseline_palette = if baseline_hist.len() <= max_colors {
+    let mut baseline_hist = histogram.clone();
+    let mut baseline_palette = if baseline_hist.items.len() <= max_colors {
         baseline_hist
+            .items
             .iter()
             .map(|item| item.color)
             .collect::<Vec<_>>()
     } else {
-        median_cut_palette(&mut baseline_hist, max_colors)
+        median_cut_palette(&mut baseline_hist, max_colors, f64::INFINITY, f64::INFINITY)
     };
     let baseline_stats = refine_palette(
-        &mut baseline_hist,
+        &mut baseline_hist.items,
         &mut baseline_palette,
         final_iterations,
         false,
@@ -379,6 +585,7 @@ fn find_best_palette(histogram: &[HistItem], settings: QuantizerSettings) -> Vec
     let mut best_error = baseline_stats.error;
     let mut best_used_colors = baseline_used_colors;
     let mut fails_in_a_row = 0i32;
+    let mut target_mse_overshoot = if total_trials > 0 { 1.05 } else { 1.0 };
 
     if best_error < target_mse && best_error > 0.0 {
         current_max_colors = current_max_colors
@@ -388,9 +595,18 @@ fn find_best_palette(histogram: &[HistItem], settings: QuantizerSettings) -> Vec
     }
 
     while trials_left > 0 && current_max_colors >= 2 {
-        let mut palette = median_cut_palette(&mut hist, current_max_colors);
+        let max_mse_per_color = target_mse
+            .max(best_error.min(quality_to_mse(1)))
+            .max(quality_to_mse(51))
+            * 1.2;
+        let mut palette = median_cut_palette(
+            &mut hist,
+            current_max_colors,
+            target_mse * target_mse_overshoot,
+            max_mse_per_color,
+        );
         let first_target_run = best_palette.is_none() && target_mse > 0.0;
-        let stats = kmeans_iteration(&mut hist, &mut palette, !first_target_run);
+        let stats = kmeans_iteration(&mut hist.items, &mut palette, !first_target_run);
         let used_colors = stats.used_colors.max(2).min(palette.len());
         let better = best_palette.is_none()
             || stats.error < best_error
@@ -404,6 +620,8 @@ fn find_best_palette(histogram: &[HistItem], settings: QuantizerSettings) -> Vec
             trials_left -= 1;
 
             if stats.error <= target_mse && current_max_colors > 2 {
+                target_mse_overshoot = (target_mse_overshoot * 1.25)
+                    .min(target_mse / stats.error.max(f64::MIN_POSITIVE));
                 current_max_colors = current_max_colors
                     .min(used_colors.saturating_add(1))
                     .saturating_sub(1)
@@ -411,12 +629,14 @@ fn find_best_palette(histogram: &[HistItem], settings: QuantizerSettings) -> Vec
             }
         } else {
             fails_in_a_row += 1;
+            target_mse_overshoot = 1.0;
             trials_left -= 1 + fails_in_a_row.min(2);
         }
     }
 
-    let mut palette = best_palette.unwrap_or_else(|| median_cut_palette(&mut hist, max_colors));
-    let mut final_hist = histogram.to_vec();
+    let mut palette = best_palette
+        .unwrap_or_else(|| median_cut_palette(&mut hist, max_colors, f64::INFINITY, f64::INFINITY));
+    let mut final_hist = histogram.clone();
     let palette_error_is_known = best_error.is_finite();
     let final_iterations = effective_kmeans_iterations(
         settings.kmeans_iterations,
@@ -425,7 +645,7 @@ fn find_best_palette(histogram: &[HistItem], settings: QuantizerSettings) -> Vec
         has_quality_target,
     );
     let _ = refine_palette(
-        &mut final_hist,
+        &mut final_hist.items,
         &mut palette,
         final_iterations,
         false,
@@ -476,7 +696,7 @@ fn kmeans_iteration(
     let mut usage = vec![0usize; palette.len()];
     let total_weight = histogram
         .iter()
-        .map(|item| f64::from(item.weight))
+        .map(|item| f64::from(item.perceptual_weight))
         .sum::<f64>()
         .max(1e-9);
     let mut total_error = 0.0f64;
@@ -486,18 +706,19 @@ fn kmeans_iteration(
         let (nearest, diff_sq) = tree.search(item.color, hint);
         let diff = f64::from(diff_sq);
         item.likely_palette_index = nearest as u16;
-        total_error += diff * f64::from(item.weight);
+        total_error += diff * f64::from(item.perceptual_weight);
 
         let weight = if adjust_weights {
             let reflected = reflected_color(item.color, palette[nearest]);
             let reflected_diff = f64::from(tree.search(reflected, nearest).1);
-            let adjusted = (2.0 * f64::from(item.adjusted_weight) + f64::from(item.weight))
+            let adjusted = (2.0 * f64::from(item.adjusted_weight)
+                + f64::from(item.perceptual_weight))
                 * (0.5 + reflected_diff.sqrt());
-            item.adjusted_weight = adjusted.min(f64::from(item.weight) * 32.0) as f32;
+            item.adjusted_weight = adjusted.min(f64::from(item.perceptual_weight) * 32.0) as f32;
             item.adjusted_weight
         } else {
-            item.adjusted_weight = item.weight;
-            item.weight
+            item.adjusted_weight = item.perceptual_weight;
+            item.perceptual_weight
         };
 
         let weight = f64::from(weight);
@@ -1419,13 +1640,12 @@ fn add_scaled_error(target: &mut InternalPixel, diff: InternalPixel, scale: f32)
     target.b += diff.b * scale;
 }
 
-fn channel_value(color: InternalPixel, channel: usize) -> f32 {
-    match channel {
-        0 => color.a,
-        1 => color.r,
-        2 => color.g,
-        _ => color.b,
-    }
+fn color_components(color: InternalPixel) -> [f32; 4] {
+    [color.a, color.r, color.g, color.b]
+}
+
+fn cluster_index(rgba: [u8; 4]) -> u8 {
+    ((rgba[0] >> 7) << 3) | ((rgba[1] >> 7) << 2) | ((rgba[2] >> 7) << 1) | (rgba[3] >> 7)
 }
 
 fn pack_rgba_key(rgba: &[u8], posterize_bits: u8) -> u32 {
