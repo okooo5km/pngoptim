@@ -124,10 +124,10 @@
 | Algorithm Replication | In Progress | 对齐 `pngquant/libimagequant` 的核心量化主链 | `docs/phase-d/ALGORITHM_REPLICATION_ANALYSIS_V1.md` |
 
 ### 当前硬阻塞与下一步
-1. 当前 R2 量化主链虽然已恢复 `smoke 9/9`，但在 `demo.png` 上仍只有 `quality_score=45`，无法满足 `--quality 65-75` 的最低质量门槛。
+1. 当前 R2.1 量化主链已把 `demo.png` 的默认输出质量从 `quality_score=45` 提升到 `56`，但在 `--quality 65-75` 下仍只有 `actual=57`，尚未满足最低质量门槛。
 2. naive 全图 Floyd 已被证明方向错误：会放大输出并拉低质量，后续必须实现 `dither map + selective dithering`，不能把全图误差扩散当作 pngquant 等价物。
-3. R2 把质量方向拉正后，性能明显回退，后续需要在完成 feedback loop / remap 主链后重新回到阶段 E 做性能收口。
-4. 当前最合理的执行顺序仍是：`R2.1 feedback loop` -> `R2.2 remap refinement` -> `R3 VP-tree + selective dithering` -> `E 回归优化`。
+3. R2.1 已引入 feedback-style palette search 与一次真实像素 remap 收敛，但 `perf-002-large-alpha-pattern` 仍从基线约 `33s` 回退到约 `104s`，性能收口仍是硬阻塞。
+4. 当前最合理的执行顺序仍是：`R2.2 selective remap refinement` -> `R3 VP-tree + selective dithering` -> `E 回归优化`。
 
 ### 最近更新
 1. 2026-03-05：确认参考仓库本地路径与远程可达性，并锁定 `main` 分支 commit。
@@ -167,6 +167,8 @@
 35. 2026-03-06：验证了 naive 全图 Floyd remap：在 `demo.png` 上会把输出放大到约 `348KB` 且质量分数下降到 `22`，不符合 pngquant 的 selective dithering 思路；当前仅在启用抖动时做“择优采用”，后续需实现 dither map/选择性抖动而非全图误差扩散。
 36. 2026-03-06：完成阶段记忆审计，确认仓库中不存在 `.py` 文件、workflow 也未重新依赖 Python；此前出现的 Python 仅为一次性本地分析命令，未进入主线。
 37. 2026-03-06：将“Rust-only 主线编排”和“参考实现可借鉴但受许可证约束”的决策写入阶段记忆，避免后续在实现路线与依赖策略上反复横跳。
+38. 2026-03-06：完成 R2.1 第一版反馈式 palette search：将 `target_mse` 与 `feedback_loop_trials` 接入 Rust quantizer，并把 histogram 权重反馈到后续 median cut；`compat` 通过（`reports/compat/r2-1d-compat-verify/summary.md`），`smoke` 通过（`reports/smoke/r2-1d-smoke-verify/summary.md`）。
+39. 2026-03-06：为中等复杂度直方图新增 1 次真实像素 remap 收敛，`demo.png` 默认输出提升到 `quality_score=56`, `quality_mse=14.644`, `131278 bytes`；但 `--quality 65-75` 仍失败（`actual=57`），且 `perf-002-large-alpha-pattern` 仍为当前主要性能回退样本（`104049.867 ms`）。
 
 ### 更新规则
 1. 每次推进必须更新对应阶段状态：`Not Started` / `In Progress` / `Blocked` / `Done`。

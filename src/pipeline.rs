@@ -11,7 +11,9 @@ use crate::error::AppError;
 use crate::palette_quant::{
     IndexedImage, max_colors_from_quality_speed, quantize_indexed, quantizer_settings,
 };
-use crate::quality::{QualityMetrics, SpeedSettings, evaluate_quality_against_rgba};
+use crate::quality::{
+    QualityMetrics, SpeedSettings, evaluate_quality_against_rgba, quality_to_mse,
+};
 
 #[derive(Debug, Clone)]
 pub struct PipelineOptions {
@@ -155,6 +157,7 @@ fn select_palette_candidate(
     speed_settings: SpeedSettings,
     dither: bool,
 ) -> QuantizeCandidate {
+    let target_mse = quality.map(|range| quality_to_mse(range.max));
     let evaluate = |max_colors: usize| {
         evaluate_candidate(
             rgba,
@@ -163,6 +166,7 @@ fn select_palette_candidate(
             max_colors,
             output_posterize_bits,
             speed_settings,
+            target_mse,
             dither,
         )
     };
@@ -221,6 +225,7 @@ fn evaluate_candidate(
     max_colors: usize,
     output_posterize_bits: u8,
     speed_settings: SpeedSettings,
+    target_mse: Option<f64>,
     dither: bool,
 ) -> QuantizeCandidate {
     let mut best = evaluate_candidate_once(
@@ -230,6 +235,7 @@ fn evaluate_candidate(
         max_colors,
         output_posterize_bits,
         speed_settings,
+        target_mse,
         false,
     );
 
@@ -241,6 +247,7 @@ fn evaluate_candidate(
             max_colors,
             output_posterize_bits,
             speed_settings,
+            target_mse,
             true,
         );
         if dithered.quality.quality_score > best.quality.quality_score
@@ -261,9 +268,10 @@ fn evaluate_candidate_once(
     max_colors: usize,
     output_posterize_bits: u8,
     speed_settings: SpeedSettings,
+    target_mse: Option<f64>,
     dither: bool,
 ) -> QuantizeCandidate {
-    let quantizer = quantizer_settings(max_colors, speed_settings, dither);
+    let quantizer = quantizer_settings(max_colors, speed_settings, target_mse, dither);
     let mut indexed = quantize_indexed(rgba, width, height, quantizer);
     if output_posterize_bits > 0 {
         apply_posterize_palette(&mut indexed.palette, output_posterize_bits);

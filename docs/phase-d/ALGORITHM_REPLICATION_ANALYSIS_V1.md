@@ -180,24 +180,24 @@
 
 也就是说，`pngquant` 会把“尺寸收益是否值得质量损失”一起算进去。
 
-## 7. 当前项目与参考实现的关键差距（基于 R2 当前状态）
+## 7. 当前项目与参考实现的关键差距（基于 R2.1 当前状态）
 
 以下差距不是调参问题，而是架构级差距：
 
-### 7.1 质量语义只完成了第一层对齐
+### 7.1 质量语义已接通，但质量搜索仍未闭环
 
-- 当前：R1 已把 `--quality` 接到 `quality <-> MSE` 标尺，并在 [`src/quality.rs`](/Users/5km/Dev/Rust/pngoptim/src/quality.rs) 与 [`src/pipeline.rs`](/Users/5km/Dev/Rust/pngoptim/src/pipeline.rs) 中作为统一门禁使用。
-- 当前缺口：`quality` 已不再是“取中值直接映射色数”，但搜索过程还没有达到 `libimagequant` 那种围绕 `target_mse/max_mse` 反复收缩 palette 的反馈式搜索。
+- 当前：R1 已把 `--quality` 接到 `quality <-> MSE` 标尺；R2.1 又把 `target_mse` 与 `feedback_loop_trials` 接入 [`src/pipeline.rs`](/Users/5km/Dev/Rust/pngoptim/src/pipeline.rs) 和 [`src/palette_quant.rs`](/Users/5km/Dev/Rust/pngoptim/src/palette_quant.rs)。
+- 当前缺口：搜索过程已具备反馈式雏形，但还没有达到 `libimagequant` 那种围绕 `target_mse/max_mse` 的稳定收缩闭环。
 - 参考：`quality -> target_mse/max_mse -> feedback loop -> 满足质量约束的更小 palette`。
 
-### 7.2 palette search 已进入正确方向，但仍未达到参考实现
+### 7.2 palette search 与 remap refine 已进入正确方向，但仍未达到参考实现
 
-- 当前：R2 已替换掉旧桶统计截断量化器，改为 gamma-aware histogram + weighted median cut + k-means refine + palette prune/remap，见 [`src/palette_quant.rs`](/Users/5km/Dev/Rust/pngoptim/src/palette_quant.rs)。
-- 当前缺口：仍缺少 `libimagequant` 风格的 feedback loop、基于误差约束的多轮 palette 缩减、unused color replacement 和更成熟的 remap 统计回灌。
+- 当前：R2 已替换掉旧桶统计截断量化器，R2.1 又补上了 feedback-style palette search、unused color replacement 和 1 次真实像素 remap 收敛，见 [`src/palette_quant.rs`](/Users/5km/Dev/Rust/pngoptim/src/palette_quant.rs)。
+- 当前缺口：仍缺少 `libimagequant` 风格更稳定的多轮 palette 缩减、VP-tree nearest 和 selective dithering/dither map。
 
 这条链路当前仍然缺少：
 
-1. feedback loop 驱动的 palette 搜索收缩。
+1. 更稳定的 feedback loop palette 缩减。
 2. remap 阶段继续累计统计并回灌 palette。
 3. VP-tree nearest。
 4. `dither map + selective Floyd`。
@@ -231,15 +231,15 @@ pngquant /Users/5km/Downloads/demo.png --output /tmp/pngquant-demo-q6575.png --q
 
 | 场景 | 输出大小 | 质量结果 | 备注 |
 |---|---:|---:|---|
-| 当前 `pngoptim` 默认输出 | `131,368` bytes | `quality_score=45`, `quality_mse=19.336` | 可写出，但质量明显低于 `65` 门槛 |
-| 当前 `pngoptim --quality 65-75` | 无输出 | `actual=45, minimum=65` | 按新门禁正确失败 |
+| 当前 `pngoptim` 默认输出 | `131,278` bytes | `quality_score=56`, `quality_mse=14.644` | R2.1 后明显改善，但仍未达到参考质量 |
+| 当前 `pngoptim --quality 65-75` | 无输出 | `actual=57, minimum=65` | 按新门禁正确失败，说明仍有质量缺口 |
 | 参考 `pngquant --quality 65-75` | `136,915` bytes | `MSE=5.210 (Q=82)` | `19` 色，满足质量要求 |
 
 补充观测：
 
-1. 当前实现默认结果虽然比 `pngquant` 的 `65-75` 输出更小，但这是因为它没有达到同一质量约束，不能当作“压得更好”。
-2. 在真正可比的 `--quality 65-75` 场景下，当前实现直接失败，而 `pngquant` 可以在满足质量门槛的同时输出 `136,915` bytes。
-3. 这说明当前缺口不在 PNG 编码尾部，而在 palette search、remap 与 selective dithering 主链。
+1. R2.1 证明当前主要收益确实来自 palette search + remap refine，而不是 PNG 编码尾部微调。
+2. 在真正可比的 `--quality 65-75` 场景下，当前实现仍直接失败，而 `pngquant` 可以在满足质量门槛的同时输出 `136,915` bytes。
+3. 这说明当前缺口已经从“完全走错方向”收窄为“还差更成熟的 remap/search/dither 主链”。
 
 结论：这不是编码器调优问题，主要差距来自 palette 搜索、remap 与 dithering 算法本身。
 
@@ -279,6 +279,6 @@ pngquant /Users/5km/Downloads/demo.png --output /tmp/pngquant-demo-q6575.png --q
 ## 10. 本轮结论
 
 1. 当前项目已经完成 Rust 工程化与发布链路，不再依赖 Python 编排。
-2. R1 已完成质量标尺纠偏，R2 已把量化器从错误方向拉回到 median cut/k-means 主链，但离参考实现仍有实质差距。
-3. 下一步不应回退到“再打一层小补丁”，而应继续完成 feedback loop、VP-tree remap、dither map/selective Floyd。
+2. R1 已完成质量标尺纠偏，R2.1 已把量化器推进到 feedback-style search + 像素级 remap refine，但离参考实现仍有实质差距。
+3. 下一步不应回退到“再打一层小补丁”，而应继续完成更强的 remap 收敛、VP-tree nearest 和 selective dithering/dither map。
 4. 复刻优先级应回到 Phase D 核心：先对齐质量语义、palette 搜索、remap/dither，再重新跑 E/F/G 回归。
