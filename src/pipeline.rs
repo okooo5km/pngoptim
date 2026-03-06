@@ -17,7 +17,7 @@ use crate::quality::{QualityMetrics, SpeedSettings, evaluate_quality_against_rgb
 pub struct PipelineOptions {
     pub quality: Option<QualityRange>,
     pub speed: u8,
-    pub _dither: bool,
+    pub dither: bool,
     pub posterize: Option<u8>,
     pub strip: bool,
     pub skip_if_larger: bool,
@@ -91,6 +91,7 @@ pub fn process_png_bytes(
         options.quality.as_ref(),
         options.posterize.unwrap_or(0),
         speed_settings,
+        options.dither,
     );
     let quantize_ms = t_quantize.elapsed().as_secs_f64() * 1000.0;
 
@@ -152,6 +153,7 @@ fn select_palette_candidate(
     quality: Option<&QualityRange>,
     output_posterize_bits: u8,
     speed_settings: SpeedSettings,
+    dither: bool,
 ) -> QuantizeCandidate {
     let evaluate = |max_colors: usize| {
         evaluate_candidate(
@@ -161,6 +163,7 @@ fn select_palette_candidate(
             max_colors,
             output_posterize_bits,
             speed_settings,
+            dither,
         )
     };
 
@@ -218,8 +221,49 @@ fn evaluate_candidate(
     max_colors: usize,
     output_posterize_bits: u8,
     speed_settings: SpeedSettings,
+    dither: bool,
 ) -> QuantizeCandidate {
-    let quantizer = quantizer_settings(max_colors, speed_settings);
+    let mut best = evaluate_candidate_once(
+        rgba,
+        width,
+        height,
+        max_colors,
+        output_posterize_bits,
+        speed_settings,
+        false,
+    );
+
+    if dither {
+        let dithered = evaluate_candidate_once(
+            rgba,
+            width,
+            height,
+            max_colors,
+            output_posterize_bits,
+            speed_settings,
+            true,
+        );
+        if dithered.quality.quality_score > best.quality.quality_score
+            || (dithered.quality.quality_score == best.quality.quality_score
+                && dithered.quality.standard_mse < best.quality.standard_mse)
+        {
+            best = dithered;
+        }
+    }
+
+    best
+}
+
+fn evaluate_candidate_once(
+    rgba: &[u8],
+    width: usize,
+    height: usize,
+    max_colors: usize,
+    output_posterize_bits: u8,
+    speed_settings: SpeedSettings,
+    dither: bool,
+) -> QuantizeCandidate {
+    let quantizer = quantizer_settings(max_colors, speed_settings, dither);
     let mut indexed = quantize_indexed(rgba, width, height, quantizer);
     if output_posterize_bits > 0 {
         apply_posterize_palette(&mut indexed.palette, output_posterize_bits);

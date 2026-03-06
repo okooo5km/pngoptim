@@ -15,6 +15,7 @@ pub struct QuantizerSettings {
     pub input_posterize_bits: u8,
     pub max_histogram_entries: u32,
     pub kmeans_iterations: u16,
+    pub dither: bool,
 }
 
 pub fn quantize_indexed(
@@ -49,7 +50,14 @@ pub fn quantize_indexed(
     refine_palette(&histogram, &mut palette, settings.kmeans_iterations.min(10));
 
     let final_palette = dedup_palette(&palette);
-    remap_image(rgba, &final_palette, settings.input_posterize_bits)
+    remap_image(
+        rgba,
+        width,
+        height,
+        &final_palette,
+        settings.input_posterize_bits,
+        settings.dither,
+    )
 }
 
 pub fn max_colors_from_quality_speed(quality_target: u8, speed: u8) -> usize {
@@ -60,12 +68,17 @@ pub fn max_colors_from_quality_speed(quality_target: u8, speed: u8) -> usize {
         .clamp(16, 256)
 }
 
-pub fn quantizer_settings(max_colors: usize, speed: SpeedSettings) -> QuantizerSettings {
+pub fn quantizer_settings(
+    max_colors: usize,
+    speed: SpeedSettings,
+    dither: bool,
+) -> QuantizerSettings {
     QuantizerSettings {
         max_colors,
         input_posterize_bits: speed.input_posterize_bits,
         max_histogram_entries: speed.max_histogram_entries,
         kmeans_iterations: speed.kmeans_iterations,
+        dither,
     }
 }
 
@@ -338,27 +351,17 @@ fn dedup_palette(palette: &[InternalPixel]) -> Vec<(InternalPixel, [u8; 4])> {
 
 fn remap_image(
     rgba: &[u8],
+    width: usize,
+    height: usize,
     palette: &[(InternalPixel, [u8; 4])],
     input_posterize_bits: u8,
+    dither: bool,
 ) -> IndexedImage {
-    let mut indices = Vec::with_capacity(rgba.len() / 4);
-    let gamma = gamma_lut(SRGB_OUTPUT_GAMMA);
-    let mut cache: HashMap<u32, u8> = HashMap::new();
-    let mut counts = vec![0usize; palette.len()];
-
-    for px in rgba.chunks_exact(4) {
-        let cache_key = pack_rgba_key(px, input_posterize_bits.min(4));
-        let idx = if let Some(&cached) = cache.get(&cache_key) {
-            cached as usize
-        } else {
-            let color = InternalPixel::from_rgba(&gamma, px);
-            let idx = nearest_palette(color, palette);
-            cache.insert(cache_key, idx as u8);
-            idx
-        };
-        counts[idx] += 1;
-        indices.push(idx as u8);
-    }
+    let (mut indices, counts) = if dither {
+        remap_image_dithered(rgba, width, height, palette)
+    } else {
+        remap_image_plain(rgba, palette, input_posterize_bits)
+    };
 
     let mut order = (0..palette.len())
         .filter(|&idx| counts[idx] > 0)
@@ -385,6 +388,100 @@ fn remap_image(
         palette: reordered_palette,
         indices,
     }
+}
+
+fn remap_image_plain(
+    rgba: &[u8],
+    palette: &[(InternalPixel, [u8; 4])],
+    input_posterize_bits: u8,
+) -> (Vec<u8>, Vec<usize>) {
+    let mut indices = Vec::with_capacity(rgba.len() / 4);
+    let gamma = gamma_lut(SRGB_OUTPUT_GAMMA);
+    let mut cache: HashMap<u32, u8> = HashMap::new();
+    let mut counts = vec![0usize; palette.len()];
+
+    for px in rgba.chunks_exact(4) {
+        let cache_key = pack_rgba_key(px, input_posterize_bits.min(4));
+        let idx = if let Some(&cached) = cache.get(&cache_key) {
+            cached as usize
+        } else {
+            let color = InternalPixel::from_rgba(&gamma, px);
+            let idx = nearest_palette(color, palette);
+            cache.insert(cache_key, idx as u8);
+            idx
+        };
+        counts[idx] += 1;
+        indices.push(idx as u8);
+    }
+
+    (indices, counts)
+}
+
+fn remap_image_dithered(
+    rgba: &[u8],
+    width: usize,
+    height: usize,
+    palette: &[(InternalPixel, [u8; 4])],
+) -> (Vec<u8>, Vec<usize>) {
+    let gamma = gamma_lut(SRGB_OUTPUT_GAMMA);
+    let pixels = rgba
+        .chunks_exact(4)
+        .map(|px| InternalPixel::from_rgba(&gamma, px))
+        .collect::<Vec<_>>();
+    let mut indices = vec![0u8; pixels.len()];
+    let mut counts = vec![0usize; palette.len()];
+    let mut next_errors = vec![InternalPixel::default(); width + 2];
+    let mut curr_errors = vec![InternalPixel::default(); width + 2];
+
+    for row in 0..height {
+        std::mem::swap(&mut curr_errors, &mut next_errors);
+        next_errors.fill(InternalPixel::default());
+
+        let even = row % 2 == 0;
+        for offset in 0..width {
+            let x = if even { offset } else { width - 1 - offset };
+            let idx = row * width + x;
+            let mut color = pixels[idx];
+            let err = curr_errors[x + 1];
+            color.a = (color.a + err.a).clamp(0.0, 1.0);
+            color.r = (color.r + err.r).clamp(0.0, 1.1);
+            color.g = (color.g + err.g).clamp(0.0, 1.1);
+            color.b = (color.b + err.b).clamp(0.0, 1.1);
+
+            let pal_idx = nearest_palette(color, palette);
+            indices[idx] = pal_idx as u8;
+            counts[pal_idx] += 1;
+
+            let out = palette[pal_idx].0;
+            let diff = InternalPixel {
+                a: color.a - out.a,
+                r: color.r - out.r,
+                g: color.g - out.g,
+                b: color.b - out.b,
+            };
+
+            if even {
+                add_scaled_error(&mut curr_errors[x + 2], diff, 7.0 / 16.0);
+                add_scaled_error(&mut next_errors[x], diff, 3.0 / 16.0);
+                add_scaled_error(&mut next_errors[x + 1], diff, 5.0 / 16.0);
+                add_scaled_error(&mut next_errors[x + 2], diff, 1.0 / 16.0);
+            } else {
+                add_scaled_error(&mut curr_errors[x], diff, 7.0 / 16.0);
+                add_scaled_error(&mut next_errors[x + 2], diff, 3.0 / 16.0);
+                add_scaled_error(&mut next_errors[x + 1], diff, 5.0 / 16.0);
+                add_scaled_error(&mut next_errors[x], diff, 1.0 / 16.0);
+            }
+        }
+    }
+
+    (indices, counts)
+}
+
+fn add_scaled_error(target: &mut InternalPixel, diff: InternalPixel, scale: f32) {
+    target.a += diff.a * scale;
+    target.r += diff.r * scale;
+    target.g += diff.g * scale;
+    target.b += diff.b * scale;
 }
 
 fn nearest_palette(color: InternalPixel, palette: &[(InternalPixel, [u8; 4])]) -> usize {
@@ -468,7 +565,7 @@ mod tests {
             255u8, 0, 0, 255, 250, 0, 0, 255, 0, 255, 0, 255, 0, 250, 0, 255, 0, 0, 255, 255, 0, 0,
             250, 255,
         ];
-        let settings = quantizer_settings(16, SpeedSettings::from_speed(4));
+        let settings = quantizer_settings(16, SpeedSettings::from_speed(4), false);
         let out = quantize_indexed(&rgba, 3, 2, settings);
         assert_eq!(out.indices.len(), 6);
         assert!(!out.palette.is_empty());
@@ -479,11 +576,11 @@ mod tests {
         let rgba = vec![
             255u8, 0, 0, 255, 254, 1, 0, 255, 253, 2, 0, 255, 252, 3, 0, 255,
         ];
-        let mut direct_settings = quantizer_settings(16, SpeedSettings::from_speed(4));
+        let mut direct_settings = quantizer_settings(16, SpeedSettings::from_speed(4), false);
         direct_settings.input_posterize_bits = 0;
         let direct = quantize_indexed(&rgba, 2, 2, direct_settings);
 
-        let mut posterized_settings = quantizer_settings(16, SpeedSettings::from_speed(4));
+        let mut posterized_settings = quantizer_settings(16, SpeedSettings::from_speed(4), false);
         posterized_settings.input_posterize_bits = 2;
         let posterized = quantize_indexed(&rgba, 2, 2, posterized_settings);
 
@@ -495,7 +592,7 @@ mod tests {
         let rgba = (0..64u8)
             .flat_map(|v| [v, 255 - v, v / 2, 255])
             .collect::<Vec<_>>();
-        let settings = quantizer_settings(4, SpeedSettings::from_speed(4));
+        let settings = quantizer_settings(4, SpeedSettings::from_speed(4), false);
         let out = quantize_indexed(&rgba, 8, 8, settings);
         assert!(out.palette.len() <= 4);
     }

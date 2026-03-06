@@ -150,6 +150,7 @@
 32. 2026-03-06：启动 R1，已将 `--quality` 解析扩展为 `N / -N / N- / min-max`，引入 libimagequant 风格 `quality <-> MSE` 标尺、speed 策略骨架与基于质量目标的最小色数搜索桥接实现，为后续 R2 的 palette search 重写清理接口。
 33. 2026-03-06：执行 R1 回归验证：`compat` 通过（`reports/compat/r1-compat-verify/summary.md`），但 `smoke` 在新质量门禁下仅 `2/9` 通过（`reports/smoke/r1-smoke-verify/summary.md`），确认当前旧量化器在真实质量标尺下已不能满足既有阶段 D 结论，需进入 R2 重写核心 palette search / remap。
 34. 2026-03-06：完成 R2 第一版自研量化器替换（gamma-aware histogram + weighted median cut + k-means refine + palette prune/remap），`compat` 通过（`reports/compat/r2-compat-verify/summary.md`），`smoke` 恢复到 `9/9` 通过（`reports/smoke/r2-smoke-verify/summary.md`）；但 perf 样本耗时显著上升，后续需回到阶段 E 做性能收口。
+35. 2026-03-06：验证了 naive 全图 Floyd remap：在 `demo.png` 上会把输出放大到约 `348KB` 且质量分数下降到 `22`，不符合 pngquant 的 selective dithering 思路；当前仅在启用抖动时做“择优采用”，后续需实现 dither map/选择性抖动而非全图误差扩散。
 
 ### 更新规则
 1. 每次推进必须更新对应阶段状态：`Not Started` / `In Progress` / `Blocked` / `Done`。
