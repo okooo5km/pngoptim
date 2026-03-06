@@ -255,7 +255,7 @@ pngquant /Users/5km/Downloads/demo.png --output /tmp/pngquant-demo-q6575.png --q
 
 | 场景 | 输出大小 | 质量结果 | 备注 |
 |---|---:|---:|---|
-| 当前 `pngoptim` 默认输出 | `131,920` bytes | `quality_score=56`, `quality_mse=14.463` | RF-5 core subset 后默认结果基本不变，说明 selective dithering 仍未形成决定性收益 |
+| 当前 `pngoptim` 默认输出 | `131,919` bytes | `quality_score=56`, `quality_mse=14.463` | RF-6 决策层后仍基本不变，说明 `demo.png` 的主阻塞不在候选选择 |
 | 当前 `pngoptim --quality 65-75` | 无输出 | `actual=57, minimum=65` | 按新门禁正确失败，说明仍有质量缺口 |
 | 参考 `pngquant --quality 65-75` | `136,915` bytes | `MSE=5.210 (Q=82)` | `19` 色，满足质量要求 |
 
@@ -264,8 +264,9 @@ pngquant /Users/5km/Downloads/demo.png --output /tmp/pngquant-demo-q6575.png --q
 1. R2.1 和 RF-4 证明当前主要收益确实来自 palette search + remap refine，而不是 PNG 编码尾部微调。
 2. RF-4 第一段（plain remap 反馈）对 `demo.png` 只有轻微改善：`quality_mse` 从 `14.644` 降到 `14.463`，但 `quality_score` 仍停在 `56/57`。
 3. RF-5 core subset 已接入 contrast-map 驱动的 selective Floyd、serpentine 扫描和 remapped guess，但在 `demo.png` 上默认输出与 `--nofs` 结果几乎重合（`131920` vs `131923 bytes`），说明这条路径还没产生足够强的实际收益。
-4. 在真正可比的 `--quality 65-75` 场景下，当前实现仍直接失败，而 `pngquant` 可以在满足质量门槛的同时输出 `136,915` bytes。
-5. 这说明当前缺口已经进一步收敛到 `remap.rs` 的 background-aware dithering、更完整的 dither 决策和 remap/quality 联动，而不是 plain remap 或 nearest search。
+4. RF-6 第一段把 same-score 候选改成“更小输出优先”后，`q_gradient_photo_like` 从 `328049 bytes` 进一步降到 `327981 bytes`，说明决策层此前确实会错误丢弃更优候选。
+5. 在真正可比的 `--quality 65-75` 场景下，当前实现仍直接失败，而 `pngquant` 可以在满足质量门槛的同时输出 `136,915` bytes。
+6. 这说明当前缺口已经进一步收敛到 `remap.rs` / `quant.rs` 的质量主链：importance/remap error、background-aware dithering 和更完整的 quality/size 联动，而不是 plain remap 或 nearest search。
 
 补充观测（R2.2 / `nearest.rs` 对齐）：
 
@@ -328,7 +329,8 @@ pngquant /Users/5km/Downloads/demo.png --output /tmp/pngquant-demo-q6575.png --q
 1. 对齐 `skip-if-larger` 启发式。
 2. 对齐 remap 后质量决策与退出条件。
 3. 对齐输出决策与质量/尺寸联动逻辑。
-4. 状态：`Pending`
+4. 状态：`Partially Done`
+5. 已完成 same-score 候选的 size-aware 选择；剩余 `skip-if-larger` 质量损失/体积收益启发式仍待补齐。
 
 ### RF-7. 全门禁收口
 
@@ -351,5 +353,5 @@ pngquant /Users/5km/Downloads/demo.png --output /tmp/pngquant-demo-q6575.png --q
 
 1. 当前项目已经完成 Rust 工程化与发布链路，不再依赖 Python 编排。
 2. 当前计划需要调整的点不在“大方向”，而在执行粒度：算法轨道必须从粗粒度 `R1/R2/R3` 改成模块驱动的 `RF-1 .. RF-7`。
-3. 下一步不应回退到“再打一层小补丁”，而应按 `RF-5 收口 -> RF-4 收口 -> RF-6 -> RF-7` 顺序推进。
+3. 下一步不应回退到“再打一层小补丁”，而应按 `RF-4 收口 -> RF-5 收口 -> RF-6 启发式收口 -> RF-7` 顺序推进。
 4. 复刻优先级应回到 Phase D 核心：先对齐质量语义、palette 搜索、remap/dither，再重新跑 E/F/G 回归。
