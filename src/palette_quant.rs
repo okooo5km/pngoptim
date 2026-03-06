@@ -320,12 +320,7 @@ fn find_best_palette(histogram: &[HistItem], settings: QuantizerSettings) -> Vec
     while trials_left > 0 && current_max_colors >= 2 {
         let mut palette = median_cut_palette(&mut hist, current_max_colors);
         let first_target_run = best_palette.is_none();
-        let stats = refine_palette(
-            &mut hist,
-            &mut palette,
-            trial_iterations,
-            !first_target_run,
-        );
+        let stats = refine_palette(&mut hist, &mut palette, trial_iterations, !first_target_run);
         let used_colors = stats.used_colors.max(2).min(palette.len());
         let better = best_palette.is_none()
             || stats.error < best_error
@@ -643,9 +638,7 @@ fn build_search_node(points: &[InternalPixel], indexes: &mut [usize]) -> SearchN
         return SearchNode {
             idx,
             vantage_point: points[idx],
-            inner: SearchNodeInner::Leaf {
-                idxs: Box::new([]),
-            },
+            inner: SearchNodeInner::Leaf { idxs: Box::new([]) },
         };
     }
 
@@ -803,8 +796,9 @@ fn remap_image(
     input_posterize_bits: u8,
     dither: bool,
 ) -> IndexedImage {
-    let (mut indices, counts) = if dither {
-        remap_image_dithered(rgba, width, height, palette)
+    let (palette, mut indices, counts) = if dither {
+        let (indices, counts) = remap_image_dithered(rgba, width, height, palette);
+        (palette.to_vec(), indices, counts)
     } else {
         remap_image_plain(rgba, palette, input_posterize_bits)
     };
@@ -839,32 +833,85 @@ fn remap_image(
 fn remap_image_plain(
     rgba: &[u8],
     palette: &[(InternalPixel, [u8; 4])],
-    input_posterize_bits: u8,
-) -> (Vec<u8>, Vec<usize>) {
+    _input_posterize_bits: u8,
+) -> (Vec<(InternalPixel, [u8; 4])>, Vec<u8>, Vec<usize>) {
+    let mut palette_points = palette.iter().map(|entry| entry.0).collect::<Vec<_>>();
+    if palette_points.len() > 1 {
+        let feedback = remap_image_plain_pass(rgba, &palette_points);
+        apply_remap_feedback(&mut palette_points, &feedback);
+    }
+
+    let final_pass = remap_image_plain_pass(rgba, &palette_points);
+
+    let remapped_palette = palette_points
+        .iter()
+        .map(|&color| (color, color.to_rgba(SRGB_OUTPUT_GAMMA)))
+        .collect::<Vec<_>>();
+
+    (remapped_palette, final_pass.indices, final_pass.counts)
+}
+
+struct PlainRemapPass {
+    indices: Vec<u8>,
+    counts: Vec<usize>,
+    sums: Vec<[f64; 4]>,
+    weights: Vec<f64>,
+    worst_color: Option<InternalPixel>,
+}
+
+fn remap_image_plain_pass(rgba: &[u8], palette_points: &[InternalPixel]) -> PlainRemapPass {
     let mut indices = Vec::with_capacity(rgba.len() / 4);
     let gamma = gamma_lut(SRGB_OUTPUT_GAMMA);
-    let mut cache: HashMap<u32, u8> = HashMap::new();
-    let mut counts = vec![0usize; palette.len()];
-    let palette_points = palette.iter().map(|entry| entry.0).collect::<Vec<_>>();
-    let tree = NearestTree::new(&palette_points);
+    let mut counts = vec![0usize; palette_points.len()];
+    let mut sums = vec![[0.0f64; 4]; palette_points.len()];
+    let mut weights = vec![0.0f64; palette_points.len()];
+    let mut worst_color = None;
+    let mut worst_diff = 0.0f32;
+    let tree = NearestTree::new(palette_points);
     let mut last_idx = 0usize;
 
     for px in rgba.chunks_exact(4) {
-        let cache_key = pack_rgba_key(px, input_posterize_bits.min(4));
-        let idx = if let Some(&cached) = cache.get(&cache_key) {
-            cached as usize
-        } else {
-            let color = InternalPixel::from_rgba(&gamma, px);
-            let idx = tree.search(color, last_idx).0;
-            cache.insert(cache_key, idx as u8);
-            idx
-        };
+        let color = InternalPixel::from_rgba(&gamma, px);
+        let (idx, diff) = tree.search(color, last_idx);
         last_idx = idx;
         counts[idx] += 1;
+        weights[idx] += 1.0;
+        sums[idx][0] += f64::from(color.a);
+        sums[idx][1] += f64::from(color.r);
+        sums[idx][2] += f64::from(color.g);
+        sums[idx][3] += f64::from(color.b);
+        if diff > worst_diff {
+            worst_diff = diff;
+            worst_color = Some(color);
+        }
         indices.push(idx as u8);
     }
 
-    (indices, counts)
+    PlainRemapPass {
+        indices,
+        counts,
+        sums,
+        weights,
+        worst_color,
+    }
+}
+
+fn apply_remap_feedback(palette_points: &mut [InternalPixel], pass: &PlainRemapPass) {
+    for idx in 0..palette_points.len() {
+        if pass.weights[idx] == 0.0 {
+            if let Some(color) = pass.worst_color {
+                palette_points[idx] = color;
+            }
+            continue;
+        }
+
+        palette_points[idx] = InternalPixel {
+            a: (pass.sums[idx][0] / pass.weights[idx]) as f32,
+            r: (pass.sums[idx][1] / pass.weights[idx]) as f32,
+            g: (pass.sums[idx][2] / pass.weights[idx]) as f32,
+            b: (pass.sums[idx][3] / pass.weights[idx]) as f32,
+        };
+    }
 }
 
 fn remap_image_dithered(

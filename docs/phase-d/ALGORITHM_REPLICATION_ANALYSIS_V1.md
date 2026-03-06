@@ -255,15 +255,16 @@ pngquant /Users/5km/Downloads/demo.png --output /tmp/pngquant-demo-q6575.png --q
 
 | 场景 | 输出大小 | 质量结果 | 备注 |
 |---|---:|---:|---|
-| 当前 `pngoptim` 默认输出 | `131,278` bytes | `quality_score=56`, `quality_mse=14.644` | R2.1 后明显改善，但仍未达到参考质量 |
+| 当前 `pngoptim` 默认输出 | `131,912` bytes | `quality_score=56`, `quality_mse=14.463` | RF-4 plain remap feedback 后 MSE 略降，但仍未达到参考质量 |
 | 当前 `pngoptim --quality 65-75` | 无输出 | `actual=57, minimum=65` | 按新门禁正确失败，说明仍有质量缺口 |
 | 参考 `pngquant --quality 65-75` | `136,915` bytes | `MSE=5.210 (Q=82)` | `19` 色，满足质量要求 |
 
 补充观测：
 
-1. R2.1 证明当前主要收益确实来自 palette search + remap refine，而不是 PNG 编码尾部微调。
-2. 在真正可比的 `--quality 65-75` 场景下，当前实现仍直接失败，而 `pngquant` 可以在满足质量门槛的同时输出 `136,915` bytes。
-3. 这说明当前缺口已经从“完全走错方向”收窄为“还差更成熟的 remap/search/dither 主链”。
+1. R2.1 和 RF-4 证明当前主要收益确实来自 palette search + remap refine，而不是 PNG 编码尾部微调。
+2. RF-4 第一段（plain remap 反馈）对 `demo.png` 只有轻微改善：`quality_mse` 从 `14.644` 降到 `14.463`，但 `quality_score` 仍停在 `56/57`。
+3. 在真正可比的 `--quality 65-75` 场景下，当前实现仍直接失败，而 `pngquant` 可以在满足质量门槛的同时输出 `136,915` bytes。
+4. 这说明当前缺口已经进一步收敛到 `remap.rs` 的 selective dithering、dither map 和 background-aware 分支，而不是 plain remap 或 nearest search。
 
 补充观测（R2.2 / `nearest.rs` 对齐）：
 
@@ -309,8 +310,8 @@ pngquant /Users/5km/Downloads/demo.png --output /tmp/pngquant-demo-q6575.png --q
 2. 对齐 background 分支。
 3. 对齐 importance-map 权重入口。
 4. 对齐 remap error 计算口径。
-5. 状态：`In Progress`
-6. 这是当前主优先级。
+5. 状态：`Partially Done`
+6. 已完成 plain remap 的 palette 统计回灌与最终 remap；剩余 background/importance-map/remap-error 口径仍待补齐。
 
 ### RF-5. `remap.rs::dither_map` + `remap_to_palette_floyd`
 
@@ -318,7 +319,7 @@ pngquant /Users/5km/Downloads/demo.png --output /tmp/pngquant-demo-q6575.png --q
 2. 引入 selective Floyd，而不是全图误差扩散。
 3. 对齐 serpentine 扫描与 `max_dither_error`。
 4. 对齐 background-aware dithering。
-5. 状态：`Pending`
+5. 状态：`Current Priority`
 
 ### RF-6. `pngquant.c` + `quant.rs` 决策层
 
@@ -348,5 +349,5 @@ pngquant /Users/5km/Downloads/demo.png --output /tmp/pngquant-demo-q6575.png --q
 
 1. 当前项目已经完成 Rust 工程化与发布链路，不再依赖 Python 编排。
 2. 当前计划需要调整的点不在“大方向”，而在执行粒度：算法轨道必须从粗粒度 `R1/R2/R3` 改成模块驱动的 `RF-1 .. RF-7`。
-3. 下一步不应回退到“再打一层小补丁”，而应按 `RF-4 -> RF-5 -> RF-6 -> RF-7` 顺序推进。
+3. 下一步不应回退到“再打一层小补丁”，而应按 `RF-5 -> RF-4 收口 -> RF-6 -> RF-7` 顺序推进。
 4. 复刻优先级应回到 Phase D 核心：先对齐质量语义、palette 搜索、remap/dither，再重新跑 E/F/G 回归。
