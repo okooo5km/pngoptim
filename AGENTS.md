@@ -130,16 +130,16 @@
 | RF-1 | Done | `pngquant.c` + `attr.rs` | 对齐 `quality/speed` 语义、预算和门禁标尺 | `quality <-> MSE` 已接通 |
 | RF-2 | Partially Done | `quant.rs` + `mediancut.rs` + `kmeans.rs` | 对齐 feedback loop、palette search、unused color replacement | 已有骨架，但误差约束收缩仍不稳定 |
 | RF-3 | Done | `nearest.rs` | 对齐 VP-tree nearest、likely-index、剪枝逻辑 | 已完成，性能回退已大幅收回 |
-| RF-4 | Partially Done | `remap.rs::remap_to_palette` | 对齐 remap 阶段 palette 统计回灌、background/importance 处理 | plain remap 反馈已接入，background/importance 与误差口径仍缺 |
+| RF-4 | Partially Done | `remap.rs::remap_to_palette` | 对齐 remap 阶段 palette 统计回灌、background/importance 处理 | plain remap 回灌、importance 权重与 dither 前 remap 已接入，剩余显式 background 分支 |
 | RF-5 | Partially Done | `remap.rs::dither_map` + `remap_to_palette_floyd` | 对齐 dither map、selective Floyd、background-aware 分支 | core subset 已接入，background-aware 与质量收益仍不足 |
 | RF-6 | Partially Done | `pngquant.c` + `quant.rs` | 对齐 `skip-if-larger` 启发式和 remap 后质量决策 | same-score 候选已按更小输出优先，完整启发式仍缺 |
 | RF-7 | Pending | 全链路 | 重跑 quality/perf/stability/release 门禁，形成新基线 | 在 RF-4/5 完成后执行 |
 
 ### 当前硬阻塞与下一步
-1. 当前主线已把 `demo.png` 的默认输出质量从 `quality_score=45` 提升到 `56`，最近一次 RF-4 spot check 为 `quality_mse=14.463`, `131912 bytes`；但在 `--quality 65-75` 下仍只有 `actual=57`，尚未满足最低质量门槛。
-2. naive 全图 Floyd 已被证明方向错误：会放大输出并拉低质量；当前已接入 `dither map + selective Floyd` 的核心子集，并新增 same-score 候选的 size-aware 决策，但 `demo.png` 默认输出仍约 `131919 bytes`、`quality_score=56`，说明主要缺口仍在质量路径而不是单纯候选选择。
-3. `Nearest` 结构已按 `libimagequant/src/nearest.rs` 的 VP-tree 思路接入主线，原先的 perf 大回退已显著收回；当前主要缺口重新回到质量与 remap/dither 主链，而不是 nearest search。
-4. 当前最合理的执行顺序已经调整为：`RF-4 importance/remap error 收口` -> `RF-5 background-aware / dither decision 收口` -> `RF-6 skip-if-larger 启发式收口` -> `RF-7 全门禁回归`。
+1. `demo.png` spot check 已出现实质跃迁：默认输出提升到 `130792 bytes`, `quality_score=77`, `quality_mse=7.091`；`--quality 65-75` 现可成功输出 `125259 bytes`, `quality_score=75`, `quality_mse=7.618`。此前长期卡住的 `actual=57 < minimum=65` 已解除。
+2. 这轮收益来自两处主链对齐：`importance_map` 已进入 histogram/remap 权重，且 dither 路径不再绕开 plain remap feedback，而是先做一次 remap 回灌再进入 selective Floyd。
+3. `compat` 与 `smoke` 已验证无回归（`reports/compat/rf4-importance-verify/summary.md`、`reports/smoke/rf4-importance-smoke/summary.md`），说明当前收益不是以基本行为破坏换来的。
+4. 当前最合理的执行顺序已更新为：`RF-5 background-aware / dither decision 收口` -> `RF-6 skip-if-larger 启发式收口` -> `RF-7 全门禁回归`。`RF-4` 仍未完全关闭的部分主要是显式 background 分支。
 
 ### 最近更新
 1. 2026-03-05：确认参考仓库本地路径与远程可达性，并锁定 `main` 分支 commit。
@@ -189,6 +189,7 @@
 45. 2026-03-06：完成 RF-5 核心子集：按 `image.rs` / `remap.rs` 思路接入 contrast-map 驱动的 selective Floyd、serpentine 扫描、`max_dither_error` 限制和 remapped guess；`compat` 通过（`reports/compat/rf5-compat-verify/summary.md`），`smoke` 通过（`reports/smoke/rf5-smoke-verify/summary.md`），perf 样本为 `5886.829 ms` / `15419.006 ms`。但 `demo.png` 默认输出仍为约 `131920 bytes`, `quality_score=56`，`--quality 65-75` 仍失败（`actual=57`），说明 RF-5 仍需继续补 background-aware 分支和更完整的 dither 决策。
 46. 2026-03-06：启动 RF-6 第一段决策层对齐：同一色数下 plain/dither 候选在相同 `quality_score` 且 MSE 接近时，改为优先保留更小输出的候选；`compat` 通过（`reports/compat/rf6-compat-verify/summary.md`），`smoke` 通过（`reports/smoke/rf6-smoke-verify/summary.md`），`q_gradient_photo_like` 进一步降到 `327981 bytes`（`quality_score=70`, `quality_mse=9.215`）。但 `demo.png` 仍保持在 `131919 bytes`, `quality_score=56`，说明 RF-6 只能改善候选选择，无法替代质量主链收口。
 47. 2026-03-06：修复 Phase F 跨平台聚合门禁再次误判的问题：`xtask cross-platform aggregate` 新增 `--strict-size-ratio` 与 `--strict-output-bytes`，默认将 `size_ratio_*` 漂移和样本输出字节差异降为 advisory，仅在显式 strict 模式下阻断；并补充 `xtask` 端到端单测覆盖默认告警/严格失败两条路径，防止同类 CI 回归。
+48. 2026-03-06：继续对齐 `libimagequant` 的 `hist.rs` / `remap.rs`：将 `importance_map` 接入 histogram 与 plain remap feedback 权重，并让 dither 路径在 selective Floyd 前先执行一次 plain remap 回灌；`compat` 通过（`reports/compat/rf4-importance-verify/summary.md`），`smoke` 通过（`reports/smoke/rf4-importance-smoke/summary.md`）。`demo.png` spot check 提升到默认 `130792 bytes`, `quality_score=77`，`--quality 65-75` 可输出 `125259 bytes`, `quality_score=75`。
 
 ### 更新规则
 1. 每次推进必须更新对应阶段状态：`Not Started` / `In Progress` / `Blocked` / `Done`。

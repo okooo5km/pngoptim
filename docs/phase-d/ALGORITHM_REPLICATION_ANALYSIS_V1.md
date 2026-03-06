@@ -255,18 +255,18 @@ pngquant /Users/5km/Downloads/demo.png --output /tmp/pngquant-demo-q6575.png --q
 
 | 场景 | 输出大小 | 质量结果 | 备注 |
 |---|---:|---:|---|
-| 当前 `pngoptim` 默认输出 | `131,919` bytes | `quality_score=56`, `quality_mse=14.463` | RF-6 决策层后仍基本不变，说明 `demo.png` 的主阻塞不在候选选择 |
-| 当前 `pngoptim --quality 65-75` | 无输出 | `actual=57, minimum=65` | 按新门禁正确失败，说明仍有质量缺口 |
+| 当前 `pngoptim` 默认输出 | `130,792` bytes | `quality_score=77`, `quality_mse=7.091` | 接入 `importance_map + remap feedback` 后显著改善 |
+| 当前 `pngoptim --quality 65-75` | `125,259` bytes | `quality_score=75`, `quality_mse=7.618` | 已满足最低质量门槛，不再因 `actual < minimum` 失败 |
 | 参考 `pngquant --quality 65-75` | `136,915` bytes | `MSE=5.210 (Q=82)` | `19` 色，满足质量要求 |
 
 补充观测：
 
-1. R2.1 和 RF-4 证明当前主要收益确实来自 palette search + remap refine，而不是 PNG 编码尾部微调。
-2. RF-4 第一段（plain remap 反馈）对 `demo.png` 只有轻微改善：`quality_mse` 从 `14.644` 降到 `14.463`，但 `quality_score` 仍停在 `56/57`。
-3. RF-5 core subset 已接入 contrast-map 驱动的 selective Floyd、serpentine 扫描和 remapped guess，但在 `demo.png` 上默认输出与 `--nofs` 结果几乎重合（`131920` vs `131923 bytes`），说明这条路径还没产生足够强的实际收益。
-4. RF-6 第一段把 same-score 候选改成“更小输出优先”后，`q_gradient_photo_like` 从 `328049 bytes` 进一步降到 `327981 bytes`，说明决策层此前确实会错误丢弃更优候选。
-5. 在真正可比的 `--quality 65-75` 场景下，当前实现仍直接失败，而 `pngquant` 可以在满足质量门槛的同时输出 `136,915` bytes。
-6. 这说明当前缺口已经进一步收敛到 `remap.rs` / `quant.rs` 的质量主链：importance/remap error、background-aware dithering 和更完整的 quality/size 联动，而不是 plain remap 或 nearest search。
+1. R2.1 到 RF-6 的轨道判断是对的：当前主要收益确实来自 palette search + remap 主链，而不是 PNG 编码尾部微调。
+2. RF-4 第二段把 `importance_map` 接入 histogram/remap，并让 dither 路径在进入 selective Floyd 前先做一次 plain remap feedback 后，`demo.png` 从长期停滞的 `quality_score=56/57` 直接提升到默认 `77`、`--quality 65-75` 下 `75`。
+3. 这说明此前真正缺的不是 nearest search 或候选选择，而是 `importance/remap feedback` 没有贯通到 dither 分支。
+4. RF-6 第一段 same-score size-aware 决策仍然有效，但它不再是主瓶颈；当前主要剩余问题已经收敛到 `background-aware dithering`、更完整的 `dither decision` 和 `skip-if-larger` 的 quality/size 联动。
+5. 单样本 spot check 已过门槛，不等于整条复刻轨道已收口；仍需重跑更广样本上的 quality/perf/stability 门禁。
+6. 当前阶段可以明确排除的方向是：继续在 nearest search 上打补丁，或者把问题归因到编码器末端微调。
 
 补充观测（R2.2 / `nearest.rs` 对齐）：
 
@@ -313,7 +313,7 @@ pngquant /Users/5km/Downloads/demo.png --output /tmp/pngquant-demo-q6575.png --q
 3. 对齐 importance-map 权重入口。
 4. 对齐 remap error 计算口径。
 5. 状态：`Partially Done`
-6. 已完成 plain remap 的 palette 统计回灌与最终 remap；剩余 background/importance-map/remap-error 口径仍待补齐。
+6. 已完成 plain remap 的 palette 统计回灌、importance-map 权重接入，以及 dither 前 remap feedback；剩余显式 background 分支仍待补齐。
 
 ### RF-5. `remap.rs::dither_map` + `remap_to_palette_floyd`
 

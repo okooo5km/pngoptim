@@ -21,6 +21,7 @@ pub struct QuantizerSettings {
     pub target_mse: Option<f64>,
     pub dither: bool,
     pub use_dither_map: DitherMapMode,
+    pub use_contrast_maps: bool,
 }
 
 pub fn quantize_indexed(
@@ -38,11 +39,30 @@ pub fn quantize_indexed(
     }
 
     let gamma = gamma_lut(SRGB_OUTPUT_GAMMA);
+    let contrast_pixels =
+        if settings.use_contrast_maps || settings.use_dither_map != DitherMapMode::None {
+            Some(
+                rgba.chunks_exact(4)
+                    .map(|px| InternalPixel::from_rgba(&gamma, px))
+                    .collect::<Vec<_>>(),
+            )
+        } else {
+            None
+        };
+    let importance_map = if settings.use_contrast_maps {
+        contrast_pixels
+            .as_deref()
+            .and_then(|pixels| build_importance_map(pixels, width, height))
+    } else {
+        None
+    };
     let histogram = build_histogram(
         rgba,
+        width,
         settings.input_posterize_bits,
         settings.max_histogram_entries,
         &gamma,
+        importance_map.as_deref(),
     );
 
     let mut palette = find_best_palette(&histogram, settings);
@@ -54,7 +74,15 @@ pub fn quantize_indexed(
     }
 
     let final_palette = dedup_palette(&palette);
-    remap_image(rgba, width, height, &final_palette, settings)
+    remap_image(
+        rgba,
+        width,
+        height,
+        &final_palette,
+        settings,
+        importance_map.as_deref(),
+        contrast_pixels.as_deref(),
+    )
 }
 
 pub fn max_colors_from_quality_speed(quality_target: u8, speed: u8) -> usize {
@@ -80,6 +108,7 @@ pub fn quantizer_settings(
         target_mse,
         dither,
         use_dither_map: speed.use_dither_map,
+        use_contrast_maps: speed.use_contrast_maps,
     }
 }
 
@@ -94,6 +123,7 @@ struct HistItem {
 #[derive(Default)]
 struct HistAccumulator {
     count: u32,
+    importance_sum: f64,
     sum_a: f64,
     sum_r: f64,
     sum_g: f64,
@@ -179,19 +209,28 @@ impl ColorBox {
 
 fn build_histogram(
     rgba: &[u8],
+    _width: usize,
     initial_posterize_bits: u8,
     max_histogram_entries: u32,
     gamma: &[f32; 256],
+    importance_map: Option<&[u8]>,
 ) -> Vec<HistItem> {
     let mut bits = initial_posterize_bits.min(4);
     loop {
         let mut map: HashMap<u32, HistAccumulator> = HashMap::new();
-        for px in rgba.chunks_exact(4) {
+        for (pixel_idx, px) in rgba.chunks_exact(4).enumerate() {
             let key = pack_rgba_key(px, bits);
             let entry = map.entry(key).or_default();
             let posterized = posterized_rgba(px, bits);
             let color = InternalPixel::from_rgba(gamma, &posterized);
+            let importance = f64::from(
+                importance_map
+                    .and_then(|map| map.get(pixel_idx))
+                    .copied()
+                    .unwrap_or(255),
+            );
             entry.count = entry.count.saturating_add(1);
+            entry.importance_sum += importance;
             entry.sum_a += f64::from(color.a);
             entry.sum_r += f64::from(color.r);
             entry.sum_g += f64::from(color.g);
@@ -206,8 +245,8 @@ fn build_histogram(
 }
 
 fn finalize_histogram(map: HashMap<u32, HistAccumulator>) -> Vec<HistItem> {
-    let total_count = map.values().map(|item| u64::from(item.count)).sum::<u64>() as f32;
-    let max_weight = ((0.1 / 255.0) * f64::from(total_count)) as f32;
+    let total_weight = map.values().map(|item| item.importance_sum).sum::<f64>() as f32;
+    let max_weight = ((0.1 / 255.0) * f64::from(total_weight)) as f32;
 
     let mut out = map
         .into_values()
@@ -222,7 +261,7 @@ fn finalize_histogram(map: HashMap<u32, HistAccumulator>) -> Vec<HistItem> {
                 g: (acc.sum_g * inv) as f32,
                 b: (acc.sum_b * inv) as f32,
             };
-            let weight = ((acc.count as f32) / 255.0).min(max_weight.max(1.0 / 255.0));
+            let weight = ((acc.importance_sum as f32) / 255.0).min(max_weight.max(1.0 / 255.0));
             Some(HistItem {
                 color,
                 weight,
@@ -791,12 +830,21 @@ fn remap_image(
     height: usize,
     palette: &[(InternalPixel, [u8; 4])],
     settings: QuantizerSettings,
+    importance_map: Option<&[u8]>,
+    contrast_pixels: Option<&[InternalPixel]>,
 ) -> IndexedImage {
     let (palette, mut indices, counts) = if settings.dither {
-        let (indices, counts) = remap_image_dithered(rgba, width, height, palette, settings);
-        (palette.to_vec(), indices, counts)
+        remap_image_dithered(
+            rgba,
+            width,
+            height,
+            palette,
+            settings,
+            importance_map,
+            contrast_pixels,
+        )
     } else {
-        remap_image_plain(rgba, palette, settings.input_posterize_bits)
+        remap_image_plain(rgba, palette, importance_map)
     };
 
     let mut order = (0..palette.len())
@@ -829,15 +877,15 @@ fn remap_image(
 fn remap_image_plain(
     rgba: &[u8],
     palette: &[(InternalPixel, [u8; 4])],
-    _input_posterize_bits: u8,
+    importance_map: Option<&[u8]>,
 ) -> (Vec<(InternalPixel, [u8; 4])>, Vec<u8>, Vec<usize>) {
     let mut palette_points = palette.iter().map(|entry| entry.0).collect::<Vec<_>>();
     if palette_points.len() > 1 {
-        let feedback = remap_image_plain_pass(rgba, &palette_points);
+        let feedback = remap_image_plain_pass(rgba, &palette_points, importance_map);
         apply_remap_feedback(&mut palette_points, &feedback);
     }
 
-    let final_pass = remap_image_plain_pass(rgba, &palette_points);
+    let final_pass = remap_image_plain_pass(rgba, &palette_points, importance_map);
 
     let remapped_palette = palette_points
         .iter()
@@ -855,7 +903,11 @@ struct PlainRemapPass {
     worst_color: Option<InternalPixel>,
 }
 
-fn remap_image_plain_pass(rgba: &[u8], palette_points: &[InternalPixel]) -> PlainRemapPass {
+fn remap_image_plain_pass(
+    rgba: &[u8],
+    palette_points: &[InternalPixel],
+    importance_map: Option<&[u8]>,
+) -> PlainRemapPass {
     let mut indices = Vec::with_capacity(rgba.len() / 4);
     let gamma = gamma_lut(SRGB_OUTPUT_GAMMA);
     let mut counts = vec![0usize; palette_points.len()];
@@ -866,16 +918,21 @@ fn remap_image_plain_pass(rgba: &[u8], palette_points: &[InternalPixel]) -> Plai
     let tree = NearestTree::new(palette_points);
     let mut last_idx = 0usize;
 
-    for px in rgba.chunks_exact(4) {
+    for (pixel_idx, px) in rgba.chunks_exact(4).enumerate() {
         let color = InternalPixel::from_rgba(&gamma, px);
         let (idx, diff) = tree.search(color, last_idx);
         last_idx = idx;
         counts[idx] += 1;
-        weights[idx] += 1.0;
-        sums[idx][0] += f64::from(color.a);
-        sums[idx][1] += f64::from(color.r);
-        sums[idx][2] += f64::from(color.g);
-        sums[idx][3] += f64::from(color.b);
+        let importance = importance_map
+            .and_then(|map| map.get(pixel_idx))
+            .copied()
+            .map(f64::from)
+            .unwrap_or(1.0);
+        weights[idx] += importance;
+        sums[idx][0] += f64::from(color.a) * importance;
+        sums[idx][1] += f64::from(color.r) * importance;
+        sums[idx][2] += f64::from(color.g) * importance;
+        sums[idx][3] += f64::from(color.b) * importance;
         if diff > worst_diff {
             worst_diff = diff;
             worst_color = Some(color);
@@ -916,17 +973,30 @@ fn remap_image_dithered(
     height: usize,
     palette: &[(InternalPixel, [u8; 4])],
     settings: QuantizerSettings,
-) -> (Vec<u8>, Vec<usize>) {
-    let gamma = gamma_lut(SRGB_OUTPUT_GAMMA);
-    let palette_points = palette.iter().map(|entry| entry.0).collect::<Vec<_>>();
+    importance_map: Option<&[u8]>,
+    contrast_pixels: Option<&[InternalPixel]>,
+) -> (Vec<(InternalPixel, [u8; 4])>, Vec<u8>, Vec<usize>) {
+    let mut palette_points = palette.iter().map(|entry| entry.0).collect::<Vec<_>>();
+    if palette_points.len() > 1 {
+        let feedback = remap_image_plain_pass(rgba, &palette_points, importance_map);
+        apply_remap_feedback(&mut palette_points, &feedback);
+    }
+
     let tree = NearestTree::new(&palette_points);
-    let pixels = rgba
-        .chunks_exact(4)
-        .map(|px| InternalPixel::from_rgba(&gamma, px))
-        .collect::<Vec<_>>();
-    let plain_pass = remap_image_plain_pass(rgba, &palette_points);
+    let gamma = gamma_lut(SRGB_OUTPUT_GAMMA);
+    let owned_pixels;
+    let pixels = if let Some(pixels) = contrast_pixels {
+        pixels
+    } else {
+        owned_pixels = rgba
+            .chunks_exact(4)
+            .map(|px| InternalPixel::from_rgba(&gamma, px))
+            .collect::<Vec<_>>();
+        &owned_pixels
+    };
+    let plain_pass = remap_image_plain_pass(rgba, &palette_points, importance_map);
     let dither_map = if settings.use_dither_map != DitherMapMode::None {
-        build_dither_map(&pixels, width, height, &plain_pass.indices, &palette_points)
+        build_dither_map(pixels, width, height, &plain_pass.indices, &palette_points)
     } else {
         Vec::new()
     };
@@ -975,7 +1045,7 @@ fn remap_image_dithered(
             indices[idx] = pal_idx as u8;
             counts[pal_idx] += 1;
 
-            let out = palette[pal_idx].0;
+            let out = palette_points[pal_idx];
             let mut diff = InternalPixel {
                 a: color.a - out.a,
                 r: color.r - out.r,
@@ -1005,7 +1075,12 @@ fn remap_image_dithered(
         }
     }
 
-    (indices, counts)
+    let remapped_palette = palette_points
+        .iter()
+        .map(|&color| (color, color.to_rgba(SRGB_OUTPUT_GAMMA)))
+        .collect::<Vec<_>>();
+
+    (remapped_palette, indices, counts)
 }
 
 fn get_dithered_pixel(
@@ -1061,6 +1136,13 @@ fn clamp_dither_ratio(
     } else {
         current_ratio
     }
+}
+
+fn build_importance_map(pixels: &[InternalPixel], width: usize, height: usize) -> Option<Vec<u8>> {
+    if width < 4 || height < 4 || pixels.len() != width.saturating_mul(height) {
+        return None;
+    }
+    Some(compute_contrast_maps(pixels, width, height).0)
 }
 
 fn build_dither_map(
@@ -1288,7 +1370,12 @@ fn posterize_channel(channel: u8, bits: u8) -> u8 {
 mod tests {
     use crate::quality::SpeedSettings;
 
-    use super::{max_colors_from_quality_speed, quantize_indexed, quantizer_settings};
+    use super::{
+        InternalPixel, QuantizerSettings, apply_remap_feedback, gamma_lut,
+        max_colors_from_quality_speed, quantize_indexed, quantizer_settings, remap_image_dithered,
+        remap_image_plain_pass,
+    };
+    use crate::quality::{DitherMapMode, SRGB_OUTPUT_GAMMA};
 
     #[test]
     fn max_colors_in_range() {
@@ -1337,5 +1424,45 @@ mod tests {
         let settings = quantizer_settings(4, SpeedSettings::from_speed(4), None, false);
         let out = quantize_indexed(&rgba, 8, 8, settings);
         assert!(out.palette.len() <= 4);
+    }
+
+    #[test]
+    fn plain_remap_feedback_uses_importance_weights() {
+        let rgba = vec![255u8, 0, 0, 255, 0, 0, 255, 255];
+        let gamma = gamma_lut(SRGB_OUTPUT_GAMMA);
+        let mut palette_points = vec![InternalPixel::from_rgba(&gamma, &[0, 0, 0, 255])];
+        let pass = remap_image_plain_pass(&rgba, &palette_points, Some(&[255, 1]));
+        apply_remap_feedback(&mut palette_points, &pass);
+
+        assert!(palette_points[0].r > palette_points[0].b);
+    }
+
+    #[test]
+    fn dithered_remap_reuses_plain_feedback_palette() {
+        let rgba = vec![255u8, 0, 0, 255, 0, 0, 255, 255];
+        let gamma = gamma_lut(SRGB_OUTPUT_GAMMA);
+        let palette = vec![(
+            InternalPixel::from_rgba(&gamma, &[0, 0, 0, 255]),
+            [0u8, 0, 0, 255],
+        )];
+        let settings = QuantizerSettings {
+            max_colors: 1,
+            input_posterize_bits: 0,
+            max_histogram_entries: 256,
+            kmeans_iterations: 1,
+            feedback_loop_trials: 1,
+            target_mse: None,
+            dither: true,
+            use_dither_map: DitherMapMode::None,
+            use_contrast_maps: false,
+        };
+
+        let (plain_palette, _, _) = super::remap_image_plain(&rgba, &palette, Some(&[255, 1]));
+        let (palette, indices, counts) =
+            remap_image_dithered(&rgba, 2, 1, &palette, settings, Some(&[255, 1]), None);
+
+        assert_eq!(indices.len(), 2);
+        assert_eq!(counts[0], 2);
+        assert_eq!(palette[0].1, plain_palette[0].1);
     }
 }
