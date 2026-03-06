@@ -418,6 +418,28 @@ pngquant /Users/5km/Downloads/demo.png --output /tmp/pngq-q6575-audit.png --qual
 3. 默认抖动路径当前仍比 `pngquant` 默认路径高约 `5.1KB`，半强度抖动高约 `6.1KB`，但 `--nofs` 已只剩约 `1.4KB` 差距。这说明当前剩余差距已从“大图裸 Floyd”进一步收敛到 palette 灰阶分配和 Floyd 细节本身。
 4. `--quality` 路径速度已明显改善，但相对 `pngquant` 仍慢，说明 quantizer 内部仍有可继续收紧的预算与 finalize 开销。
 
+### 10.4 2026-03-06 时间复查结论
+
+针对用户提出的“处理时间为什么比 `pngquant` 长”，本轮做了两类核验：
+
+1. 热缓存 5 次均值（同一张 `demo.png`）：
+   - `pngoptim --quality 65-75`: `0.306s`
+   - `pngquant --quality 65-75`: `0.340s`
+   - `pngoptim --quality 65-75 --nofs`: `0.246s`
+   - `pngquant --quality 65-75 --nofs`: `0.286s`
+2. 内置 profile 埋点：
+   - `decode_ms≈65`
+   - `quantize_ms≈160`
+   - `encode_ms≈104`
+   - `total_ms≈339`
+
+结论：
+
+1. 在这张当前样本的热缓存本地对拍里，`pngoptim` 平均并不比 `pngquant` 慢。
+2. 但这不代表性能差距已经彻底消失。真正稳定的热点仍是 `quantize_ms`，不是 decode。
+3. 参考实现在 `/Users/5km/Dev/C/libimagequant/src/kmeans.rs` 与 `/Users/5km/Dev/C/libimagequant/src/remap.rs` 已分别使用 `par_chunks_mut()` 和 `par_bridge()`，`/Users/5km/Dev/C/pngquant/pngquant.c` 与 `rwpng.c` 也使用 OpenMP 做多文件与色彩管理并行；当前 Rust 量化主链仍是单线程，这才是跨样本仍可能落后的结构性原因。
+4. 这轮顺手清掉了一个低风险冗余：`src/palette_quant.rs` 的 plain remap 现在会在已有 `contrast_pixels` 时直接复用内部浮点像素，避免重复 `RGBA -> InternalPixel` 转换。这个改动不改输出语义，但减少了 plain remap 的重复工作。
+
 ## 11. 当前判断
 
 1. 静态 PNG 主线不该再被笼统写成“彻底完成”；更准确的状态是“工程主线完成，但静态量化算法仍在 reference-first 复查和收口中”。

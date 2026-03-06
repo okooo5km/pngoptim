@@ -160,7 +160,8 @@
    - `pngoptim --quality 65-75 --nofs`: `105,433 bytes`, `quality_score=91`, `quality_mse=2.524`
    - `pngquant --quality 65-75`: `136,915 bytes`, `0.55s`
    - `pngquant --quality 65-75 --nofs`: `104,038 bytes`, `0.45s`
-5. 这轮确认的硬根因不是 palette search 本身，而是两处输入/输出对齐缺失：
+5. 2026-03-06 新一轮时间复查表明：在本机热缓存 5 次均值下，`demo.png` 上 `pngoptim --quality 65-75` 为 `0.306s`，`pngquant --quality 65-75` 为 `0.340s`；`--nofs` 下分别为 `0.246s` 和 `0.286s`。因此“当前这张样本上我们整体更慢”并不成立，真正稳定的热点仍是 quantizer 内部：本地埋点显示 `decode_ms≈65`、`quantize_ms≈160`、`encode_ms≈104`。参考实现在 `libimagequant/src/kmeans.rs`、`remap.rs` 和 `pngquant` CLI 层分别用了 Rayon / OpenMP 并行，而当前 Rust 量化主链仍是单线程，这才是跨样本仍可能落后的结构性原因。
+6. 这轮确认的硬根因不是 palette search 本身，而是两处输入/输出对齐缺失：
    - 当前 ICC 像素转换支路会把同一张图的唯一颜色数从 `1499` 膨胀到 `9347`
    - remap / Floyd 之前没有像 `init_int_palette()` 一样先按输出精度 round palette
    另外，大图在未生成 dither-map 时我们此前还漏掉了 `edges` fallback，导致默认 `speed=4` 比参考实现更像“裸 Floyd”。当前三点都已修正后，默认抖动和半强度抖动都继续向 `pngquant` 靠近，剩余差距已进一步收敛到少量 palette 落点与大图 Floyd 细节。
@@ -241,6 +242,7 @@
 67. 2026-03-06：重新引入正确的颜色管理主线：`src/pipeline.rs::normalize_rgba_to_srgb_if_needed()` 现已通过 Little CMS 支持 embedded `ICC -> sRGB` 和 `gAMA + cHRM -> sRGB` 两条参考路径；无效 ICC 回退原像素不阻断主流程，有效 ICC 则会把输出 metadata 规范化为 `sRGB`。回归验证 `smoke` 通过（`reports/smoke/static-color-management-smoke-20260306/summary.md`），`compat` 通过（`reports/compat/static-color-management-compat-20260306/summary.md`）。
 68. 2026-03-06：Apple Display ICC 样本 `demo.png` 经过正确颜色管理后，`pngoptim --quality 65-75 --nofs` 进一步收敛到 `105,433 bytes`（相对此前 `107,965 bytes` 再降），palette 灰阶分布已明显向 `pngquant` 靠拢；默认抖动路径当前为 `150,443 bytes`，说明剩余差距已更集中到大图 selective Floyd / edges fallback 细节，而不再是输入色彩配置解析错误。
 69. 2026-03-06：继续收口 `remap_to_palette_floyd()` 的大图路径：已修复“未生成 dither-map 时丢失 `edges` fallback”的主偏差，并补上 `dither_map.or(edges)` 的回退语义；新增回归单测锁住这条路径。当前 `demo.png --quality 65-75` 进一步收敛到 `142,017 bytes`，`--floyd=0.5` 为 `133,223 bytes`，`--nofs` 维持 `105,433 bytes`。剩余主差距已进一步收敛到少量 palette 灰阶分配与 Floyd 细节。
+70. 2026-03-06：对静态 PNG 当前速度进行了分段复查，并顺手消除 plain remap 的重复 `RGBA -> InternalPixel` 转换：`src/palette_quant.rs` 现在会在已有 `contrast_pixels` 时直接复用内部像素，不再在 plain remap 中重复构造。回归验证 `smoke` 通过（`reports/smoke/remap-pixel-reuse-smoke-20260306/summary.md`），`compat` 通过（`reports/compat/remap-pixel-reuse-compat-20260306/summary.md`）。热缓存 5 次均值下，`demo.png` 上 `pngoptim --quality 65-75` 为 `0.306s`、`pngquant` 为 `0.340s`；`--nofs` 分别为 `0.246s` / `0.286s`。当前稳定热点仍在 `quantize_ms`，且参考实现的 `kmeans/remap/Floyd` 已具备 Rayon / OpenMP 并行，后续阶段 E 再次收口时应优先从量化主链并行化入手，而不是继续怀疑 decode/encode。
 
 ### 更新规则
 1. 每次推进必须更新对应阶段状态：`Not Started` / `In Progress` / `Blocked` / `Done`。

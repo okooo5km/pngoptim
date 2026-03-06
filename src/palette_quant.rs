@@ -1288,6 +1288,7 @@ fn remap_image(
             palette,
             settings.output_posterize_bits,
             importance_map,
+            contrast_pixels,
         )
     };
 
@@ -1317,11 +1318,23 @@ fn remap_image_plain(
     palette: &[(InternalPixel, [u8; 4])],
     output_posterize_bits: u8,
     importance_map: Option<&[u8]>,
+    contrast_pixels: Option<&[InternalPixel]>,
 ) -> (Vec<(InternalPixel, [u8; 4])>, Vec<u8>, Vec<usize>) {
     let mut palette_points = palette.iter().map(|entry| entry.0).collect::<Vec<_>>();
     let output_palette =
         round_palette_for_output_in_place(&mut palette_points, output_posterize_bits);
-    let final_pass = remap_image_plain_pass(rgba, width, &palette_points, importance_map);
+    let gamma = gamma_lut(SRGB_OUTPUT_GAMMA);
+    let owned_pixels;
+    let pixels = if let Some(pixels) = contrast_pixels {
+        pixels
+    } else {
+        owned_pixels = rgba
+            .chunks_exact(4)
+            .map(|px| InternalPixel::from_rgba(&gamma, px))
+            .collect::<Vec<_>>();
+        &owned_pixels
+    };
+    let final_pass = remap_image_plain_pass(width, pixels, &palette_points, importance_map);
 
     let remapped_palette = palette_points
         .into_iter()
@@ -1341,31 +1354,27 @@ struct PlainRemapPass {
 }
 
 fn remap_image_plain_pass(
-    rgba: &[u8],
     width: usize,
+    pixels: &[InternalPixel],
     palette_points: &[InternalPixel],
     importance_map: Option<&[u8]>,
 ) -> PlainRemapPass {
-    let mut indices = Vec::with_capacity(rgba.len() / 4);
-    let gamma = gamma_lut(SRGB_OUTPUT_GAMMA);
+    let mut indices = Vec::with_capacity(pixels.len());
     let mut counts = vec![0usize; palette_points.len()];
     let mut sums = vec![[0.0f64; 4]; palette_points.len()];
     let mut weights = vec![0.0f64; palette_points.len()];
     let mut total_error = 0.0f64;
-    let mut total_pixels = 0usize;
     let tree = NearestTree::new(palette_points);
-    for (pixel_idx, px) in rgba.chunks_exact(4).enumerate() {
+    for (pixel_idx, color) in pixels.iter().copied().enumerate() {
         let row_offset = pixel_idx % width;
         let last_idx = if row_offset == 0 {
             0usize
         } else {
             indices[pixel_idx - 1] as usize
         };
-        let color = InternalPixel::from_rgba(&gamma, px);
         let (idx, diff) = tree.search(color, last_idx);
         counts[idx] += 1;
         total_error += f64::from(diff);
-        total_pixels += 1;
         let importance = importance_map
             .and_then(|map| map.get(pixel_idx))
             .copied()
@@ -1384,17 +1393,17 @@ fn remap_image_plain_pass(
         counts,
         sums,
         weights,
-        palette_error: total_error / total_pixels.max(1) as f64,
+        palette_error: total_error / pixels.len().max(1) as f64,
     }
 }
 
 fn finalize_plain_remap(
-    rgba: &[u8],
     width: usize,
+    pixels: &[InternalPixel],
     palette_points: &mut [InternalPixel],
     importance_map: Option<&[u8]>,
 ) -> PlainRemapPass {
-    let feedback = remap_image_plain_pass(rgba, width, palette_points, importance_map);
+    let feedback = remap_image_plain_pass(width, pixels, palette_points, importance_map);
     if palette_points.len() <= 1 {
         return feedback;
     }
@@ -1451,8 +1460,8 @@ fn remap_image_dithered(
         || (!is_image_huge && settings.use_dither_map != DitherMapMode::None);
     let plain_pass = if generate_dither_map {
         Some(finalize_plain_remap(
-            rgba,
             width,
+            pixels,
             &mut palette_points,
             importance_map,
         ))
@@ -1988,8 +1997,12 @@ mod tests {
     fn plain_remap_feedback_uses_importance_weights() {
         let rgba = vec![255u8, 0, 0, 255, 0, 0, 255, 255];
         let gamma = gamma_lut(SRGB_OUTPUT_GAMMA);
+        let pixels = rgba
+            .chunks_exact(4)
+            .map(|px| InternalPixel::from_rgba(&gamma, px))
+            .collect::<Vec<_>>();
         let mut palette_points = vec![InternalPixel::from_rgba(&gamma, &[0, 0, 0, 255])];
-        let pass = remap_image_plain_pass(&rgba, 2, &palette_points, Some(&[255, 1]));
+        let pass = remap_image_plain_pass(2, &pixels, &palette_points, Some(&[255, 1]));
         apply_remap_feedback(&mut palette_points, &pass);
 
         assert!(palette_points[0].r > palette_points[0].b);
@@ -2020,8 +2033,12 @@ mod tests {
             use_contrast_maps: false,
         };
 
+        let pixels = rgba
+            .chunks_exact(4)
+            .map(|px| InternalPixel::from_rgba(&gamma, px))
+            .collect::<Vec<_>>();
         let (plain_palette, _, _) =
-            super::remap_image_plain(&rgba, 2, &palette, 0, Some(&[255, 1]));
+            super::remap_image_plain(&rgba, 2, &palette, 0, Some(&[255, 1]), Some(&pixels));
         let (palette, indices, counts) = remap_image_dithered(
             &rgba,
             2,
@@ -2083,7 +2100,7 @@ mod tests {
             [131u8, 131, 131, 255],
         )];
 
-        let (final_palette, _, _) = remap_image_plain(&rgba, 1, &seed, 2, None);
+        let (final_palette, _, _) = remap_image_plain(&rgba, 1, &seed, 2, None, None);
         assert_eq!(final_palette[0].1, [130, 130, 130, 255]);
     }
 
