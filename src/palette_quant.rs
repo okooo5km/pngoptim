@@ -2,6 +2,8 @@ use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::hash::Hasher;
 
+use rayon::prelude::*;
+
 use crate::quality::{
     DitherMapMode, InternalPixel, SRGB_OUTPUT_GAMMA, SpeedSettings, gamma_lut, quality_to_mse,
 };
@@ -837,6 +839,36 @@ fn effective_target_mse(
 struct PaletteStats {
     error: f64,
 }
+#[derive(Debug, Clone)]
+struct KmeansAccumulator {
+    sums: Vec<[f64; 4]>,
+    weights: Vec<f64>,
+    total_error: f64,
+}
+
+impl KmeansAccumulator {
+    fn new(palette_len: usize) -> Self {
+        Self {
+            sums: vec![[0.0f64; 4]; palette_len],
+            weights: vec![0.0f64; palette_len],
+            total_error: 0.0,
+        }
+    }
+
+    fn merge(mut self, other: Self) -> Self {
+        self.total_error += other.total_error;
+        for (lhs, rhs) in self.sums.iter_mut().zip(other.sums) {
+            lhs[0] += rhs[0];
+            lhs[1] += rhs[1];
+            lhs[2] += rhs[2];
+            lhs[3] += rhs[3];
+        }
+        for (lhs, rhs) in self.weights.iter_mut().zip(other.weights) {
+            *lhs += rhs;
+        }
+        self
+    }
+}
 
 fn refine_palette(
     histogram: &mut [HistItem],
@@ -884,16 +916,57 @@ fn kmeans_iteration(
         .map(|entry| entry.popularity)
         .collect::<Vec<_>>();
     let tree = NearestTree::new_with_popularity(&palette_points, Some(&palette_popularities));
-    let mut sums = vec![[0.0f64; 4]; palette.len()];
-    let mut weights = vec![0.0f64; palette.len()];
     let total_weight = histogram
         .iter()
         .map(|item| f64::from(item.perceptual_weight))
         .sum::<f64>()
         .max(1e-9);
-    let mut total_error = 0.0f64;
 
-    for item in histogram.iter_mut() {
+    let acc = histogram
+        .par_chunks_mut(256)
+        .fold(
+            || KmeansAccumulator::new(palette.len()),
+            |mut acc, batch| {
+                kmeans_iteration_batch(batch, &tree, palette, adjust_weights, &mut acc);
+                acc
+            },
+        )
+        .reduce(
+            || KmeansAccumulator::new(palette.len()),
+            KmeansAccumulator::merge,
+        );
+
+    for idx in 0..palette.len() {
+        palette[idx].popularity = acc.weights[idx] as f32;
+        if acc.weights[idx] == 0.0 {
+            continue;
+        }
+        if palette[idx].color.a == 0.0 {
+            continue;
+        }
+        palette[idx].color = InternalPixel {
+            a: (acc.sums[idx][0] / acc.weights[idx]) as f32,
+            r: (acc.sums[idx][1] / acc.weights[idx]) as f32,
+            g: (acc.sums[idx][2] / acc.weights[idx]) as f32,
+            b: (acc.sums[idx][3] / acc.weights[idx]) as f32,
+        };
+    }
+
+    replace_unused_palette_entries(histogram, palette);
+
+    PaletteStats {
+        error: acc.total_error / total_weight,
+    }
+}
+
+fn kmeans_iteration_batch(
+    batch: &mut [HistItem],
+    tree: &NearestTree<'_>,
+    palette: &[PaletteEntry],
+    adjust_weights: bool,
+    acc: &mut KmeansAccumulator,
+) {
+    for item in batch.iter_mut() {
         let hint = usize::from(item.likely_palette_index).min(palette.len().saturating_sub(1));
         let (nearest, diff_sq) = tree.search(item.color, hint);
         let mut diff = f64::from(diff_sq);
@@ -907,35 +980,13 @@ fn kmeans_iteration(
                 * (0.5 + reflected_diff as f32);
         }
 
-        total_error += diff * f64::from(item.perceptual_weight);
+        acc.total_error += diff * f64::from(item.perceptual_weight);
         let weight = f64::from(item.adjusted_weight);
-        weights[nearest] += weight;
-        sums[nearest][0] += f64::from(item.color.a) * weight;
-        sums[nearest][1] += f64::from(item.color.r) * weight;
-        sums[nearest][2] += f64::from(item.color.g) * weight;
-        sums[nearest][3] += f64::from(item.color.b) * weight;
-    }
-
-    for idx in 0..palette.len() {
-        palette[idx].popularity = weights[idx] as f32;
-        if weights[idx] == 0.0 {
-            continue;
-        }
-        if palette[idx].color.a == 0.0 {
-            continue;
-        }
-        palette[idx].color = InternalPixel {
-            a: (sums[idx][0] / weights[idx]) as f32,
-            r: (sums[idx][1] / weights[idx]) as f32,
-            g: (sums[idx][2] / weights[idx]) as f32,
-            b: (sums[idx][3] / weights[idx]) as f32,
-        };
-    }
-
-    replace_unused_palette_entries(histogram, palette);
-
-    PaletteStats {
-        error: total_error / total_weight,
+        acc.weights[nearest] += weight;
+        acc.sums[nearest][0] += f64::from(item.color.a) * weight;
+        acc.sums[nearest][1] += f64::from(item.color.r) * weight;
+        acc.sums[nearest][2] += f64::from(item.color.g) * weight;
+        acc.sums[nearest][3] += f64::from(item.color.b) * weight;
     }
 }
 

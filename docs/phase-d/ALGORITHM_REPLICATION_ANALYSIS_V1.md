@@ -437,8 +437,9 @@ pngquant /Users/5km/Downloads/demo.png --output /tmp/pngq-q6575-audit.png --qual
 
 1. 在这张当前样本的热缓存本地对拍里，`pngoptim` 平均并不比 `pngquant` 慢。
 2. 但这不代表性能差距已经彻底消失。真正稳定的热点仍是 `quantize_ms`，不是 decode。
-3. 参考实现在 `/Users/5km/Dev/C/libimagequant/src/kmeans.rs` 与 `/Users/5km/Dev/C/libimagequant/src/remap.rs` 已分别使用 `par_chunks_mut()` 和 `par_bridge()`，`/Users/5km/Dev/C/pngquant/pngquant.c` 与 `rwpng.c` 也使用 OpenMP 做多文件与色彩管理并行；当前 Rust 量化主链仍是单线程，这才是跨样本仍可能落后的结构性原因。
+3. 参考实现在 `/Users/5km/Dev/C/libimagequant/src/kmeans.rs` 与 `/Users/5km/Dev/C/libimagequant/src/remap.rs` 已分别使用 `par_chunks_mut()` 和 `par_bridge()`，`/Users/5km/Dev/C/pngquant/pngquant.c` 与 `rwpng.c` 也使用 OpenMP 做多文件与色彩管理并行。本轮已先把 `kmeans_iteration()` 按同类分块方式并行化，并确认 `demo.png` 与 `dataset/perf/p_large_gradient_noise.png` 两个样本的输出哈希保持一致；但 `remap/Floyd` 仍是单线程，这才是跨样本仍可能落后的剩余结构性原因。
 4. 这轮顺手清掉了一个低风险冗余：`src/palette_quant.rs` 的 plain remap 现在会在已有 `contrast_pixels` 时直接复用内部浮点像素，避免重复 `RGBA -> InternalPixel` 转换。这个改动不改输出语义，但减少了 plain remap 的重复工作。
+5. 在 `dataset/perf/p_large_gradient_noise.png` 上，并行化 `kmeans` 后默认路径 3 次均值从基线 worktree 的 `1.987s` 降到 `1.570s`，说明这一步对大图默认路径有效；但 `--quality 65-75` 路径几乎持平（`1.700s -> 1.707s`），因此接下来该优化的核心不再是 `kmeans`，而是 `remap/Floyd`。
 
 ## 11. 当前判断
 
