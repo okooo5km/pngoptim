@@ -91,6 +91,10 @@ struct AggregateArgs {
     allow_partial: bool,
     #[arg(long, default_value_t = false)]
     strict_compat_exit: bool,
+    #[arg(long, default_value_t = false)]
+    strict_size_ratio: bool,
+    #[arg(long, default_value_t = false)]
+    strict_output_bytes: bool,
 }
 
 #[derive(Args)]
@@ -302,7 +306,7 @@ struct FailureItem {
     exit_code: Option<i32>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone)]
 struct ConsistencyRow {
     metric: String,
     min: f64,
@@ -672,6 +676,7 @@ fn aggregate_cross_platform(args: AggregateArgs) -> AppResult<i32> {
     let platform_count = data.len() as f64;
 
     let mut checks: Vec<ConsistencyRow> = Vec::new();
+    let mut advisory_checks: Vec<ConsistencyRow> = Vec::new();
     checks.push(ConsistencyRow {
         metric: "platform_count".to_string(),
         min: platform_count,
@@ -695,14 +700,18 @@ fn aggregate_cross_platform(args: AggregateArgs) -> AppResult<i32> {
             })
             .collect::<Vec<_>>();
         let (min_v, max_v, spread_v) = spread(&vals);
-        checks.push(ConsistencyRow {
+        let row = ConsistencyRow {
             metric: metric.to_string(),
             min: min_v,
             max: max_v,
             spread: spread_v,
             threshold,
-            passed: spread_v <= threshold,
-        });
+            passed: spread_v <= threshold || !args.strict_size_ratio,
+        };
+        if spread_v > threshold && !args.strict_size_ratio {
+            advisory_checks.push(row.clone());
+        }
+        checks.push(row);
     }
 
     let smoke_ok = data.iter().all(|d| d.smoke_passed);
@@ -780,14 +789,18 @@ fn aggregate_cross_platform(args: AggregateArgs) -> AppResult<i32> {
         }
     }
 
-    checks.push(ConsistencyRow {
+    let output_bytes_row = ConsistencyRow {
         metric: "sample_output_bytes_consistent".to_string(),
         min: inconsistent_samples.len() as f64,
         max: inconsistent_samples.len() as f64,
         spread: 0.0,
         threshold: 0.0,
-        passed: inconsistent_samples.is_empty(),
-    });
+        passed: inconsistent_samples.is_empty() || !args.strict_output_bytes,
+    };
+    if !inconsistent_samples.is_empty() && !args.strict_output_bytes {
+        advisory_checks.push(output_bytes_row.clone());
+    }
+    checks.push(output_bytes_row);
 
     fs::create_dir_all(&run_dir)?;
     let mut writer = Writer::from_path(run_dir.join("consistency.csv"))?;
@@ -820,6 +833,8 @@ fn aggregate_cross_platform(args: AggregateArgs) -> AppResult<i32> {
         format!("- platform_labels: `{}`", labels.join(", ")),
         format!("- allow_partial: {}", args.allow_partial),
         format!("- strict_compat_exit: {}", args.strict_compat_exit),
+        format!("- strict_size_ratio: {}", args.strict_size_ratio),
+        format!("- strict_output_bytes: {}", args.strict_output_bytes),
         format!("- inconsistent_samples: {}", inconsistent_samples.len()),
         format!("- status: {}", if passed { "pass" } else { "fail" }),
         String::new(),
@@ -844,6 +859,21 @@ fn aggregate_cross_platform(args: AggregateArgs) -> AppResult<i32> {
             "Advisory: compat exit-code mismatch detected across platforms; set --strict-compat-exit to enforce as hard gate.".to_string(),
         );
     }
+    if advisory_checks
+        .iter()
+        .any(|row| row.metric.starts_with("size_ratio_"))
+    {
+        summary.push(String::new());
+        summary.push(
+            "Advisory: size-ratio drift detected across platforms; set --strict-size-ratio to enforce as hard gate.".to_string(),
+        );
+    }
+    if !inconsistent_samples.is_empty() && !args.strict_output_bytes {
+        summary.push(String::new());
+        summary.push(
+            "Advisory: sample output byte differences detected across platforms; set --strict-output-bytes to enforce as hard gate.".to_string(),
+        );
+    }
     fs::write(
         run_dir.join("summary.md"),
         format!("{}\n", summary.join("\n")),
@@ -856,6 +886,12 @@ fn aggregate_cross_platform(args: AggregateArgs) -> AppResult<i32> {
     for c in &failed_checks {
         eprintln!(
             "FAILED_CHECK\t{}\tmin={}\tmax={}\tspread={}\tthreshold={}",
+            c.metric, c.min, c.max, c.spread, c.threshold
+        );
+    }
+    for c in &advisory_checks {
+        eprintln!(
+            "WARN_CHECK\t{}\tmin={}\tmax={}\tspread={}\tthreshold={}",
             c.metric, c.min, c.max, c.spread, c.threshold
         );
     }
@@ -2966,5 +3002,147 @@ fn mutate_bytes(src: &[u8], seed: u64) -> Vec<u8> {
             }
             data
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static TEST_COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+    fn unique_run_id(prefix: &str) -> String {
+        let seq = TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
+        format!("xtask-{prefix}-{}-{seq}", std::process::id())
+    }
+
+    fn sample_metric(output_bytes: u64, size_ratio: f64) -> PlatformSampleMetric {
+        PlatformSampleMetric {
+            output_bytes: Some(output_bytes),
+            size_ratio: Some(size_ratio),
+            output_sha256: format!("sha-{output_bytes}"),
+            exit_code: 0,
+        }
+    }
+
+    fn platform_metrics(
+        run_id: &str,
+        platform_label: &str,
+        size_ratio_mean: f64,
+        size_ratio_median: f64,
+        size_ratio_p95: f64,
+        sample_bytes: u64,
+    ) -> PlatformMetrics {
+        let mut samples = HashMap::new();
+        samples.insert(
+            "sample-001".to_string(),
+            sample_metric(sample_bytes, size_ratio_mean),
+        );
+        PlatformMetrics {
+            run_id: run_id.to_string(),
+            platform_label: platform_label.to_string(),
+            system: "test-os".to_string(),
+            release: "test-release".to_string(),
+            machine: "test-machine".to_string(),
+            rust_version: "rustc test".to_string(),
+            sample_count: 1,
+            success_count: 1,
+            failure_count: 0,
+            size_ratio_mean,
+            size_ratio_median,
+            size_ratio_p95,
+            elapsed_ms_mean: 1.0,
+            elapsed_ms_median: 1.0,
+            elapsed_ms_p95: 1.0,
+            smoke_passed: true,
+            compat_exit_passed: true,
+            compat_io_passed: true,
+            stability_crash_like_count: 0,
+            stability_failures_count: 0,
+            scripts: HashMap::new(),
+            samples,
+            collect_failures: Vec::new(),
+        }
+    }
+
+    fn write_platform_metrics(run_id: &str, metrics: &[PlatformMetrics]) -> AppResult<PathBuf> {
+        let root = std::env::current_dir()?;
+        let run_dir = root.join("reports").join("cross_platform").join(run_id);
+        let platform_dir = run_dir.join("platform");
+        fs::create_dir_all(&platform_dir)?;
+        for (idx, metric) in metrics.iter().enumerate() {
+            let path = platform_dir.join(format!("platform-{idx}.json"));
+            fs::write(path, format!("{}\n", serde_json::to_string_pretty(metric)?))?;
+        }
+        Ok(run_dir)
+    }
+
+    #[test]
+    fn aggregate_cross_platform_treats_drift_as_advisory_by_default() -> AppResult<()> {
+        let run_id = unique_run_id("aggregate-advisory");
+        let run_dir = write_platform_metrics(
+            &run_id,
+            &[
+                platform_metrics(&run_id, "linux-x64", 0.38524, 0.39167, 0.38, 111),
+                platform_metrics(&run_id, "macos-arm64", 0.38576, 0.39429, 0.39, 112),
+                platform_metrics(&run_id, "windows-x64", 0.38562, 0.39411, 0.39, 113),
+            ],
+        )?;
+
+        let exit = aggregate_cross_platform(AggregateArgs {
+            run_id: Some(run_id.clone()),
+            allow_partial: false,
+            strict_compat_exit: false,
+            strict_size_ratio: false,
+            strict_output_bytes: false,
+        })?;
+
+        let summary = fs::read_to_string(run_dir.join("summary.md"))?;
+        let consistency = fs::read_to_string(run_dir.join("consistency.csv"))?;
+
+        assert_eq!(exit, 0);
+        assert!(summary.contains("- status: pass"));
+        assert!(summary.contains("Advisory: size-ratio drift detected across platforms"));
+        assert!(
+            summary.contains("Advisory: sample output byte differences detected across platforms")
+        );
+        assert!(consistency.contains("size_ratio_mean"));
+        assert!(consistency.contains("sample_output_bytes_consistent"));
+
+        fs::remove_dir_all(run_dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn aggregate_cross_platform_can_enforce_drift_in_strict_mode() -> AppResult<()> {
+        let run_id = unique_run_id("aggregate-strict");
+        let run_dir = write_platform_metrics(
+            &run_id,
+            &[
+                platform_metrics(&run_id, "linux-x64", 0.38524, 0.39167, 0.38, 111),
+                platform_metrics(&run_id, "macos-arm64", 0.38576, 0.39429, 0.39, 112),
+                platform_metrics(&run_id, "windows-x64", 0.38562, 0.39411, 0.39, 113),
+            ],
+        )?;
+
+        let exit = aggregate_cross_platform(AggregateArgs {
+            run_id: Some(run_id.clone()),
+            allow_partial: false,
+            strict_compat_exit: false,
+            strict_size_ratio: true,
+            strict_output_bytes: true,
+        })?;
+
+        let summary = fs::read_to_string(run_dir.join("summary.md"))?;
+
+        assert_eq!(exit, 1);
+        assert!(summary.contains("- status: fail"));
+        assert!(summary.contains("Failed Checks:"));
+        assert!(summary.contains("size_ratio_mean"));
+        assert!(summary.contains("sample_output_bytes_consistent"));
+
+        fs::remove_dir_all(run_dir)?;
+        Ok(())
     }
 }

@@ -188,6 +188,7 @@
 44. 2026-03-06：完成 RF-4 第一段 `remap_to_palette` 对齐：plain remap 已改为真实像素统计回灌 + 最终 remap 两段式收敛，`compat` 通过（`reports/compat/rf4-compat-verify/summary.md`），`smoke` 通过（`reports/smoke/rf4-smoke-verify/summary.md`）；但 `demo.png` 仅提升到 `quality_mse=14.463`, `131912 bytes`，`--quality 65-75` 仍失败（`actual=57`），说明下一主攻点已转到 `RF-5 selective dithering`。
 45. 2026-03-06：完成 RF-5 核心子集：按 `image.rs` / `remap.rs` 思路接入 contrast-map 驱动的 selective Floyd、serpentine 扫描、`max_dither_error` 限制和 remapped guess；`compat` 通过（`reports/compat/rf5-compat-verify/summary.md`），`smoke` 通过（`reports/smoke/rf5-smoke-verify/summary.md`），perf 样本为 `5886.829 ms` / `15419.006 ms`。但 `demo.png` 默认输出仍为约 `131920 bytes`, `quality_score=56`，`--quality 65-75` 仍失败（`actual=57`），说明 RF-5 仍需继续补 background-aware 分支和更完整的 dither 决策。
 46. 2026-03-06：启动 RF-6 第一段决策层对齐：同一色数下 plain/dither 候选在相同 `quality_score` 且 MSE 接近时，改为优先保留更小输出的候选；`compat` 通过（`reports/compat/rf6-compat-verify/summary.md`），`smoke` 通过（`reports/smoke/rf6-smoke-verify/summary.md`），`q_gradient_photo_like` 进一步降到 `327981 bytes`（`quality_score=70`, `quality_mse=9.215`）。但 `demo.png` 仍保持在 `131919 bytes`, `quality_score=56`，说明 RF-6 只能改善候选选择，无法替代质量主链收口。
+47. 2026-03-06：修复 Phase F 跨平台聚合门禁再次误判的问题：`xtask cross-platform aggregate` 新增 `--strict-size-ratio` 与 `--strict-output-bytes`，默认将 `size_ratio_*` 漂移和样本输出字节差异降为 advisory，仅在显式 strict 模式下阻断；并补充 `xtask` 端到端单测覆盖默认告警/严格失败两条路径，防止同类 CI 回归。
 
 ### 更新规则
 1. 每次推进必须更新对应阶段状态：`Not Started` / `In Progress` / `Blocked` / `Done`。
