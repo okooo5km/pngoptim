@@ -385,8 +385,8 @@ pngquant /Users/5km/Downloads/demo.png --output /tmp/pngq-q6575-audit.png --qual
    - 在彻底移除坏支路后，`normalize_rgba_to_srgb_if_needed()` 其实变成了空实现，导致带 Apple Display ICC 的输入被直接按 sRGB 字节量化
    - remap / Floyd 前没有像 `init_int_palette()` 那样先按输出精度 round palette
 3. 当前已用 Little CMS 正确补回 `ICC -> sRGB` 和 `gAMA + cHRM -> sRGB` 两条参考路径。对 `demo.png` 这类带 Apple Display ICC 的输入，灰阶 palette 已明显向 `pngquant` 靠拢，`--nofs` 体积也进一步收敛到 `105,433 bytes`。
-4. 但正确颜色管理接入后，默认抖动路径仍为 `150,443 bytes`，反而比 `pngquant` 默认的 `136,915 bytes` 更大。这说明当前默认路径的剩余问题已经高度集中到大图 selective Floyd / edges fallback，而不是输入色彩配置解析。
-5. palette 对比已经暴露出更具体的剩余差异：`pngoptim` 的灰阶分布虽然已明显改善，但在默认抖动路径上仍没有把 `pngquant` 那套大图边缘/平坦区域抖动策略完全复现。
+4. 在正确颜色管理接入后，又定位到一处更直接的参考偏差：当前大图在未生成专用 dither-map 时漏掉了 `edges` fallback，导致默认 `speed=4` 更像“裸 Floyd”而不是 `pngquant` 的选择性抖动。
+5. 这条路径修正后，`demo.png` 的默认抖动已从 `150,443 bytes` 收敛到 `142,017 bytes`，`--floyd=0.5` 到 `133,223 bytes`，说明当前默认路径的剩余问题已从“大图裸扩散”进一步收敛到少量 palette 灰阶分配与 Floyd 细节，而不是输入色彩配置解析或 dither-map 主逻辑缺失。
 
 ### 10.2 本轮已修复的偏差
 
@@ -409,12 +409,13 @@ pngquant /Users/5km/Downloads/demo.png --output /tmp/pngq-q6575-audit.png --qual
 15. 保留 contrast maps 的 `edges` 图，并在大图未生成 dither-map 时退回使用 `edges` 作为选择性抖动图，而不是直接做“裸 Floyd”。
 16. 重新引入正确的颜色管理：`src/pipeline.rs::normalize_rgba_to_srgb_if_needed()` 现已通过 Little CMS 支持 `ICC -> sRGB` 和 `gAMA + cHRM -> sRGB` 两条参考路径；无效 ICC 会回退原像素，不阻断主流程。
 17. histogram key 已改为 native-endian 打包，`U32Hasher` 也改回参考实现使用的 fxhash 常量乘法；importance 累计改为 `u32` 饱和加法，posterize 升级语义改为“请求 bits + 最多额外 1 bit”，plain remap 的 `last_match` 也改为按行重置。
+18. 补齐 `dither_map.or(edges)` 的完整回退语义：即使生成的专用 dither-map 为空，也会像参考实现那样继续回退到 `edges`，避免在退化图上重新掉回全强度 Floyd。
 
 ### 10.3 仍然存在的关键偏差
 
 1. 当前 plain remap / dither remap 还没有完整实现 `remap.rs::remap_to_palette()` 的 full-image K-Means finalize 结构。
 2. 当前 selective dithering 虽然已接入 core subset，但还没达到 `remap_to_palette_floyd()` 的整套 chunk warmup / background-aware / guess 策略。
-3. 默认抖动路径当前仍比 `pngquant` 默认路径大约高 `13.5KB`，但 `--nofs` 已只剩约 `1.4KB` 差距。这说明当前剩余差距已从 palette 搜索本身进一步收敛到大图 selective Floyd / edges fallback 细节。
+3. 默认抖动路径当前仍比 `pngquant` 默认路径高约 `5.1KB`，半强度抖动高约 `6.1KB`，但 `--nofs` 已只剩约 `1.4KB` 差距。这说明当前剩余差距已从“大图裸 Floyd”进一步收敛到 palette 灰阶分配和 Floyd 细节本身。
 4. `--quality` 路径速度已明显改善，但相对 `pngquant` 仍慢，说明 quantizer 内部仍有可继续收紧的预算与 finalize 开销。
 
 ## 11. 当前判断

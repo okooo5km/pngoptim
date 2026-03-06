@@ -155,9 +155,9 @@
    - palette 落点在灰阶 UI 样本上仍与 `pngquant` 有细微差异，当前会多保留一档棕色/强调色，少保留一档中间灰，导致默认抖动路径体积和阴影观感仍未完全对齐
 3. `src/pipeline.rs` 已不再在 `--quality` 模式下做外层色数二分，也不再在 `--quality` 模式额外跑 baseline 候选；质量约束完全收回 quantizer 内部，慢路径已明显缩短。
 4. 当前 `demo.png` spot check 的真实状态已更新为：
-   - `pngoptim --quality 65-75`（默认抖动）: `144,803 bytes`, `quality_score=89`, `quality_mse=3.105`, `0.73s`
-   - `pngoptim --quality 65-75 --floyd=0.5`: `133,985 bytes`, `quality_score=90`, `quality_mse=2.789`
-   - `pngoptim --quality 65-75 --nofs`: `107,965 bytes`, `quality_score=91`, `quality_mse=2.430`, `0.72s`
+   - `pngoptim --quality 65-75`（默认抖动）: `142,017 bytes`, `quality_score=89`, `quality_mse=3.237`
+   - `pngoptim --quality 65-75 --floyd=0.5`: `133,223 bytes`, `quality_score=90`, `quality_mse=2.916`
+   - `pngoptim --quality 65-75 --nofs`: `105,433 bytes`, `quality_score=91`, `quality_mse=2.524`
    - `pngquant --quality 65-75`: `136,915 bytes`, `0.55s`
    - `pngquant --quality 65-75 --nofs`: `104,038 bytes`, `0.45s`
 5. 这轮确认的硬根因不是 palette search 本身，而是两处输入/输出对齐缺失：
@@ -165,11 +165,11 @@
    - remap / Floyd 之前没有像 `init_int_palette()` 一样先按输出精度 round palette
    另外，大图在未生成 dither-map 时我们此前还漏掉了 `edges` fallback，导致默认 `speed=4` 比参考实现更像“裸 Floyd”。当前三点都已修正后，默认抖动和半强度抖动都继续向 `pngquant` 靠近，剩余差距已进一步收敛到少量 palette 落点与大图 Floyd 细节。
 6. 2026-03-06 本轮 reference-first 复查又补齐了几处实现口径：
-   - histogram 超限时会持续提高 input posterize，直到不超过 `3` bit 上限，而不是只提一级
-   - histogram 改用固定 `u32` identity hasher，避免标准随机 `HashMap` 顺序把 mediancut 起点带偏
+   - histogram 超限时改回“请求 bits + 最多额外 1 bit”的参考语义，不再持续提到 `3` bit 上限
+   - histogram 改用参考实现一致的 `U32Hasher(fxhash-mul)`，避免标准随机 `HashMap` 顺序把 mediancut 起点带偏
    - VP-tree 在 K-Means / unused color replacement 中按 palette popularity 选 vantage point，更接近 `nearest.rs`
    - plain remap 按行重置 `last_match`，与 `remap.rs::remap_to_palette()` 的行级 hint 口径一致
-   这批修正对 `demo.png` 体积未产生新跳变，但清掉了真实参考偏差，后续可以把注意力继续压回 palette 分配和 Floyd 细节本身。
+   这批修正本身没有单独带来体积跳变，但配合后续颜色管理和大图 `edges` fallback 修复后，默认抖动已从 `150,443 bytes` 收敛到 `142,017 bytes`。
 
 ### 最近更新
 1. 2026-03-05：确认参考仓库本地路径与远程可达性，并锁定 `main` 分支 commit。
@@ -240,6 +240,7 @@
 66. 2026-03-06：纠正静态 PNG 直方图主链中的基础 reference drift：histogram key 改为 native-endian 打包，`U32Hasher` 改为和参考实现一致的 fxhash 常量乘法，importance 累计改回 `u32` 饱和加法，posterize 升级也改回“请求 bits + 最多额外 1 bit”的参考语义；并新增单测锁住这一行为，避免后续再次把参考实现误读成“持续升级到上限”。
 67. 2026-03-06：重新引入正确的颜色管理主线：`src/pipeline.rs::normalize_rgba_to_srgb_if_needed()` 现已通过 Little CMS 支持 embedded `ICC -> sRGB` 和 `gAMA + cHRM -> sRGB` 两条参考路径；无效 ICC 回退原像素不阻断主流程，有效 ICC 则会把输出 metadata 规范化为 `sRGB`。回归验证 `smoke` 通过（`reports/smoke/static-color-management-smoke-20260306/summary.md`），`compat` 通过（`reports/compat/static-color-management-compat-20260306/summary.md`）。
 68. 2026-03-06：Apple Display ICC 样本 `demo.png` 经过正确颜色管理后，`pngoptim --quality 65-75 --nofs` 进一步收敛到 `105,433 bytes`（相对此前 `107,965 bytes` 再降），palette 灰阶分布已明显向 `pngquant` 靠拢；默认抖动路径当前为 `150,443 bytes`，说明剩余差距已更集中到大图 selective Floyd / edges fallback 细节，而不再是输入色彩配置解析错误。
+69. 2026-03-06：继续收口 `remap_to_palette_floyd()` 的大图路径：已修复“未生成 dither-map 时丢失 `edges` fallback”的主偏差，并补上 `dither_map.or(edges)` 的回退语义；新增回归单测锁住这条路径。当前 `demo.png --quality 65-75` 进一步收敛到 `142,017 bytes`，`--floyd=0.5` 为 `133,223 bytes`，`--nofs` 维持 `105,433 bytes`。剩余主差距已进一步收敛到少量 palette 灰阶分配与 Floyd 细节。
 
 ### 更新规则
 1. 每次推进必须更新对应阶段状态：`Not Started` / `In Progress` / `Blocked` / `Done`。

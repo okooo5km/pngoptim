@@ -203,7 +203,7 @@ struct ColorBox {
     end: usize,
     average: InternalPixel,
     adjusted_weight_sum: f64,
-    variance: [f64; 4],
+    variance: [f32; 4],
     total_error: Option<f64>,
     max_error: f32,
 }
@@ -215,39 +215,41 @@ impl ColorBox {
         }
 
         let mut adjusted_weight_sum = 0.0f64;
-        let mut sum_a = 0.0f64;
-        let mut sum_r = 0.0f64;
-        let mut sum_g = 0.0f64;
-        let mut sum_b = 0.0f64;
+        let mut average = InternalPixel::default();
+        let mut average_weight_sum = 0.0f32;
 
         for item in &items[start..end] {
             let weight = f64::from(item.adjusted_weight);
             adjusted_weight_sum += weight;
-            sum_a += f64::from(item.color.a) * weight;
-            sum_r += f64::from(item.color.r) * weight;
-            sum_g += f64::from(item.color.g) * weight;
-            sum_b += f64::from(item.color.b) * weight;
+            average_weight_sum += item.adjusted_weight;
+            average.a += item.color.a * item.adjusted_weight;
+            average.r += item.color.r * item.adjusted_weight;
+            average.g += item.color.g * item.adjusted_weight;
+            average.b += item.color.b * item.adjusted_weight;
         }
 
         if adjusted_weight_sum == 0.0 {
             return None;
         }
 
-        let average = InternalPixel {
-            a: (sum_a / adjusted_weight_sum) as f32,
-            r: (sum_r / adjusted_weight_sum) as f32,
-            g: (sum_g / adjusted_weight_sum) as f32,
-            b: (sum_b / adjusted_weight_sum) as f32,
-        };
+        if average_weight_sum != 0.0 {
+            average.a /= average_weight_sum;
+            average.r /= average_weight_sum;
+            average.g /= average_weight_sum;
+            average.b /= average_weight_sum;
+        }
 
-        let mut variance = [0.0; 4];
+        let mut variance = [0.0f32; 4];
         let mut max_error = 0.0f32;
         for item in &items[start..end] {
-            let weight = f64::from(item.adjusted_weight);
-            variance[0] += f64::from((item.color.a - average.a).powi(2)) * weight;
-            variance[1] += f64::from((item.color.r - average.r).powi(2)) * weight;
-            variance[2] += f64::from((item.color.g - average.g).powi(2)) * weight;
-            variance[3] += f64::from((item.color.b - average.b).powi(2)) * weight;
+            let delta_a = item.color.a - average.a;
+            let delta_r = item.color.r - average.r;
+            let delta_g = item.color.g - average.g;
+            let delta_b = item.color.b - average.b;
+            variance[0] += delta_a * delta_a * item.adjusted_weight;
+            variance[1] += delta_r * delta_r * item.adjusted_weight;
+            variance[2] += delta_g * delta_g * item.adjusted_weight;
+            variance[3] += delta_b * delta_b * item.adjusted_weight;
             max_error = max_error.max(average.diff(item.color));
         }
 
@@ -608,7 +610,12 @@ fn take_best_splittable_box(boxes: &[ColorBox], max_mse: f64) -> Option<usize> {
         .enumerate()
         .filter(|(_, color_box)| color_box.len() > 1)
         .map(|(idx, color_box)| {
-            let mut score = color_box.adjusted_weight_sum * color_box.variance.iter().sum::<f64>();
+            let mut score = color_box.adjusted_weight_sum
+                * color_box
+                    .variance
+                    .iter()
+                    .map(|variance| f64::from(*variance))
+                    .sum::<f64>();
             if f64::from(color_box.max_error) > max_mse {
                 score = score * f64::from(color_box.max_error) / max_mse;
             }
@@ -1453,17 +1460,16 @@ fn remap_image_dithered(
         None
     };
     let output_image_is_remapped = generate_dither_map;
-    let dither_map = if let Some(plain_pass) = plain_pass.as_ref() {
-        if generate_dither_map {
-            build_dither_map(pixels, width, height, &plain_pass.indices, &palette_points)
-        } else if settings.use_dither_map != DitherMapMode::None {
-            edges_map.map_or_else(Vec::new, |edges| edges.to_vec())
-        } else {
-            Vec::new()
-        }
-    } else {
-        Vec::new()
-    };
+    let dither_map = select_dither_map(
+        pixels,
+        width,
+        height,
+        plain_pass.as_ref(),
+        &palette_points,
+        settings.use_dither_map,
+        generate_dither_map,
+        edges_map,
+    );
     let tree = NearestTree::new(&palette_points);
     let mut indices = vec![0u8; pixels.len()];
     let mut counts = vec![0usize; palette.len()];
@@ -1554,6 +1560,34 @@ fn remap_image_dithered(
         .collect::<Vec<_>>();
 
     (remapped_palette, indices, counts)
+}
+
+fn select_dither_map(
+    pixels: &[InternalPixel],
+    width: usize,
+    height: usize,
+    plain_pass: Option<&PlainRemapPass>,
+    palette_points: &[InternalPixel],
+    use_dither_map: DitherMapMode,
+    generate_dither_map: bool,
+    edges_map: Option<&[u8]>,
+) -> Vec<u8> {
+    if generate_dither_map {
+        let generated = plain_pass
+            .map(|plain_pass| {
+                build_dither_map(pixels, width, height, &plain_pass.indices, palette_points)
+            })
+            .unwrap_or_default();
+        if !generated.is_empty() {
+            return generated;
+        }
+    }
+
+    if use_dither_map != DitherMapMode::None {
+        return edges_map.map_or_else(Vec::new, |edges| edges.to_vec());
+    }
+
+    Vec::new()
 }
 
 fn get_dithered_pixel(
@@ -1889,6 +1923,7 @@ mod tests {
     use super::{
         InternalPixel, QuantizerSettings, apply_remap_feedback, gamma_lut, quantize_indexed,
         quantizer_settings, remap_image_dithered, remap_image_plain, remap_image_plain_pass,
+        select_dither_map,
     };
     use crate::quality::{DitherMapMode, SRGB_OUTPUT_GAMMA};
 
@@ -2002,6 +2037,41 @@ mod tests {
         assert_eq!(indices.len(), 2);
         assert_eq!(counts[0], 2);
         assert_eq!(palette[0].1, plain_palette[0].1);
+    }
+
+    #[test]
+    fn huge_image_dithering_falls_back_to_edges_map() {
+        let pixels = vec![InternalPixel::default(); 4];
+        let edges = vec![9u8, 8, 7, 6];
+        let dither_map = select_dither_map(
+            &pixels,
+            2,
+            2,
+            None,
+            &[],
+            DitherMapMode::Enabled,
+            false,
+            Some(&edges),
+        );
+
+        assert_eq!(dither_map, edges);
+    }
+
+    #[test]
+    fn empty_generated_dither_map_falls_back_to_edges_map() {
+        let edges = vec![5u8, 4, 3, 2];
+        let dither_map = select_dither_map(
+            &[],
+            0,
+            0,
+            None,
+            &[],
+            DitherMapMode::Enabled,
+            true,
+            Some(&edges),
+        );
+
+        assert_eq!(dither_map, edges);
     }
 
     #[test]
