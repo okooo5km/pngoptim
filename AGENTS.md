@@ -134,7 +134,7 @@
 ### 附加产品轨道
 | 轨道 | 状态 | 当前焦点 | 证据/报告 |
 |---|---|---|---|
-| Algorithm Replication | Done | 轨道收口完成 | `docs/phase-d/ALGORITHM_REPLICATION_ANALYSIS_V1.md` |
+| Algorithm Replication | In Progress | 静态 PNG reference-first 复查与质量主链收口 | `docs/phase-d/ALGORITHM_REPLICATION_ANALYSIS_V1.md` |
 
 ### Algorithm Replication 新规划（Reference-First）
 | 子阶段 | 状态 | 参考模块 | 目标 | 当前结论 |
@@ -148,11 +148,16 @@
 | RF-7 | Done | 全链路 | 重跑 quality/perf/stability/release 门禁，形成新基线 | 本地与跨平台复核均已通过 |
 
 ### 当前硬阻塞与下一步
-1. A-G 主线与 `Algorithm Replication` 轨道均已收口；当前主任务已经从“复刻 pngquant”切换到“超越阶段”。
-2. 阶段 H 已确定优先攻克 APNG，而不是继续在静态 PNG 主线上做边际优化。原因很明确：APNG 是格式与产品能力维度上的新增，而不是同一赛道里的微调。
-3. APNG 的核心约束已经冻结：动画文件共享一套全局 `IHDR` 语义，若使用调色板则也是全局 `PLTE/tRNS`；因此不能按“每帧独立 pngquant 一次”来设计，有损优化必须是 animation-aware 的全局颜色决策。
-4. 阶段 H 的 H1 首版骨架已落地：`src/apng.rs` 现已具备 `RGBA8` APNG 的 decode / compose / encode round-trip，以及 default image / separate thumbnail / dispose / blend 语义单测。
-5. 下一步不该直接碰 animation-wide 有损量化，而应先把 APNG 模块接入正式 CLI / pipeline 分流，然后进入 H2 的 lossless 结构优化（重复帧折叠、最小变化矩形、等价 dispose/blend 重写）。
+1. 阶段 H 目前暂缓，主任务切回静态 PNG 的 `reference-first` 复查。原因很明确：用户样本已证明当前静态量化主链在平滑阴影和 `--quality` 路径上仍存在可感知差距，不适合在这个状态下继续扩新格式能力。
+2. 当前最硬的阻塞不是工程链路，而是 `libimagequant` 细节对齐仍不完整：
+   - `hist.rs` 的 `perceptual_weight` / `mc_color_weight` / cluster 初始化
+   - `mediancut.rs` 的 `total_box_error_below_target()` / `max_mse_per_color` / best-box split
+   - `remap.rs::remap_to_palette` 的 full-image K-Means finalize
+3. 本轮已经先收掉一个最明显的结构偏差：`src/pipeline.rs` 不再在 `--quality` 模式下做外层色数二分；质量约束改回 quantizer 内部，`--quality 65-75` 样本耗时已从约 `7.58s` 降到约 `2.38s`。
+4. 当前 `demo.png` spot check 的真实状态是：
+   - `pngoptim --quality 65-75`: `141,651 bytes`, `quality_score=81`, `quality_mse=5.608`, `2.38s`
+   - `pngquant --quality 65-75`: `136,915 bytes`, `MSE=5.210 (Q=82)`, `0.40s`
+5. 这说明质量已经拉回到接近参考实现，但体积与速度仍落后；下一步必须继续对齐 `hist.rs` / `mediancut.rs` / `remap.rs`，而不是继续扩展 APNG 或做编码层微调。
 
 ### 最近更新
 1. 2026-03-05：确认参考仓库本地路径与远程可达性，并锁定 `main` 分支 commit。
@@ -209,6 +214,8 @@
 52. 2026-03-06：完成 RF-7 跨平台复核：远端 `phase-f-cross-platform` run `22750921042` 最终为 `success`，`collect-ubuntu-latest` / `collect-macos-latest` / `collect-windows-latest` / `aggregate` 全部成功，算法复刻轨道正式收口为 `Done`。
 53. 2026-03-06：启动超越阶段规划，决定优先落地 `Phase H: APNG 动图压缩优化`，并完成一轮 APNG 一手规范调研与仓库架构映射：确认 APNG 已纳入 `PNG 3` 正式规范，文件由 `acTL` / `fcTL` / `fdAT` 扩展 chunk 驱动，动画共享全局 `IHDR` 与色彩约束；当前仓库依赖的 `png` crate 已具备 APNG 读帧与动画写出基础能力，后续重点将转向 parser / canvas / lossless 结构优化 / animation-aware 全局量化。
 54. 2026-03-06：完成 H1 首版实现：新增 `src/apng.rs`，提供 `decode_apng` / `compose_frames` / `encode_apng`，当前先支持 `RGBA8` APNG；已覆盖 static PNG 非 APNG 判别、separate default image 识别、`dispose_op=Previous` 与 `blend_op=Over` compositing，以及 encode/decode round-trip（`cargo test apng -- --nocapture` 全绿）。
+55. 2026-03-06：基于用户真实样本重新打开静态 PNG 复查：确认当前实现虽已完成工程化主线，但在平滑阴影与 `--quality` 路径上仍存在 reference drift；`Algorithm Replication` 轨道状态由 `Done` 调整为 `In Progress`，阶段 H 暂缓。
+56. 2026-03-06：完成第一轮静态 PNG 复查修复：移除 `src/pipeline.rs` 中外层 `quality -> colors` 二分搜索，引入 `kmeans_iteration_limit`，将 feedback loop 结构改回“trial 一次主迭代 + 最终单独 refine”，并为 `--quality` 增加“高质量 256 色基线 + 目标质量候选”的内部护栏；回归验证 `smoke` 通过（`reports/smoke/static-quality-guard-20260306-r1/summary.md`），`compat` 通过（`reports/compat/static-quality-guard-compat-20260306-r1/summary.md`）。`demo.png --quality 65-75` 当前结果为 `141,651 bytes`, `quality_score=81`, `quality_mse=5.608`, `2.38s`，已明显优于修复前的低质量退化，但相较 `pngquant` 的 `136,915 bytes`, `Q=82`, `0.40s` 仍有体积和速度差距。
 
 ### 更新规则
 1. 每次推进必须更新对应阶段状态：`Not Started` / `In Progress` / `Blocked` / `Done`。

@@ -17,6 +17,7 @@ pub struct QuantizerSettings {
     pub input_posterize_bits: u8,
     pub max_histogram_entries: u32,
     pub kmeans_iterations: u16,
+    pub kmeans_iteration_limit: f64,
     pub feedback_loop_trials: u16,
     pub target_mse: Option<f64>,
     pub dither: bool,
@@ -85,14 +86,6 @@ pub fn quantize_indexed(
     )
 }
 
-pub fn max_colors_from_quality_speed(quality_target: u8, speed: u8) -> usize {
-    let quality_component = 16 + (usize::from(quality_target) * 180 / 100);
-    let speed_penalty = usize::from(speed.saturating_sub(1)) * 14;
-    quality_component
-        .saturating_sub(speed_penalty)
-        .clamp(16, 256)
-}
-
 pub fn quantizer_settings(
     max_colors: usize,
     speed: SpeedSettings,
@@ -104,6 +97,7 @@ pub fn quantizer_settings(
         input_posterize_bits: speed.input_posterize_bits,
         max_histogram_entries: speed.max_histogram_entries,
         kmeans_iterations: speed.kmeans_iterations,
+        kmeans_iteration_limit: speed.kmeans_iteration_limit,
         feedback_loop_trials: speed.feedback_loop_trials,
         target_mse,
         dither,
@@ -332,31 +326,71 @@ fn find_best_palette(histogram: &[HistItem], settings: QuantizerSettings) -> Vec
     let mut hist = histogram.to_vec();
     let hist_items = hist.len();
     let total_trials = effective_feedback_trials(settings.feedback_loop_trials, hist_items);
-    let trial_iterations = trial_kmeans_iterations(settings.kmeans_iterations, hist_items);
-    let final_iterations = final_kmeans_iterations(settings.kmeans_iterations, hist_items);
+    let final_iteration_limit =
+        effective_kmeans_iteration_limit(settings.kmeans_iteration_limit, hist_items);
+    let has_quality_target = settings.target_mse.is_some();
+    let final_iterations = effective_kmeans_iterations(
+        settings.kmeans_iterations,
+        hist_items,
+        false,
+        has_quality_target,
+    );
 
-    if hist.len() <= max_colors || total_trials <= 1 || settings.target_mse.is_none() {
+    if hist.len() <= max_colors || total_trials == 0 || !has_quality_target {
         let mut palette = if hist.len() <= max_colors {
             hist.iter().map(|item| item.color).collect::<Vec<_>>()
         } else {
             median_cut_palette(&mut hist, max_colors)
         };
-        let _ = refine_palette(&mut hist, &mut palette, final_iterations, false);
+        let _ = refine_palette(
+            &mut hist,
+            &mut palette,
+            final_iterations,
+            false,
+            final_iteration_limit,
+        );
         return palette;
     }
 
     let target_mse = settings.target_mse.unwrap_or(f64::INFINITY);
     let mut current_max_colors = max_colors;
     let mut trials_left = total_trials as i32;
-    let mut best_palette = None;
-    let mut best_error = f64::INFINITY;
-    let mut best_used_colors = usize::MAX;
+    let mut baseline_hist = histogram.to_vec();
+    let mut baseline_palette = if baseline_hist.len() <= max_colors {
+        baseline_hist
+            .iter()
+            .map(|item| item.color)
+            .collect::<Vec<_>>()
+    } else {
+        median_cut_palette(&mut baseline_hist, max_colors)
+    };
+    let baseline_stats = refine_palette(
+        &mut baseline_hist,
+        &mut baseline_palette,
+        final_iterations,
+        false,
+        final_iteration_limit,
+    );
+    let baseline_used_colors = baseline_stats
+        .used_colors
+        .max(2)
+        .min(baseline_palette.len());
+    let mut best_palette = Some(baseline_palette);
+    let mut best_error = baseline_stats.error;
+    let mut best_used_colors = baseline_used_colors;
     let mut fails_in_a_row = 0i32;
+
+    if best_error < target_mse && best_error > 0.0 {
+        current_max_colors = current_max_colors
+            .min(best_used_colors.saturating_add(1))
+            .saturating_sub(1)
+            .max(2);
+    }
 
     while trials_left > 0 && current_max_colors >= 2 {
         let mut palette = median_cut_palette(&mut hist, current_max_colors);
-        let first_target_run = best_palette.is_none();
-        let stats = refine_palette(&mut hist, &mut palette, trial_iterations, !first_target_run);
+        let first_target_run = best_palette.is_none() && target_mse > 0.0;
+        let stats = kmeans_iteration(&mut hist, &mut palette, !first_target_run);
         let used_colors = stats.used_colors.max(2).min(palette.len());
         let better = best_palette.is_none()
             || stats.error < best_error
@@ -383,7 +417,20 @@ fn find_best_palette(histogram: &[HistItem], settings: QuantizerSettings) -> Vec
 
     let mut palette = best_palette.unwrap_or_else(|| median_cut_palette(&mut hist, max_colors));
     let mut final_hist = histogram.to_vec();
-    let _ = refine_palette(&mut final_hist, &mut palette, final_iterations, false);
+    let palette_error_is_known = best_error.is_finite();
+    let final_iterations = effective_kmeans_iterations(
+        settings.kmeans_iterations,
+        hist_items,
+        palette_error_is_known,
+        has_quality_target,
+    );
+    let _ = refine_palette(
+        &mut final_hist,
+        &mut palette,
+        final_iterations,
+        false,
+        final_iteration_limit,
+    );
     palette
 }
 
@@ -398,6 +445,7 @@ fn refine_palette(
     palette: &mut [InternalPixel],
     iterations: u16,
     adjust_weights: bool,
+    iteration_limit: f64,
 ) -> PaletteStats {
     if palette.is_empty() {
         return PaletteStats {
@@ -407,7 +455,6 @@ fn refine_palette(
     }
 
     let mut stats = kmeans_iteration(histogram, palette, adjust_weights);
-    let iteration_limit = 1e-7;
     for _ in 0..iterations.saturating_sub(1) {
         let previous_error = stats.error;
         stats = kmeans_iteration(histogram, palette, false);
@@ -517,7 +564,7 @@ fn replace_unused_palette_entries(
 }
 
 fn effective_feedback_trials(base_trials: u16, hist_items: usize) -> u16 {
-    let mut trials = base_trials.max(1);
+    let mut trials = base_trials;
     if hist_items > 5_000 {
         trials = (trials * 3 + 3) / 4;
     }
@@ -530,33 +577,39 @@ fn effective_feedback_trials(base_trials: u16, hist_items: usize) -> u16 {
     if hist_items > 100_000 {
         trials = (trials * 3 + 3) / 4;
     }
-    if hist_items > 100_000 {
-        trials = 1;
-    } else if hist_items > 10_000 {
-        trials = trials.min(2);
-    } else {
-        trials = trials.min(3);
-    }
-    trials.clamp(1, 3)
+    trials
 }
 
-fn trial_kmeans_iterations(base_iterations: u16, hist_items: usize) -> u16 {
-    if hist_items > 100_000 {
-        base_iterations.clamp(1, 2)
-    } else if hist_items > 10_000 {
-        base_iterations.clamp(1, 4)
-    } else {
-        base_iterations.min(6)
+fn effective_kmeans_iterations(
+    base_iterations: u16,
+    hist_items: usize,
+    palette_error_is_known: bool,
+    has_quality_target: bool,
+) -> u16 {
+    let mut iterations = base_iterations;
+    if hist_items > 5_000 {
+        iterations = (iterations * 3 + 3) / 4;
     }
+    if hist_items > 25_000 {
+        iterations = (iterations * 3 + 3) / 4;
+    }
+    if hist_items > 50_000 {
+        iterations = (iterations * 3 + 3) / 4;
+    }
+    if hist_items > 100_000 {
+        iterations = (iterations * 3 + 3) / 4;
+    }
+    if iterations == 0 && !palette_error_is_known && has_quality_target {
+        iterations = 1;
+    }
+    iterations
 }
 
-fn final_kmeans_iterations(base_iterations: u16, hist_items: usize) -> u16 {
+fn effective_kmeans_iteration_limit(base_limit: f64, hist_items: usize) -> f64 {
     if hist_items > 100_000 {
-        base_iterations.clamp(1, 3)
-    } else if hist_items > 10_000 {
-        base_iterations.clamp(1, 5)
+        base_limit * 2.0
     } else {
-        base_iterations.min(8)
+        base_limit
     }
 }
 
@@ -1402,21 +1455,11 @@ mod tests {
     use crate::quality::SpeedSettings;
 
     use super::{
-        InternalPixel, QuantizerSettings, apply_remap_feedback, gamma_lut,
-        max_colors_from_quality_speed, quantize_indexed, quantizer_settings, remap_image_dithered,
-        remap_image_plain_pass, should_prefer_plain_match,
+        InternalPixel, QuantizerSettings, apply_remap_feedback, gamma_lut, quantize_indexed,
+        quantizer_settings, remap_image_dithered, remap_image_plain_pass,
+        should_prefer_plain_match,
     };
     use crate::quality::{DitherMapMode, SRGB_OUTPUT_GAMMA};
-
-    #[test]
-    fn max_colors_in_range() {
-        for q in 0..=100u8 {
-            for s in 1..=11u8 {
-                let n = max_colors_from_quality_speed(q, s);
-                assert!((16..=256).contains(&n));
-            }
-        }
-    }
 
     #[test]
     fn quantize_indexed_runs() {
@@ -1481,6 +1524,7 @@ mod tests {
             input_posterize_bits: 0,
             max_histogram_entries: 256,
             kmeans_iterations: 1,
+            kmeans_iteration_limit: 1e-7,
             feedback_loop_trials: 1,
             target_mse: None,
             dither: true,

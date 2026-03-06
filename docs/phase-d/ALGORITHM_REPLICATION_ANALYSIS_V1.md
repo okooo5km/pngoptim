@@ -350,9 +350,57 @@ pngquant /Users/5km/Downloads/demo.png --output /tmp/pngquant-demo-q6575.png --q
 3. filter / deflate 组合回归。
 4. `skip-if-larger` 启发式对齐。
 
-## 10. 本轮结论
+## 10. 2026-03-06 静态 PNG 复查结论
 
-1. 当前项目已经完成 Rust 工程化与发布链路，不再依赖 Python 编排。
-2. 当前计划需要调整的点不在“大方向”，而在执行粒度：算法轨道必须从粗粒度 `R1/R2/R3` 改成模块驱动的 `RF-1 .. RF-7`。
-3. 当前不应再回到“凭感觉打补丁”的模式；算法轨道已经完成主链收口，后续应以产品决策和新功能评估为主。
-4. 若继续推进，最自然的方向已经不再是修主链，而是决定是否把显式 background 图像分支产品化，或转向新的产品能力。
+用户样本复查表明，之前把静态 PNG 主线直接视为“完全收口”是过早结论。  
+从工程链路、CI/CD 和发布资产角度，主线是完整的；但从 `pngquant/libimagequant` 的静态量化算法细节看，仍存在一批会直接影响平滑阴影、渐变和 `--quality` 用户体验的 reference drift。
+
+### 10.1 样本实测
+
+样本：`/Users/5km/Downloads/demo.png`
+
+参考命令：
+
+```bash
+./target/release/pngoptim /Users/5km/Downloads/demo.png --output /tmp/pgo-noq-audit.png --force
+./target/release/pngoptim /Users/5km/Downloads/demo.png --output /tmp/pgo-q6575-audit.png --quality 65-75 --force
+pngquant /Users/5km/Downloads/demo.png --output /tmp/pngq-q6575-audit.png --quality 65-75 --force --verbose
+```
+
+本轮确认的结果：
+
+| 场景 | 输出大小 | 质量结果 | 耗时 | 说明 |
+|---|---:|---:|---:|---|
+| 当前 `pngoptim` 默认 | `137,110` bytes | `quality_score=77`, `quality_mse=6.825` | `0.80s` | 质量回到稳定水位 |
+| 当前 `pngoptim --quality 65-75` | `141,651` bytes | `quality_score=81`, `quality_mse=5.608` | `2.38s` | 质量已接近参考，但体积更大、速度更慢 |
+| `pngquant --quality 65-75` | `136,915` bytes | `MSE=5.210 (Q=82)` | `0.40s` | 参考实现，`19` 色 |
+
+补充观测：
+
+1. 当前 `pngoptim --quality 65-75` 的输出已回到 `256` 色级别。
+2. 这说明前面的阴影阶梯问题，核心不是“色数太少”，而是 palette 落点、remap refinement 和 selective dithering 还不够接近参考实现。
+3. 第一轮修复后，`--quality` 已不再走外层二分导致的 `7.58s` 慢路径，但相比 `pngquant` 仍有明显性能差距。
+
+### 10.2 本轮已修复的偏差
+
+1. 去掉 [`src/pipeline.rs`](/Users/5km/Dev/Rust/pngoptim/src/pipeline.rs) 中外层 `quality -> colors` 二分搜索。
+2. 将 `kmeans_iteration_limit` 接入 [`src/quality.rs`](/Users/5km/Dev/Rust/pngoptim/src/quality.rs) 和 [`src/palette_quant.rs`](/Users/5km/Dev/Rust/pngoptim/src/palette_quant.rs)，预算口径向 `attr.rs` 靠拢。
+3. 将 feedback loop 的 K-Means 试探改回“每轮 1 次主迭代 + 最终单独 refine”的结构，不再在 trial 阶段连续做多轮收敛。
+4. 为 `--quality` 模式增加“高质量 256 色基线 + 目标质量候选”的内部比较护栏：如果目标候选未达到最低质量，不再把更差结果直接交给用户。
+
+### 10.3 仍然存在的关键偏差
+
+1. [`src/palette_quant.rs`](/Users/5km/Dev/Rust/pngoptim/src/palette_quant.rs) 的 histogram 仍缺少 `hist.rs` 中 `perceptual_weight` / `mc_color_weight` / cluster 初始化的完整细节。
+2. 当前 mediancut 仍未实现 `mediancut.rs` 中的 `total_box_error_below_target()`、`max_mse_per_color`、`take_best_splittable_box()` 这套误差约束切分逻辑。
+3. 当前 plain remap / dither remap 还没有完整实现 `remap.rs::remap_to_palette()` 的 full-image K-Means finalize 结构。
+4. 当前 selective dithering 虽然已接入 core subset，但还没达到 `remap_to_palette_floyd()` 的整套 chunk warmup / background-aware / guess 策略。
+
+## 11. 当前判断
+
+1. 静态 PNG 主线不该再被笼统写成“彻底完成”；更准确的状态是“工程主线完成，但静态量化算法仍在 reference-first 复查和收口中”。
+2. 这不是要推翻现有 Rust 主线，而是要把剩余偏差重新压回参考实现模块上去解决。
+3. 继续推进的优先级应该是：
+   1. `hist.rs` 权重与 cluster 细节对齐
+   2. `mediancut.rs` 的误差约束切分对齐
+   3. `remap.rs::remap_to_palette` 的 full-image finalize 对齐
+   4. 最后再继续压 `--quality` 模式的速度与输出体积

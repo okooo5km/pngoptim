@@ -8,12 +8,12 @@ use std::time::Instant;
 
 use crate::cli::QualityRange;
 use crate::error::AppError;
-use crate::palette_quant::{
-    IndexedImage, max_colors_from_quality_speed, quantize_indexed, quantizer_settings,
-};
+use crate::palette_quant::{IndexedImage, quantize_indexed, quantizer_settings};
 use crate::quality::{
     QualityMetrics, SpeedSettings, evaluate_quality_against_rgba, quality_to_mse,
 };
+
+const DEFAULT_MAX_COLORS: usize = 256;
 
 #[derive(Debug, Clone)]
 pub struct PipelineOptions {
@@ -164,65 +164,67 @@ fn select_palette_candidate(
     speed_settings: SpeedSettings,
     dither: bool,
 ) -> QuantizeCandidate {
-    let target_mse = quality.map(|range| quality_to_mse(range.max));
-    let evaluate = |max_colors: usize| {
-        evaluate_candidate(
-            rgba,
-            width,
-            height,
-            max_colors,
-            output_posterize_bits,
-            speed_settings,
-            target_mse,
-            dither,
-        )
-    };
-
-    let default_colors = quality
-        .map(|range| max_colors_from_quality_speed(range.max, speed_settings.effective_speed))
-        .unwrap_or(256);
-
-    let mut high_quality = evaluate(default_colors);
-    if high_quality.quality.quality_score < quality.map_or(0, |range| range.max)
-        && default_colors < 256
-    {
-        high_quality = evaluate(256);
-    }
+    let mut baseline = evaluate_candidate(
+        rgba,
+        width,
+        height,
+        DEFAULT_MAX_COLORS,
+        output_posterize_bits,
+        speed_settings,
+        None,
+        dither,
+    );
     let Some(range) = quality else {
-        return high_quality;
+        return baseline;
     };
 
-    if high_quality.quality.quality_score < range.max {
-        return high_quality;
+    let mut targeted = evaluate_candidate(
+        rgba,
+        width,
+        height,
+        DEFAULT_MAX_COLORS,
+        output_posterize_bits,
+        speed_settings,
+        Some(quality_to_mse(range.max)),
+        dither,
+    );
+
+    if targeted.quality.quality_score < range.min {
+        return baseline;
+    }
+    if baseline.quality.quality_score < range.min {
+        return targeted;
     }
 
-    let mut low = 2usize;
-    let mut high = default_colors;
-    let mut best_colors = default_colors;
-    let mut best = high_quality;
-    let mut budget = speed_settings.search_budget();
-
-    while low <= high && budget > 0 {
-        let mid = low + (high - low) / 2;
-        let candidate = evaluate(mid);
-        if candidate.quality.quality_score >= range.max {
-            best_colors = mid;
-            best = candidate;
-            high = mid.saturating_sub(1);
-        } else {
-            low = mid.saturating_add(1);
+    if targeted.quality.quality_score >= range.max {
+        let baseline_size = estimate_output_bytes(
+            &mut baseline,
+            width as u32,
+            height as u32,
+            speed_settings.raw_speed,
+        );
+        let targeted_size = estimate_output_bytes(
+            &mut targeted,
+            width as u32,
+            height as u32,
+            speed_settings.raw_speed,
+        );
+        if targeted_size < baseline_size {
+            return targeted;
         }
-        budget -= 1;
     }
 
-    for colors in best_colors.saturating_sub(4).max(2)..best_colors {
-        let candidate = evaluate(colors);
-        if candidate.quality.quality_score >= range.max {
-            best = candidate;
-        }
+    if should_prefer_candidate(
+        &mut baseline,
+        &mut targeted,
+        width as u32,
+        height as u32,
+        speed_settings.raw_speed,
+    ) {
+        targeted
+    } else {
+        baseline
     }
-
-    best
 }
 
 fn evaluate_candidate(

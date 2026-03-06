@@ -13,11 +13,12 @@ pub enum DitherMapMode {
     Always,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SpeedSettings {
     pub raw_speed: u8,
     pub effective_speed: u8,
     pub kmeans_iterations: u16,
+    pub kmeans_iteration_limit: f64,
     pub feedback_loop_trials: u16,
     pub max_histogram_entries: u32,
     pub input_posterize_bits: u8,
@@ -34,6 +35,7 @@ impl SpeedSettings {
 
         let mut iterations = (8 - i32::from(effective_speed)).max(0) as u16;
         iterations += iterations * iterations / 2;
+        let kmeans_iteration_limit = 1.0 / f64::from(1u32 << (23 - u32::from(effective_speed)));
 
         let feedback_loop_trials = (56 - 9 * i32::from(effective_speed)).max(0) as u16;
         let max_histogram_entries =
@@ -56,6 +58,7 @@ impl SpeedSettings {
             raw_speed,
             effective_speed,
             kmeans_iterations: iterations,
+            kmeans_iteration_limit,
             feedback_loop_trials,
             max_histogram_entries,
             input_posterize_bits,
@@ -64,10 +67,6 @@ impl SpeedSettings {
             single_threaded_dithering,
             force_disable_dither,
         }
-    }
-
-    pub fn search_budget(self) -> usize {
-        usize::from(self.feedback_loop_trials.clamp(4, 12))
     }
 }
 
@@ -248,6 +247,7 @@ mod tests {
         let settings = SpeedSettings::from_speed(4);
         assert_eq!(settings.effective_speed, 4);
         assert_eq!(settings.kmeans_iterations, 12);
+        assert!((settings.kmeans_iteration_limit - (1.0 / 524_288.0)).abs() < f64::EPSILON);
         assert_eq!(settings.feedback_loop_trials, 20);
         assert_eq!(settings.input_posterize_bits, 0);
         assert_eq!(settings.use_dither_map, DitherMapMode::Enabled);
