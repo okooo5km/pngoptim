@@ -1,3 +1,4 @@
+mod apng;
 mod cli;
 mod error;
 mod palette_quant;

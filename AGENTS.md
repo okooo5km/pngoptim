@@ -151,7 +151,8 @@
 1. A-G 主线与 `Algorithm Replication` 轨道均已收口；当前主任务已经从“复刻 pngquant”切换到“超越阶段”。
 2. 阶段 H 已确定优先攻克 APNG，而不是继续在静态 PNG 主线上做边际优化。原因很明确：APNG 是格式与产品能力维度上的新增，而不是同一赛道里的微调。
 3. APNG 的核心约束已经冻结：动画文件共享一套全局 `IHDR` 语义，若使用调色板则也是全局 `PLTE/tRNS`；因此不能按“每帧独立 pngquant 一次”来设计，有损优化必须是 animation-aware 的全局颜色决策。
-4. 阶段 H 的首个编码里程碑不是直接上全动画有损量化，而是先完成 APNG parser / canvas / round-trip 与 lossless 结构优化基线，再把当前 palette/remap/dither 主链接入。
+4. 阶段 H 的 H1 首版骨架已落地：`src/apng.rs` 现已具备 `RGBA8` APNG 的 decode / compose / encode round-trip，以及 default image / separate thumbnail / dispose / blend 语义单测。
+5. 下一步不该直接碰 animation-wide 有损量化，而应先把 APNG 模块接入正式 CLI / pipeline 分流，然后进入 H2 的 lossless 结构优化（重复帧折叠、最小变化矩形、等价 dispose/blend 重写）。
 
 ### 最近更新
 1. 2026-03-05：确认参考仓库本地路径与远程可达性，并锁定 `main` 分支 commit。
@@ -207,6 +208,7 @@
 51. 2026-03-06：启动 RF-7 全门禁回归并完成本地收口：`quality-size` 通过（`reports/quality-size/rf7-quality-size/summary.md`，7/7 failed=0），`perf` 通过（`reports/perf/rf7-perf/summary.md`，mean `3490.456 ms`，p95 `16535.485 ms`，failed=0），`stability` 通过（`reports/stability/rf7-stability/summary.md`，0 crash_like / 0 failures），`release-check` 通过（`reports/release/rf7-release-check/summary.md`）。算法轨道已进入“待跨平台复核”的最终阶段。
 52. 2026-03-06：完成 RF-7 跨平台复核：远端 `phase-f-cross-platform` run `22750921042` 最终为 `success`，`collect-ubuntu-latest` / `collect-macos-latest` / `collect-windows-latest` / `aggregate` 全部成功，算法复刻轨道正式收口为 `Done`。
 53. 2026-03-06：启动超越阶段规划，决定优先落地 `Phase H: APNG 动图压缩优化`，并完成一轮 APNG 一手规范调研与仓库架构映射：确认 APNG 已纳入 `PNG 3` 正式规范，文件由 `acTL` / `fcTL` / `fdAT` 扩展 chunk 驱动，动画共享全局 `IHDR` 与色彩约束；当前仓库依赖的 `png` crate 已具备 APNG 读帧与动画写出基础能力，后续重点将转向 parser / canvas / lossless 结构优化 / animation-aware 全局量化。
+54. 2026-03-06：完成 H1 首版实现：新增 `src/apng.rs`，提供 `decode_apng` / `compose_frames` / `encode_apng`，当前先支持 `RGBA8` APNG；已覆盖 static PNG 非 APNG 判别、separate default image 识别、`dispose_op=Previous` 与 `blend_op=Over` compositing，以及 encode/decode round-trip（`cargo test apng -- --nocapture` 全绿）。
 
 ### 更新规则
 1. 每次推进必须更新对应阶段状态：`Not Started` / `In Progress` / `Blocked` / `Done`。
