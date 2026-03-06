@@ -12,14 +12,23 @@ pub struct IndexedImage {
 }
 
 #[derive(Debug, Clone, Copy)]
+struct PaletteEntry {
+    color: InternalPixel,
+    popularity: f32,
+}
+
+#[derive(Debug, Clone, Copy)]
 pub struct QuantizerSettings {
     pub max_colors: usize,
     pub input_posterize_bits: u8,
+    pub output_posterize_bits: u8,
     pub max_histogram_entries: u32,
     pub kmeans_iterations: u16,
     pub kmeans_iteration_limit: f64,
     pub feedback_loop_trials: u16,
-    pub target_mse: Option<f64>,
+    pub target_mse: f64,
+    pub max_mse: Option<f64>,
+    pub target_mse_is_zero: bool,
     pub dither: bool,
     pub dither_level: f32,
     pub use_dither_map: DitherMapMode,
@@ -67,20 +76,25 @@ pub fn quantize_indexed(
         importance_map.as_deref(),
     );
 
-    let mut palette = find_best_palette(&histogram, settings);
+    let (mut palette, palette_error) = find_best_palette(&histogram, settings);
     if palette.is_empty() {
-        palette = vec![InternalPixel::default()];
+        palette = vec![PaletteEntry {
+            color: InternalPixel::default(),
+            popularity: 0.0,
+        }];
     }
+    sort_palette_entries(&mut palette);
 
     let final_palette = palette
         .iter()
-        .map(|&color| (color, color.to_rgba(SRGB_OUTPUT_GAMMA)))
+        .map(|entry| (entry.color, entry.color.to_rgba(SRGB_OUTPUT_GAMMA)))
         .collect::<Vec<_>>();
     remap_image(
         rgba,
         width,
         height,
         &final_palette,
+        palette_error,
         settings,
         importance_map.as_deref(),
         contrast_pixels.as_deref(),
@@ -90,17 +104,23 @@ pub fn quantize_indexed(
 pub fn quantizer_settings(
     max_colors: usize,
     speed: SpeedSettings,
-    target_mse: Option<f64>,
+    target_mse: f64,
+    max_mse: Option<f64>,
+    target_mse_is_zero: bool,
+    output_posterize_bits: u8,
     dither_level: f32,
 ) -> QuantizerSettings {
     QuantizerSettings {
         max_colors,
         input_posterize_bits: speed.input_posterize_bits,
+        output_posterize_bits,
         max_histogram_entries: speed.max_histogram_entries,
         kmeans_iterations: speed.kmeans_iterations,
         kmeans_iteration_limit: speed.kmeans_iteration_limit,
         feedback_loop_trials: speed.feedback_loop_trials,
         target_mse,
+        max_mse,
+        target_mse_is_zero,
         dither: dither_level > 0.0 && !speed.force_disable_dither,
         dither_level,
         use_dither_map: speed.use_dither_map,
@@ -262,26 +282,92 @@ impl ColorBox {
 
         self.prepare_sort(items);
         let half_weight = self.prepare_color_weight_total(items) / 2.0;
-
         let local_split = {
             let slice = &mut items[self.start..self.end];
-            slice.sort_unstable_by_key(|item| std::cmp::Reverse(item.sort_value));
-            let mut cumulative = 0.0f64;
-            let mut split = 1usize;
-            for idx in 0..slice.len() - 1 {
-                cumulative += f64::from(slice[idx].mc_color_weight);
-                if cumulative >= half_weight {
-                    split = idx + 1;
-                    break;
-                }
-            }
-            split.clamp(1, slice.len() - 1)
+            hist_item_sort_half(slice, half_weight)
+                .max(1)
+                .min(slice.len().saturating_sub(1))
         };
 
         let split = self.start + local_split;
         let left = Self::new(items, self.start, split)?;
         let right = Self::new(items, split, self.end)?;
         Some((left, right))
+    }
+}
+
+#[inline(always)]
+fn mc_sort_value(base: &[HistItem], idx: usize) -> Option<u32> {
+    base.get(idx).map(|item| item.sort_value)
+}
+
+#[inline]
+fn qsort_pivot(base: &[HistItem]) -> Option<usize> {
+    let len = base.len();
+    if len < 32 {
+        return Some(len / 2);
+    }
+    let mut pivots = [8, len / 2, len - 1];
+    pivots.sort_unstable_by_key(|&idx| mc_sort_value(base, idx).unwrap_or_default());
+    (pivots[1] < base.len()).then_some(pivots[1])
+}
+
+fn qsort_partition(base: &mut [HistItem]) -> Option<usize> {
+    let mut right = base.len();
+    base.swap(qsort_pivot(base)?, 0);
+    let pivot_value = mc_sort_value(base, 0)?;
+    let mut left = 1usize;
+    while left < right {
+        if mc_sort_value(base, left)? >= pivot_value {
+            left += 1;
+        } else {
+            right -= 1;
+            while left < right && mc_sort_value(base, right)? <= pivot_value {
+                right -= 1;
+            }
+            if right >= base.len() {
+                return None;
+            }
+            base.swap(left, right);
+        }
+    }
+    left = left.saturating_sub(1);
+    if left >= base.len() {
+        return None;
+    }
+    base.swap(left, 0);
+    Some(left)
+}
+
+#[inline(never)]
+fn hist_item_sort_half(mut base: &mut [HistItem], mut weight_half_sum: f64) -> usize {
+    let mut base_index = 0usize;
+    if base.is_empty() {
+        return 0;
+    }
+    loop {
+        let Some(partition) = qsort_partition(base) else {
+            return base_index;
+        };
+        let split_at = partition + 1;
+        let (left, right) = base.split_at_mut(split_at);
+        let left_sum = left
+            .iter()
+            .map(|item| f64::from(item.mc_color_weight))
+            .sum::<f64>();
+        if left_sum >= weight_half_sum {
+            if partition > 0 {
+                base = &mut left[..partition];
+                continue;
+            }
+            return base_index;
+        }
+        weight_half_sum -= left_sum;
+        base_index += left.len();
+        if right.is_empty() {
+            return base_index;
+        }
+        base = right;
     }
 }
 
@@ -295,32 +381,42 @@ fn build_histogram(
     gamma: &[f32; 256],
     importance_map: Option<&[u8]>,
 ) -> HistogramData {
-    let mut bits = initial_posterize_bits.min(4);
-    loop {
-        let mut map: HashMap<u32, HistAccumulator> = HashMap::new();
-        for (pixel_idx, px) in rgba.chunks_exact(4).enumerate() {
-            let key = pack_rgba_key(px, bits);
-            let entry = map.entry(key).or_default();
-            let importance = f64::from(
-                importance_map
-                    .and_then(|map| map.get(pixel_idx))
-                    .copied()
-                    .unwrap_or(255),
-            );
-            entry.importance_sum += importance;
-            if !entry.initialized {
-                let rgba = [px[0], px[1], px[2], px[3]];
-                entry.representative = rgba;
-                entry.cluster_index = cluster_index(rgba);
-                entry.initialized = true;
-            }
-        }
-
-        if map.len() <= max_histogram_entries as usize || bits >= 4 {
-            return finalize_histogram(map, gamma);
-        }
-        bits += 1;
+    let bits = initial_posterize_bits.min(3);
+    let map = build_histogram_map(rgba, bits, importance_map);
+    if map.len() > max_histogram_entries as usize && bits < 3 {
+        return finalize_histogram(build_histogram_map(rgba, bits + 1, importance_map), gamma);
     }
+    finalize_histogram(map, gamma)
+}
+
+fn build_histogram_map(
+    rgba: &[u8],
+    posterize_bits: u8,
+    importance_map: Option<&[u8]>,
+) -> HashMap<u32, HistAccumulator> {
+    let mut map: HashMap<u32, HistAccumulator> = HashMap::new();
+    for (pixel_idx, px) in rgba.chunks_exact(4).enumerate() {
+        let mut bucket_rgba = posterized_rgba(px, posterize_bits);
+        let representative = [px[0], px[1], px[2], px[3]];
+        if bucket_rgba[3] == 0 {
+            bucket_rgba = [0, 0, 0, 0];
+        }
+        let key = pack_rgba_key(&bucket_rgba, 0);
+        let entry = map.entry(key).or_default();
+        let importance = f64::from(
+            importance_map
+                .and_then(|map| map.get(pixel_idx))
+                .copied()
+                .unwrap_or(255),
+        );
+        entry.importance_sum += importance;
+        if !entry.initialized {
+            entry.representative = representative;
+            entry.cluster_index = cluster_index(representative);
+            entry.initialized = true;
+        }
+    }
+    map
 }
 
 fn finalize_histogram(map: HashMap<u32, HistAccumulator>, gamma: &[f32; 256]) -> HistogramData {
@@ -370,7 +466,6 @@ fn finalize_histogram(map: HashMap<u32, HistAccumulator>, gamma: &[f32; 256]) ->
         cluster.end += 1;
 
         let weight = ((item.importance_sum as f32) / 255.0).min(max_perceptual_weight);
-        let weight = weight.max(1.0 / 255.0);
         total_perceptual_weight += f64::from(weight);
 
         items[next_index] = HistItem {
@@ -395,9 +490,12 @@ fn median_cut_palette(
     target_colors: usize,
     target_mse: f64,
     max_mse_per_color: f64,
-) -> Vec<InternalPixel> {
+) -> Vec<PaletteEntry> {
     if histogram.items.is_empty() {
-        return vec![InternalPixel::default()];
+        return vec![PaletteEntry {
+            color: InternalPixel::default(),
+            popularity: 0.0,
+        }];
     }
 
     let mut boxes = initial_color_boxes(histogram, target_colors);
@@ -497,7 +595,7 @@ fn total_box_error_below_target(
     true
 }
 
-fn boxes_to_palette(boxes: &mut [ColorBox], items: &mut [HistItem]) -> Vec<InternalPixel> {
+fn boxes_to_palette(boxes: &mut [ColorBox], items: &mut [HistItem]) -> Vec<PaletteEntry> {
     let mut palette = Vec::with_capacity(boxes.len());
     for (palette_index, color_box) in boxes.iter_mut().enumerate() {
         for item in &mut items[color_box.start..color_box.end] {
@@ -519,14 +617,30 @@ fn boxes_to_palette(boxes: &mut [ColorBox], items: &mut [HistItem]) -> Vec<Inter
         } else {
             color_box.average
         };
-        palette.push(representative);
+        let popularity = items[color_box.start..color_box.end]
+            .iter()
+            .map(|item| item.perceptual_weight)
+            .sum::<f32>();
+        palette.push(PaletteEntry {
+            color: representative,
+            popularity,
+        });
     }
     palette
 }
 
-fn find_best_palette(histogram: &HistogramData, settings: QuantizerSettings) -> Vec<InternalPixel> {
+fn find_best_palette(
+    histogram: &HistogramData,
+    settings: QuantizerSettings,
+) -> (Vec<PaletteEntry>, Option<f64>) {
     if histogram.items.is_empty() {
-        return vec![InternalPixel::default()];
+        return (
+            vec![PaletteEntry {
+                color: InternalPixel::default(),
+                popularity: 0.0,
+            }],
+            Some(0.0),
+        );
     }
 
     let max_colors = settings.max_colors.clamp(2, 256);
@@ -535,16 +649,26 @@ fn find_best_palette(histogram: &HistogramData, settings: QuantizerSettings) -> 
     let total_trials = effective_feedback_trials(settings.feedback_loop_trials, hist_items) as i32;
     let final_iteration_limit =
         effective_kmeans_iteration_limit(settings.kmeans_iteration_limit, hist_items);
-    let has_quality_target = settings.target_mse.is_some();
-    let target_mse = settings.target_mse.unwrap_or(f64::INFINITY);
+    let (max_mse, target_mse, target_mse_is_zero) =
+        effective_target_mse(&settings, hist_items, max_colors);
+    let has_quality_target = max_mse.is_some();
     let few_input_colors = hist.items.len() <= max_colors;
-    if few_input_colors && target_mse == 0.0 {
-        return hist.items.iter().map(|item| item.color).collect::<Vec<_>>();
+    if few_input_colors && target_mse_is_zero {
+        return (
+            hist.items
+                .iter()
+                .map(|item| PaletteEntry {
+                    color: item.color,
+                    popularity: item.perceptual_weight,
+                })
+                .collect::<Vec<_>>(),
+            Some(0.0),
+        );
     }
 
     let mut current_max_colors = max_colors;
     let mut trials_left = total_trials;
-    let mut best_palette = None;
+    let mut best_palette: Option<Vec<PaletteEntry>> = None;
     let mut target_mse_overshoot = if total_trials > 0 { 1.05 } else { 1.0 };
     let mut fails_in_a_row = 0i32;
     let mut palette_error = None::<f64>;
@@ -555,7 +679,13 @@ fn find_best_palette(histogram: &HistogramData, settings: QuantizerSettings) -> 
             .max(quality_to_mse(51))
             * 1.2;
         let mut new_palette = if few_input_colors {
-            hist.items.iter().map(|item| item.color).collect::<Vec<_>>()
+            hist.items
+                .iter()
+                .map(|item| PaletteEntry {
+                    color: item.color,
+                    popularity: item.perceptual_weight,
+                })
+                .collect::<Vec<_>>()
         } else {
             median_cut_palette(
                 &mut hist,
@@ -596,7 +726,13 @@ fn find_best_palette(histogram: &HistogramData, settings: QuantizerSettings) -> 
     }
     .unwrap_or_else(|| {
         if few_input_colors {
-            hist.items.iter().map(|item| item.color).collect::<Vec<_>>()
+            hist.items
+                .iter()
+                .map(|item| PaletteEntry {
+                    color: item.color,
+                    popularity: item.perceptual_weight,
+                })
+                .collect::<Vec<_>>()
         } else {
             median_cut_palette(&mut hist, max_colors, f64::INFINITY, f64::INFINITY)
         }
@@ -608,14 +744,32 @@ fn find_best_palette(histogram: &HistogramData, settings: QuantizerSettings) -> 
         palette_error.is_some(),
         has_quality_target,
     );
-    let _ = refine_palette(
+    refine_palette(
         &mut hist.items,
         &mut palette,
         final_iterations,
-        false,
         final_iteration_limit,
+        max_mse,
+        &mut palette_error,
     );
-    palette
+    (palette, palette_error)
+}
+
+fn effective_target_mse(
+    settings: &QuantizerSettings,
+    hist_items: usize,
+    max_colors: usize,
+) -> (Option<f64>, f64, bool) {
+    let max_mse = settings
+        .max_mse
+        .map(|mse| mse * if hist_items <= max_colors { 0.33 } else { 1.0 });
+    let mut target_mse = settings
+        .target_mse
+        .max((f64::from(1u16 << settings.output_posterize_bits) / 1024.0).powi(2));
+    if let Some(limit) = max_mse {
+        target_mse = target_mse.min(limit);
+    }
+    (max_mse, target_mse, settings.target_mse_is_zero)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -625,35 +779,48 @@ struct PaletteStats {
 
 fn refine_palette(
     histogram: &mut [HistItem],
-    palette: &mut [InternalPixel],
+    palette: &mut [PaletteEntry],
     iterations: u16,
-    adjust_weights: bool,
     iteration_limit: f64,
-) -> PaletteStats {
+    max_mse: Option<f64>,
+    palette_error: &mut Option<f64>,
+) {
     if palette.is_empty() {
-        return PaletteStats { error: 0.0 };
+        *palette_error = Some(0.0);
+        return;
     }
 
-    let mut stats = kmeans_iteration(histogram, palette, adjust_weights);
-    for _ in 0..iterations.saturating_sub(1) {
-        let previous_error = stats.error;
-        stats = kmeans_iteration(histogram, palette, false);
-        if (previous_error - stats.error).abs() < iteration_limit {
-            break;
-        }
+    if iterations == 0 {
+        return;
     }
-    stats
+
+    let mut iteration = 0u16;
+    while iteration < iterations {
+        let stats = kmeans_iteration(histogram, palette, false);
+        let previous_error = *palette_error;
+        *palette_error = Some(stats.error);
+        if let Some(previous_error) = previous_error {
+            if (previous_error - stats.error).abs() < iteration_limit {
+                break;
+            }
+        }
+        iteration += if stats.error > max_mse.unwrap_or(1e20) * 1.5 {
+            2
+        } else {
+            1
+        };
+    }
 }
 
 fn kmeans_iteration(
     histogram: &mut [HistItem],
-    palette: &mut [InternalPixel],
+    palette: &mut [PaletteEntry],
     adjust_weights: bool,
 ) -> PaletteStats {
-    let tree = NearestTree::new(palette);
+    let palette_points = palette.iter().map(|entry| entry.color).collect::<Vec<_>>();
+    let tree = NearestTree::new(&palette_points);
     let mut sums = vec![[0.0f64; 4]; palette.len()];
     let mut weights = vec![0.0f64; palette.len()];
-    let mut usage = vec![0usize; palette.len()];
     let total_weight = histogram
         .iter()
         .map(|item| f64::from(item.perceptual_weight))
@@ -667,21 +834,16 @@ fn kmeans_iteration(
         let mut diff = f64::from(diff_sq);
         item.likely_palette_index = nearest as u16;
 
-        let weight = if adjust_weights {
-            let reflected = reflected_color(item.color, palette[nearest]);
+        if adjust_weights {
+            let reflected = reflected_color(item.color, palette[nearest].color);
             let reflected_diff = f64::from(tree.search(reflected, nearest).1);
             diff = reflected_diff;
             item.adjusted_weight = ((2.0 * item.adjusted_weight) + item.perceptual_weight)
                 * (0.5 + reflected_diff as f32);
-            item.adjusted_weight
-        } else {
-            item.adjusted_weight = item.perceptual_weight;
-            item.perceptual_weight
-        };
+        }
 
         total_error += diff * f64::from(item.perceptual_weight);
-        let weight = f64::from(weight);
-        usage[nearest] += 1;
+        let weight = f64::from(item.adjusted_weight);
         weights[nearest] += weight;
         sums[nearest][0] += f64::from(item.color.a) * weight;
         sums[nearest][1] += f64::from(item.color.r) * weight;
@@ -690,10 +852,14 @@ fn kmeans_iteration(
     }
 
     for idx in 0..palette.len() {
+        palette[idx].popularity = weights[idx] as f32;
         if weights[idx] == 0.0 {
             continue;
         }
-        palette[idx] = InternalPixel {
+        if palette[idx].color.a == 0.0 {
+            continue;
+        }
+        palette[idx].color = InternalPixel {
             a: (sums[idx][0] / weights[idx]) as f32,
             r: (sums[idx][1] / weights[idx]) as f32,
             g: (sums[idx][2] / weights[idx]) as f32,
@@ -701,25 +867,22 @@ fn kmeans_iteration(
         };
     }
 
-    replace_unused_palette_entries(histogram, palette, &usage);
+    replace_unused_palette_entries(histogram, palette);
 
     PaletteStats {
         error: total_error / total_weight,
     }
 }
 
-fn replace_unused_palette_entries(
-    histogram: &[HistItem],
-    palette: &mut [InternalPixel],
-    usage: &[usize],
-) {
-    for (pal_idx, &count) in usage.iter().enumerate() {
-        if count > 0 {
+fn replace_unused_palette_entries(histogram: &[HistItem], palette: &mut [PaletteEntry]) {
+    for pal_idx in 0..palette.len() {
+        if palette[pal_idx].popularity > 0.0 {
             continue;
         }
 
         let worst_idx = {
-            let tree = NearestTree::new(palette);
+            let palette_points = palette.iter().map(|entry| entry.color).collect::<Vec<_>>();
+            let tree = NearestTree::new(&palette_points);
             let mut worst_idx = None;
             let mut worst_diff = 0.0f32;
             for (item_idx, item) in histogram.iter().enumerate() {
@@ -727,7 +890,7 @@ fn replace_unused_palette_entries(
                     usize::from(item.likely_palette_index).min(palette.len().saturating_sub(1));
                 let may_be_worst = palette
                     .get(hint)
-                    .map_or(true, |pal| pal.diff(item.color) > worst_diff);
+                    .map_or(true, |pal| pal.color.diff(item.color) > worst_diff);
                 if !may_be_worst {
                     continue;
                 }
@@ -742,9 +905,25 @@ fn replace_unused_palette_entries(
         };
 
         if let Some(worst_idx) = worst_idx {
-            palette[pal_idx] = histogram[worst_idx].color;
+            palette[pal_idx] = PaletteEntry {
+                color: histogram[worst_idx].color,
+                popularity: histogram[worst_idx].adjusted_weight,
+            };
         }
     }
+}
+
+fn sort_palette_entries(palette: &mut [PaletteEntry]) {
+    palette.sort_by(|left, right| {
+        let left_transparent = left.color.to_rgba(SRGB_OUTPUT_GAMMA)[3] < 255;
+        let right_transparent = right.color.to_rgba(SRGB_OUTPUT_GAMMA)[3] < 255;
+        right_transparent.cmp(&left_transparent).then_with(|| {
+            right
+                .popularity
+                .partial_cmp(&left.popularity)
+                .unwrap_or(Ordering::Equal)
+        })
+    });
 }
 
 fn effective_feedback_trials(base_trials: u16, hist_items: usize) -> u16 {
@@ -799,10 +978,10 @@ fn effective_kmeans_iteration_limit(base_limit: f64, hist_items: usize) -> f64 {
 
 fn reflected_color(color: InternalPixel, mapped: InternalPixel) -> InternalPixel {
     InternalPixel {
-        a: (color.a + (color.a - mapped.a)).clamp(0.0, 1.0),
-        r: (color.r + (color.r - mapped.r)).clamp(0.0, 1.1),
-        g: (color.g + (color.g - mapped.g)).clamp(0.0, 1.1),
-        b: (color.b + (color.b - mapped.b)).clamp(0.0, 1.1),
+        a: color.a + (color.a - mapped.a),
+        r: color.r + (color.r - mapped.r),
+        g: color.g + (color.g - mapped.g),
+        b: color.b + (color.b - mapped.b),
     }
 }
 
@@ -991,6 +1170,7 @@ fn remap_image(
     width: usize,
     height: usize,
     palette: &[(InternalPixel, [u8; 4])],
+    palette_error: Option<f64>,
     settings: QuantizerSettings,
     importance_map: Option<&[u8]>,
     contrast_pixels: Option<&[InternalPixel]>,
@@ -1001,24 +1181,23 @@ fn remap_image(
             width,
             height,
             palette,
+            palette_error,
             settings,
             importance_map,
             contrast_pixels,
         )
     } else {
-        remap_image_plain(rgba, palette, importance_map)
+        remap_image_plain(
+            rgba,
+            palette,
+            settings.output_posterize_bits,
+            importance_map,
+        )
     };
 
-    let mut order = (0..palette.len())
+    let order = (0..palette.len())
         .filter(|&idx| counts[idx] > 0)
         .collect::<Vec<_>>();
-    order.sort_by(|&left, &right| {
-        let left_transparent = palette[left].1[3] < 255;
-        let right_transparent = palette[right].1[3] < 255;
-        left_transparent
-            .cmp(&right_transparent)
-            .then_with(|| counts[right].cmp(&counts[left]))
-    });
 
     let mut remap = vec![0u8; palette.len()];
     let mut reordered_palette = Vec::with_capacity(palette.len());
@@ -1039,19 +1218,19 @@ fn remap_image(
 fn remap_image_plain(
     rgba: &[u8],
     palette: &[(InternalPixel, [u8; 4])],
+    output_posterize_bits: u8,
     importance_map: Option<&[u8]>,
 ) -> (Vec<(InternalPixel, [u8; 4])>, Vec<u8>, Vec<usize>) {
     let mut palette_points = palette.iter().map(|entry| entry.0).collect::<Vec<_>>();
-    if palette_points.len() > 1 {
-        let feedback = remap_image_plain_pass(rgba, &palette_points, importance_map);
-        apply_remap_feedback(&mut palette_points, &feedback);
-    }
-
-    let final_pass = remap_image_plain_pass(rgba, &palette_points, importance_map);
+    let final_pass = finalize_plain_remap(rgba, &mut palette_points, importance_map);
+    let mut rounded_palette_points = palette_points.clone();
+    let output_palette =
+        round_palette_for_output_in_place(&mut rounded_palette_points, output_posterize_bits);
 
     let remapped_palette = palette_points
-        .iter()
-        .map(|&color| (color, color.to_rgba(SRGB_OUTPUT_GAMMA)))
+        .into_iter()
+        .zip(output_palette)
+        .map(|(color, rgba)| (color, rgba))
         .collect::<Vec<_>>();
 
     (remapped_palette, final_pass.indices, final_pass.counts)
@@ -1063,7 +1242,6 @@ struct PlainRemapPass {
     sums: Vec<[f64; 4]>,
     weights: Vec<f64>,
     palette_error: f64,
-    worst_color: Option<InternalPixel>,
 }
 
 fn remap_image_plain_pass(
@@ -1078,8 +1256,6 @@ fn remap_image_plain_pass(
     let mut weights = vec![0.0f64; palette_points.len()];
     let mut total_error = 0.0f64;
     let mut total_pixels = 0usize;
-    let mut worst_color = None;
-    let mut worst_diff = 0.0f32;
     let tree = NearestTree::new(palette_points);
     let mut last_idx = 0usize;
 
@@ -1100,10 +1276,6 @@ fn remap_image_plain_pass(
         sums[idx][1] += f64::from(color.r) * importance;
         sums[idx][2] += f64::from(color.g) * importance;
         sums[idx][3] += f64::from(color.b) * importance;
-        if diff > worst_diff {
-            worst_diff = diff;
-            worst_color = Some(color);
-        }
         indices.push(idx as u8);
     }
 
@@ -1113,16 +1285,29 @@ fn remap_image_plain_pass(
         sums,
         weights,
         palette_error: total_error / total_pixels.max(1) as f64,
-        worst_color,
     }
+}
+
+fn finalize_plain_remap(
+    rgba: &[u8],
+    palette_points: &mut [InternalPixel],
+    importance_map: Option<&[u8]>,
+) -> PlainRemapPass {
+    let feedback = remap_image_plain_pass(rgba, palette_points, importance_map);
+    if palette_points.len() <= 1 {
+        return feedback;
+    }
+
+    apply_remap_feedback(palette_points, &feedback);
+    feedback
 }
 
 fn apply_remap_feedback(palette_points: &mut [InternalPixel], pass: &PlainRemapPass) {
     for idx in 0..palette_points.len() {
         if pass.weights[idx] == 0.0 {
-            if let Some(color) = pass.worst_color {
-                palette_points[idx] = color;
-            }
+            continue;
+        }
+        if palette_points[idx].a == 0.0 {
             continue;
         }
 
@@ -1140,17 +1325,12 @@ fn remap_image_dithered(
     width: usize,
     height: usize,
     palette: &[(InternalPixel, [u8; 4])],
+    palette_error: Option<f64>,
     settings: QuantizerSettings,
     importance_map: Option<&[u8]>,
     contrast_pixels: Option<&[InternalPixel]>,
 ) -> (Vec<(InternalPixel, [u8; 4])>, Vec<u8>, Vec<usize>) {
     let mut palette_points = palette.iter().map(|entry| entry.0).collect::<Vec<_>>();
-    if palette_points.len() > 1 {
-        let feedback = remap_image_plain_pass(rgba, &palette_points, importance_map);
-        apply_remap_feedback(&mut palette_points, &feedback);
-    }
-
-    let tree = NearestTree::new(&palette_points);
     let gamma = gamma_lut(SRGB_OUTPUT_GAMMA);
     let owned_pixels;
     let pixels = if let Some(pixels) = contrast_pixels {
@@ -1162,12 +1342,22 @@ fn remap_image_dithered(
             .collect::<Vec<_>>();
         &owned_pixels
     };
-    let plain_pass = remap_image_plain_pass(rgba, &palette_points, importance_map);
-    let dither_map = if settings.use_dither_map != DitherMapMode::None {
+    let is_image_huge = width.saturating_mul(height) > 2000 * 2000;
+    let generate_dither_map = settings.use_dither_map == DitherMapMode::Always
+        || (!is_image_huge && settings.use_dither_map != DitherMapMode::None);
+    let plain_pass = generate_dither_map
+        .then(|| finalize_plain_remap(rgba, &mut palette_points, importance_map));
+    let dither_map = if let Some(plain_pass) = plain_pass.as_ref() {
         build_dither_map(pixels, width, height, &plain_pass.indices, &palette_points)
     } else {
         Vec::new()
     };
+    let mut rounded_palette_points = palette_points.clone();
+    let output_palette = round_palette_for_output_in_place(
+        &mut rounded_palette_points,
+        settings.output_posterize_bits,
+    );
+    let tree = NearestTree::new(&palette_points);
     let mut indices = vec![0u8; pixels.len()];
     let mut counts = vec![0usize; palette.len()];
     let mut next_errors = vec![InternalPixel::default(); width + 2];
@@ -1179,8 +1369,10 @@ fn remap_image_dithered(
         base_dithering_level *= 1.0 / 255.0;
     }
     let max_dither_error = plain_pass
-        .palette_error
-        .max(f64::MIN_POSITIVE)
+        .as_ref()
+        .map(|pass| pass.palette_error)
+        .or(palette_error)
+        .unwrap_or(quality_to_mse(80))
         .mul_add(2.4, 0.0)
         .max(quality_to_mse(35)) as f32;
 
@@ -1206,14 +1398,14 @@ fn remap_image_dithered(
             );
 
             let plain_idx = if !dither_map.is_empty() {
-                plain_pass.indices[idx] as usize
+                plain_pass
+                    .as_ref()
+                    .map(|pass| pass.indices[idx] as usize)
+                    .unwrap_or(last_match)
             } else {
                 last_match
             };
-            let (mut pal_idx, _) = tree.search(color, plain_idx);
-            if should_prefer_plain_match(pixels[idx], plain_idx, pal_idx, &palette_points) {
-                pal_idx = plain_idx;
-            }
+            let (pal_idx, _) = tree.search(color, plain_idx);
             last_match = pal_idx;
             indices[idx] = pal_idx as u8;
             counts[pal_idx] += 1;
@@ -1238,50 +1430,23 @@ fn remap_image_dithered(
                 add_scaled_error(&mut curr_errors[x + 2], diff, 7.0 / 16.0);
                 add_scaled_error(&mut next_errors[x], diff, 3.0 / 16.0);
                 add_scaled_error(&mut next_errors[x + 1], diff, 5.0 / 16.0);
-                add_scaled_error(&mut next_errors[x + 2], diff, 1.0 / 16.0);
+                next_errors[x + 2] = scaled_error(diff, 1.0 / 16.0);
             } else {
                 add_scaled_error(&mut curr_errors[x], diff, 7.0 / 16.0);
-                add_scaled_error(&mut next_errors[x + 2], diff, 3.0 / 16.0);
+                next_errors[x] = scaled_error(diff, 1.0 / 16.0);
                 add_scaled_error(&mut next_errors[x + 1], diff, 5.0 / 16.0);
-                add_scaled_error(&mut next_errors[x], diff, 1.0 / 16.0);
+                add_scaled_error(&mut next_errors[x + 2], diff, 3.0 / 16.0);
             }
         }
     }
 
     let remapped_palette = palette_points
-        .iter()
-        .map(|&color| (color, color.to_rgba(SRGB_OUTPUT_GAMMA)))
+        .into_iter()
+        .zip(output_palette)
+        .map(|(color, rgba)| (color, rgba))
         .collect::<Vec<_>>();
 
     (remapped_palette, indices, counts)
-}
-
-fn should_prefer_plain_match(
-    input: InternalPixel,
-    plain_idx: usize,
-    dithered_idx: usize,
-    palette_points: &[InternalPixel],
-) -> bool {
-    if plain_idx == dithered_idx || palette_points.is_empty() {
-        return false;
-    }
-
-    let Some(&plain) = palette_points.get(plain_idx) else {
-        return false;
-    };
-    let Some(&dithered) = palette_points.get(dithered_idx) else {
-        return false;
-    };
-
-    if !is_transparentish(input) && !is_transparentish(plain) && !is_transparentish(dithered) {
-        return false;
-    }
-
-    input.diff(plain) <= input.diff(dithered) * 1.02
-}
-
-fn is_transparentish(px: InternalPixel) -> bool {
-    px.a <= 8.0 / 255.0 * 0.625
 }
 
 fn get_dithered_pixel(
@@ -1351,13 +1516,13 @@ fn build_dither_map(
     width: usize,
     height: usize,
     remapped_indices: &[u8],
-    palette: &[InternalPixel],
+    _palette: &[InternalPixel],
 ) -> Vec<u8> {
     if width < 4 || height < 4 || pixels.len() != width.saturating_mul(height) {
         return Vec::new();
     }
 
-    let (noise, mut edges) = compute_contrast_maps(pixels, width, height);
+    let (_, mut edges) = compute_contrast_maps(pixels, width, height);
     if edges.is_empty() {
         return edges;
     }
@@ -1370,10 +1535,6 @@ fn build_dither_map(
 
         for col in 1..width {
             let px = row_pixels[col];
-            let transparent = palette[px as usize].a <= (1.0 / 255.0 * 0.625) as f32;
-            if transparent {
-                continue;
-            }
             if px != last_pixel || col == width - 1 {
                 let mut neighbor_count = 10usize * (col - last_col);
                 for i in last_col..col {
@@ -1386,12 +1547,10 @@ fn build_dither_map(
                 }
 
                 for i in last_col..=col {
-                    let edge = edges[row_start + i];
-                    let adjusted = (f32::from(u16::from(edge) + 128)
+                    edges[row_start + i] = (f32::from(u16::from(edges[row_start + i]) + 128)
                         * (255.0 / (255.0 + 128.0))
                         * (1.0 - 20.0 / (20.0 + neighbor_count as f32)))
                         as u8;
-                    edges[row_start + i] = adjusted.min(noise[row_start + i]);
                 }
 
                 last_col = col;
@@ -1536,6 +1695,37 @@ fn add_scaled_error(target: &mut InternalPixel, diff: InternalPixel, scale: f32)
     target.b += diff.b * scale;
 }
 
+fn scaled_error(diff: InternalPixel, scale: f32) -> InternalPixel {
+    InternalPixel {
+        a: diff.a * scale,
+        r: diff.r * scale,
+        g: diff.g * scale,
+        b: diff.b * scale,
+    }
+}
+
+fn round_palette_for_output_in_place(
+    palette_points: &mut [InternalPixel],
+    output_posterize_bits: u8,
+) -> Vec<[u8; 4]> {
+    let gamma = gamma_lut(SRGB_OUTPUT_GAMMA);
+    palette_points
+        .iter_mut()
+        .map(|point| {
+            let mut rgba = point
+                .to_rgba(SRGB_OUTPUT_GAMMA)
+                .map(|channel| posterize_output_channel(channel, output_posterize_bits));
+            *point = InternalPixel::from_rgba(&gamma, &rgba);
+            if rgba[3] == 0 {
+                rgba[0] = 71;
+                rgba[1] = 112;
+                rgba[2] = 76;
+            }
+            rgba
+        })
+        .collect()
+}
+
 fn color_components(color: InternalPixel) -> [f32; 4] {
     [color.a, color.r, color.g, color.b]
 }
@@ -1545,7 +1735,10 @@ fn cluster_index(rgba: [u8; 4]) -> u8 {
 }
 
 fn pack_rgba_key(rgba: &[u8], posterize_bits: u8) -> u32 {
-    let px = posterized_rgba(rgba, posterize_bits);
+    let mut px = posterized_rgba(rgba, posterize_bits);
+    if px[3] == 0 {
+        px = [0, 0, 0, 0];
+    }
     u32::from_be_bytes(px)
 }
 
@@ -1566,14 +1759,21 @@ fn posterize_channel(channel: u8, bits: u8) -> u8 {
     }
 }
 
+fn posterize_output_channel(channel: u8, bits: u8) -> u8 {
+    if bits == 0 {
+        channel
+    } else {
+        (channel & !((1u8 << bits) - 1)) | (channel >> (8 - bits))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crate::quality::SpeedSettings;
 
     use super::{
         InternalPixel, QuantizerSettings, apply_remap_feedback, gamma_lut, quantize_indexed,
-        quantizer_settings, remap_image_dithered, remap_image_plain_pass,
-        should_prefer_plain_match,
+        quantizer_settings, remap_image_dithered, remap_image_plain, remap_image_plain_pass,
     };
     use crate::quality::{DitherMapMode, SRGB_OUTPUT_GAMMA};
 
@@ -1583,7 +1783,8 @@ mod tests {
             255u8, 0, 0, 255, 250, 0, 0, 255, 0, 255, 0, 255, 0, 250, 0, 255, 0, 0, 255, 255, 0, 0,
             250, 255,
         ];
-        let settings = quantizer_settings(16, SpeedSettings::from_speed(4), None, 0.0);
+        let settings =
+            quantizer_settings(16, SpeedSettings::from_speed(4), 0.0, None, true, 0, 0.0);
         let out = quantize_indexed(&rgba, 3, 2, settings);
         assert_eq!(out.indices.len(), 6);
         assert!(!out.palette.is_empty());
@@ -1594,12 +1795,13 @@ mod tests {
         let rgba = vec![
             255u8, 0, 0, 255, 254, 1, 0, 255, 253, 2, 0, 255, 252, 3, 0, 255,
         ];
-        let mut direct_settings = quantizer_settings(16, SpeedSettings::from_speed(4), None, 0.0);
+        let mut direct_settings =
+            quantizer_settings(16, SpeedSettings::from_speed(4), 0.0, None, true, 0, 0.0);
         direct_settings.input_posterize_bits = 0;
         let direct = quantize_indexed(&rgba, 2, 2, direct_settings);
 
         let mut posterized_settings =
-            quantizer_settings(16, SpeedSettings::from_speed(4), None, 0.0);
+            quantizer_settings(16, SpeedSettings::from_speed(4), 0.0, None, true, 0, 0.0);
         posterized_settings.input_posterize_bits = 2;
         let posterized = quantize_indexed(&rgba, 2, 2, posterized_settings);
 
@@ -1611,7 +1813,7 @@ mod tests {
         let rgba = (0..64u8)
             .flat_map(|v| [v, 255 - v, v / 2, 255])
             .collect::<Vec<_>>();
-        let settings = quantizer_settings(4, SpeedSettings::from_speed(4), None, 0.0);
+        let settings = quantizer_settings(4, SpeedSettings::from_speed(4), 0.0, None, true, 0, 0.0);
         let out = quantize_indexed(&rgba, 8, 8, settings);
         assert!(out.palette.len() <= 4);
     }
@@ -1638,20 +1840,23 @@ mod tests {
         let settings = QuantizerSettings {
             max_colors: 1,
             input_posterize_bits: 0,
+            output_posterize_bits: 0,
             max_histogram_entries: 256,
             kmeans_iterations: 1,
             kmeans_iteration_limit: 1e-7,
             feedback_loop_trials: 1,
-            target_mse: None,
+            target_mse: 0.0,
+            max_mse: None,
+            target_mse_is_zero: true,
             dither: true,
             dither_level: 1.0,
-            use_dither_map: DitherMapMode::None,
+            use_dither_map: DitherMapMode::Enabled,
             use_contrast_maps: false,
         };
 
-        let (plain_palette, _, _) = super::remap_image_plain(&rgba, &palette, Some(&[255, 1]));
+        let (plain_palette, _, _) = super::remap_image_plain(&rgba, &palette, 0, Some(&[255, 1]));
         let (palette, indices, counts) =
-            remap_image_dithered(&rgba, 2, 1, &palette, settings, Some(&[255, 1]), None);
+            remap_image_dithered(&rgba, 2, 1, &palette, None, settings, Some(&[255, 1]), None);
 
         assert_eq!(indices.len(), 2);
         assert_eq!(counts[0], 2);
@@ -1659,20 +1864,198 @@ mod tests {
     }
 
     #[test]
-    fn transparent_pixels_prefer_plain_match_when_dither_is_worse() {
+    fn plain_remap_uses_reference_output_posterization() {
+        let rgba = vec![131u8, 131, 131, 255];
         let gamma = gamma_lut(SRGB_OUTPUT_GAMMA);
-        let input = InternalPixel::from_rgba(&gamma, &[32, 32, 32, 6]);
-        let palette = vec![
-            InternalPixel::from_rgba(&gamma, &[0, 0, 0, 0]),
-            InternalPixel::from_rgba(&gamma, &[255, 0, 0, 255]),
+        let seed = vec![(
+            InternalPixel::from_rgba(&gamma, &[131, 131, 131, 255]),
+            [131u8, 131, 131, 255],
+        )];
+
+        let (final_palette, _, _) = remap_image_plain(&rgba, &seed, 2, None);
+        assert_eq!(final_palette[0].1, [130, 130, 130, 255]);
+    }
+
+    #[test]
+    fn kmeans_without_adjust_weights_preserves_existing_adjusted_weight() {
+        let mut histogram = vec![super::HistItem {
+            color: InternalPixel {
+                a: 0.625,
+                r: 0.1,
+                g: 0.2,
+                b: 0.3,
+            },
+            adjusted_weight: 7.5,
+            perceptual_weight: 1.0,
+            mc_color_weight: 0.0,
+            sort_value: 0,
+            likely_palette_index: 0,
+        }];
+        let mut palette = vec![super::PaletteEntry {
+            color: InternalPixel {
+                a: 0.625,
+                r: 0.1,
+                g: 0.2,
+                b: 0.3,
+            },
+            popularity: 1.0,
+        }];
+
+        let _ = super::kmeans_iteration(&mut histogram, &mut palette, false);
+
+        assert_eq!(histogram[0].adjusted_weight, 7.5);
+    }
+
+    fn quality_target_test_settings(
+        target_mse: f64,
+        max_mse: Option<f64>,
+        target_mse_is_zero: bool,
+        output_posterize_bits: u8,
+    ) -> QuantizerSettings {
+        QuantizerSettings {
+            max_colors: 256,
+            input_posterize_bits: 0,
+            output_posterize_bits,
+            max_histogram_entries: 1 << 20,
+            kmeans_iterations: 0,
+            kmeans_iteration_limit: 0.0,
+            feedback_loop_trials: 0,
+            target_mse,
+            max_mse,
+            target_mse_is_zero,
+            dither: false,
+            dither_level: 1.0,
+            use_dither_map: DitherMapMode::None,
+            use_contrast_maps: false,
+        }
+    }
+
+    fn assert_approx_eq(actual: f64, expected: f64) {
+        let delta = (actual - expected).abs();
+        assert!(
+            delta < 1e-12,
+            "expected {expected:.12}, got {actual:.12}, delta={delta:.12}"
+        );
+    }
+
+    #[test]
+    fn target_mse_scales_small_histograms_like_reference() {
+        let settings = quality_target_test_settings(0.004, Some(0.009), false, 0);
+        let (max_mse, target_mse, aim_perfect) = super::effective_target_mse(&settings, 128, 256);
+        assert!(!aim_perfect);
+        assert_approx_eq(max_mse.expect("max_mse"), 0.009 * 0.33);
+        assert_approx_eq(target_mse, 0.009 * 0.33);
+    }
+
+    #[test]
+    fn target_mse_preserves_large_histogram_limits() {
+        let settings = quality_target_test_settings(0.004, Some(0.009), false, 0);
+        let (max_mse, target_mse, _) = super::effective_target_mse(&settings, 2048, 256);
+        assert_approx_eq(max_mse.expect("max_mse"), 0.009);
+        assert_approx_eq(target_mse, 0.004);
+    }
+
+    #[test]
+    fn target_mse_respects_output_posterization_floor() {
+        let settings = quality_target_test_settings(0.0, None, true, 2);
+        let (_, target_mse, aim_perfect) = super::effective_target_mse(&settings, 4096, 256);
+        assert!(aim_perfect);
+        assert_approx_eq(target_mse, (f64::from(1u16 << 2) / 1024.0).powi(2));
+    }
+
+    #[test]
+    fn refine_palette_does_not_run_when_iterations_are_zero() {
+        let gamma = gamma_lut(SRGB_OUTPUT_GAMMA);
+        let mut histogram = vec![super::HistItem {
+            color: InternalPixel::from_rgba(&gamma, &[255, 16, 16, 16]),
+            adjusted_weight: 1.0,
+            perceptual_weight: 1.0,
+            mc_color_weight: 1.0,
+            sort_value: 0,
+            likely_palette_index: 0,
+        }];
+        let original = InternalPixel::from_rgba(&gamma, &[255, 32, 32, 32]);
+        let mut palette = vec![super::PaletteEntry {
+            color: original,
+            popularity: 1.0,
+        }];
+        let mut palette_error = Some(0.123);
+
+        super::refine_palette(
+            &mut histogram,
+            &mut palette,
+            0,
+            0.0,
+            None,
+            &mut palette_error,
+        );
+
+        assert_eq!(palette.len(), 1);
+        assert!((palette[0].color.a - original.a).abs() < f32::EPSILON);
+        assert!((palette[0].color.r - original.r).abs() < f32::EPSILON);
+        assert!((palette[0].color.g - original.g).abs() < f32::EPSILON);
+        assert!((palette[0].color.b - original.b).abs() < f32::EPSILON);
+        assert_eq!(palette_error, Some(0.123));
+    }
+
+    #[test]
+    fn nearest_tree_matches_bruteforce_search() {
+        let gamma = gamma_lut(SRGB_OUTPUT_GAMMA);
+        let palette_rgba = [
+            [255, 255, 255, 255],
+            [245, 245, 245, 255],
+            [236, 236, 236, 255],
+            [205, 205, 205, 255],
+            [171, 171, 171, 255],
+            [136, 136, 136, 255],
+            [106, 106, 106, 255],
+            [70, 70, 70, 255],
+            [15, 15, 15, 255],
+            [0, 0, 0, 0],
+            [84, 138, 250, 255],
+            [207, 99, 35, 255],
+            [205, 140, 74, 255],
+        ];
+        let palette = palette_rgba
+            .iter()
+            .map(|rgba| InternalPixel::from_rgba(&gamma, rgba))
+            .collect::<Vec<_>>();
+        let tree = super::NearestTree::new(&palette);
+
+        let sample_rgba = [
+            [250, 250, 250, 255],
+            [238, 238, 238, 255],
+            [220, 220, 220, 255],
+            [190, 190, 190, 255],
+            [150, 150, 150, 255],
+            [110, 110, 110, 255],
+            [80, 80, 80, 255],
+            [20, 20, 20, 255],
+            [0, 0, 0, 12],
+            [0, 0, 0, 48],
+            [88, 140, 248, 255],
+            [210, 101, 34, 255],
+            [210, 141, 70, 255],
         ];
 
-        assert!(should_prefer_plain_match(input, 0, 1, &palette));
-        assert!(!should_prefer_plain_match(
-            InternalPixel::from_rgba(&gamma, &[255, 0, 0, 255]),
-            0,
-            1,
-            &palette,
-        ));
+        for likely in 0..palette.len() {
+            for rgba in sample_rgba {
+                let needle = InternalPixel::from_rgba(&gamma, &rgba);
+                let (idx, dist) = tree.search(needle, likely);
+
+                let (expected_idx, expected_dist) = palette
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, point)| (idx, needle.diff(*point)))
+                    .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap())
+                    .expect("expected nearest palette entry");
+
+                assert_eq!(idx, expected_idx, "likely={likely}, rgba={rgba:?}");
+                assert!(
+                    (dist - expected_dist).abs() < f32::EPSILON,
+                    "likely={likely}, rgba={rgba:?}, expected_dist={expected_dist}, got={dist}"
+                );
+            }
+        }
     }
 }

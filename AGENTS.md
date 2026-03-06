@@ -154,14 +154,13 @@
    - `remap.rs::remap_to_palette_floyd` 的剩余视觉细节
    - 默认无 `--quality` 路径虽然已与 `pngquant` 一样回到 `256-color / 高保真` 方向，但当前样本体积仍偏大
 3. `src/pipeline.rs` 已不再在 `--quality` 模式下做外层色数二分，也不再在 `--quality` 模式额外跑 baseline 候选；质量约束完全收回 quantizer 内部，慢路径已明显缩短。
-4. 当前 `demo.png` spot check 的真实状态是：
-   - `pngoptim --quality 65-75`（默认抖动）: `158,492 bytes`, `quality_score=91`, `quality_mse=2.551`
-   - `pngoptim --quality 65-75 --floyd=0.5`: `149,967 bytes`, `quality_score=92`, `quality_mse=2.296`
-   - `pngoptim --quality 65-75 --nofs`: `127,726 bytes`, `quality_score=92`, `quality_mse=2.074`
-   - `pngoptim` 默认：`291,210 bytes`, `quality_score=99`, `quality_mse=0.025`, `1.87s`
-   - `pngquant --quality 65-75`: `136,915 bytes`, `MSE=5.210 (Q=82)`, `0.39s`
-   - `pngquant` 默认：`249KB`, `MSE=0.021 (Q=100)`, `0.40s`
-5. 这说明 reference-first 复查已经把抖动语义拉回参考方向：默认抖动、半强度抖动和 `--nofs` 现在会产生不同输出；下一步要继续盯 `remap.rs` / `dither_row` 的剩余视觉分支，而不是再回去发明外围护栏。
+4. 当前 `demo.png` spot check 的真实状态已更新为：
+   - `pngoptim --quality 65-75`（默认抖动）: `153,467 bytes`, `quality_score=88`, `quality_mse=3.314`, `1.00s`
+   - `pngoptim --quality 65-75 --floyd=0.5`: `140,799 bytes`, `quality_score=90`, `quality_mse=2.910`
+   - `pngoptim --quality 65-75 --nofs`: `107,700 bytes`, `quality_score=91`, `quality_mse=2.435`, `0.92s`
+   - `pngquant --quality 65-75`: `136,915 bytes`, `0.55s`
+   - `pngquant --quality 65-75 --nofs`: `104,038 bytes`, `0.45s`
+5. 这轮确认的硬根因不是 palette search 本身，而是当前 ICC 像素转换支路会把同一张图的唯一颜色数从 `1499` 膨胀到 `9347`，直接破坏 histogram / palette search / dithering 的输入分布。关闭这条坏支路后，原始带 ICC 输入的 `--nofs` 已追近 `pngquant --nofs`，说明静态 PNG 的剩余差距已收敛到 selective dithering 细节，而不是基础量化主链全面失真。
 
 ### 最近更新
 1. 2026-03-05：确认参考仓库本地路径与远程可达性，并锁定 `main` 分支 commit。
@@ -225,6 +224,7 @@
 59. 2026-03-06：完成第二轮 `--quality` 慢路径收口：`src/pipeline.rs` 已不再在 `--quality` 模式额外跑 baseline 候选，回归验证 `smoke` 通过（`reports/smoke/static-reference-audit-smoke-20260306-r2/summary.md`），`compat` 通过（`reports/compat/static-reference-audit-compat-20260306-r2/summary.md`）；`demo.png --quality 65-75` 耗时从上一轮的 `2.22s` / `2.38s` 降到约 `1.10s`，但与 `pngquant` 的 `0.39s` 仍有性能差距。
 60. 2026-03-06：继续对齐 dithering 语义：移除 `src/pipeline.rs` 中 plain/dither 候选赛马逻辑，开了抖动就走抖动；同时移除 `src/palette_quant.rs` 中 remap 前按 8-bit RGBA 提前去重的错误收缩。现在 `demo.png --quality 65-75` 的默认抖动、`--floyd=0.5` 和 `--nofs` 三条路径已产生不同输出，说明抖动链路不再形同虚设。
 61. 2026-03-06：补齐 `--floyd` CLI 语义，现支持 `--floyd` 与 `--floyd=0.5` 这类 `0..1` 强度参数，并将 dither strength 贯通到 quantizer；回归验证 `smoke` 通过（`reports/smoke/static-reference-audit-smoke-20260306-r4/summary.md`），`compat` 通过（`reports/compat/static-reference-audit-compat-20260306-r4/summary.md`）。
+62. 2026-03-06：定位到当前静态 PNG 质量回退的硬根因：`src/pipeline.rs` 中的 ICC 像素转换支路会把 `demo.png` 的唯一颜色数从 `1499` 放大到 `9347`，直接污染 histogram 与 dithering 输入。当前已移除这条坏支路，并把 indexed PNG 编码默认策略对齐到 `pngquant` 的 `PNG_FILTER_NONE + Deflate Level(9)`（`speed >= 10` 时 `Level(1)`）；回归验证 `smoke` 通过（`reports/smoke/static-icc-fix-smoke-20260306/summary.md`），`compat` 通过（`reports/compat/static-icc-fix-compat-20260306/summary.md`）。原始带 ICC 输入上，`pngoptim --quality 65-75 --nofs` 现为 `107,700 bytes`，已接近 `pngquant --nofs` 的 `104,038 bytes`。
 
 ### 更新规则
 1. 每次推进必须更新对应阶段状态：`Not Started` / `In Progress` / `Blocked` / `Done`。

@@ -71,16 +71,18 @@ pub fn process_png_bytes(
     options: PipelineOptions,
 ) -> Result<PipelineResult, AppError> {
     let t_total = Instant::now();
-    let metadata = if options.strip {
+    let input_metadata = extract_metadata(input_bytes);
+    let mut metadata = if options.strip {
         None
     } else {
-        extract_metadata(input_bytes)
+        input_metadata.clone()
     };
 
     let t_decode = Instant::now();
-    let rgba = image::load_from_memory_with_format(input_bytes, ImageFormat::Png)
+    let mut rgba = image::load_from_memory_with_format(input_bytes, ImageFormat::Png)
         .map_err(|e| AppError::Decode(format!("failed to decode PNG: {e}")))?
         .to_rgba8();
+    normalize_rgba_to_srgb_if_needed(rgba.as_mut(), input_metadata.as_ref(), metadata.as_mut())?;
     let (width, height) = rgba.dimensions();
     let decode_ms = t_decode.elapsed().as_secs_f64() * 1000.0;
 
@@ -154,6 +156,13 @@ struct QuantizeCandidate {
     quality: QualityMetrics,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct QualityTargets {
+    target_mse: f64,
+    max_mse: Option<f64>,
+    target_mse_is_zero: bool,
+}
+
 fn select_palette_candidate(
     rgba: &[u8],
     width: usize,
@@ -163,7 +172,7 @@ fn select_palette_candidate(
     speed_settings: SpeedSettings,
     dither_level: f32,
 ) -> QuantizeCandidate {
-    let target_mse = quality.map(|range| quality_to_mse(range.max));
+    let targets = quality_targets(quality, output_posterize_bits);
     evaluate_candidate(
         rgba,
         width,
@@ -171,7 +180,7 @@ fn select_palette_candidate(
         DEFAULT_MAX_COLORS,
         output_posterize_bits,
         speed_settings,
-        target_mse,
+        targets,
         dither_level,
     )
 }
@@ -183,7 +192,7 @@ fn evaluate_candidate(
     max_colors: usize,
     output_posterize_bits: u8,
     speed_settings: SpeedSettings,
-    target_mse: Option<f64>,
+    quality_targets: QualityTargets,
     dither_level: f32,
 ) -> QuantizeCandidate {
     evaluate_candidate_once(
@@ -193,7 +202,7 @@ fn evaluate_candidate(
         max_colors,
         output_posterize_bits,
         speed_settings,
-        target_mse,
+        quality_targets,
         dither_level,
     )
 }
@@ -205,17 +214,35 @@ fn evaluate_candidate_once(
     max_colors: usize,
     output_posterize_bits: u8,
     speed_settings: SpeedSettings,
-    target_mse: Option<f64>,
+    quality_targets: QualityTargets,
     dither_level: f32,
 ) -> QuantizeCandidate {
-    let quantizer = quantizer_settings(max_colors, speed_settings, target_mse, dither_level);
-    let mut indexed = quantize_indexed(rgba, width, height, quantizer);
-    if output_posterize_bits > 0 {
-        apply_posterize_palette(&mut indexed.palette, output_posterize_bits);
-    }
+    let quantizer = quantizer_settings(
+        max_colors,
+        speed_settings,
+        quality_targets.target_mse,
+        quality_targets.max_mse,
+        quality_targets.target_mse_is_zero,
+        output_posterize_bits,
+        dither_level,
+    );
+    let indexed = quantize_indexed(rgba, width, height, quantizer);
     let remapped_rgba = remapped_rgba_from_indices(&indexed.indices, &indexed.palette);
     let quality = evaluate_quality_against_rgba(rgba, &remapped_rgba);
     QuantizeCandidate { indexed, quality }
+}
+
+fn quality_targets(quality: Option<&QualityRange>, output_posterize_bits: u8) -> QualityTargets {
+    let _ = output_posterize_bits;
+    let max_mse = quality.map(|range| quality_to_mse(range.min));
+    let target_mse_is_zero = quality.is_none();
+    let target_mse = quality.map_or(0.0, |range| quality_to_mse(range.max));
+
+    QualityTargets {
+        target_mse,
+        max_mse,
+        target_mse_is_zero,
+    }
 }
 
 fn remapped_rgba_from_indices(indices: &[u8], palette: &[[u8; 4]]) -> Vec<u8> {
@@ -267,35 +294,12 @@ fn encode_indexed_png_to_vec(
 ) -> Result<Vec<u8>, AppError> {
     let bit_depth = indexed_bit_depth(palette_rgba.len());
     let packed_indices = pack_indices_by_bit_depth(indices, width, height, bit_depth)?;
-    let (compression, filters): (png::DeflateCompression, &[png::Filter]) = match speed {
-        1..=2 => (
-            png::DeflateCompression::Level(9),
-            &[
-                png::Filter::MinEntropy,
-                png::Filter::Adaptive,
-                png::Filter::Up,
-                png::Filter::Sub,
-                png::Filter::NoFilter,
-            ],
-        ),
-        3..=4 => (
-            png::DeflateCompression::Level(9),
-            &[png::Filter::MinEntropy, png::Filter::Adaptive],
-        ),
-        5..=6 => (
-            png::DeflateCompression::Level(7),
-            &[png::Filter::Adaptive, png::Filter::Up],
-        ),
-        7..=8 => (png::DeflateCompression::Level(5), &[png::Filter::Adaptive]),
-        9..=10 => (
-            png::DeflateCompression::Level(3),
-            &[png::Filter::Up, png::Filter::NoFilter],
-        ),
-        _ => (
-            png::DeflateCompression::FdeflateUltraFast,
-            &[png::Filter::Up],
-        ),
+    let compression = if speed >= 10 {
+        png::DeflateCompression::Level(1)
+    } else {
+        png::DeflateCompression::Level(9)
     };
+    let filters = [png::Filter::NoFilter];
 
     let mut best: Option<Vec<u8>> = None;
     for filter in filters {
@@ -307,7 +311,7 @@ fn encode_indexed_png_to_vec(
             palette_rgba,
             metadata,
             strip,
-            *filter,
+            filter,
             compression,
         )?;
         if best
@@ -475,6 +479,16 @@ fn extract_metadata(input_bytes: &[u8]) -> Option<PreservedMetadata> {
     })
 }
 
+fn normalize_rgba_to_srgb_if_needed(
+    rgba: &mut [u8],
+    input_metadata: Option<&PreservedMetadata>,
+    output_metadata: Option<&mut PreservedMetadata>,
+) -> Result<(), AppError> {
+    let _ = (rgba, input_metadata, output_metadata);
+    Ok(())
+}
+
+#[cfg(test)]
 fn apply_posterize_palette(palette: &mut [[u8; 4]], bits: u8) {
     if bits == 0 {
         return;
@@ -500,8 +514,9 @@ fn apply_posterize_palette(palette: &mut [[u8; 4]], bits: u8) {
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_posterize_palette, indexed_bit_depth, pack_indices_by_bit_depth,
-        remapped_rgba_from_indices, skip_if_larger_max_file_size,
+        PreservedMetadata, apply_posterize_palette, indexed_bit_depth,
+        normalize_rgba_to_srgb_if_needed, pack_indices_by_bit_depth, remapped_rgba_from_indices,
+        skip_if_larger_max_file_size,
     };
 
     #[test]
@@ -551,5 +566,26 @@ mod tests {
     fn skip_if_larger_demands_stronger_savings_at_low_quality() {
         assert_eq!(skip_if_larger_max_file_size(1_000, 10), 499);
         assert_eq!(skip_if_larger_max_file_size(1_000, 75), 648);
+    }
+
+    #[test]
+    fn icc_normalization_keeps_pixels_and_metadata_unchanged() {
+        let icc_profile = vec![1u8, 2, 3, 4];
+        let input = PreservedMetadata {
+            icc_profile: Some(icc_profile),
+            ..PreservedMetadata::default()
+        };
+        let mut output = input.clone();
+        let original_rgba = vec![10u8, 20, 30, 255, 200, 210, 220, 255];
+        let mut rgba = original_rgba.clone();
+
+        normalize_rgba_to_srgb_if_needed(&mut rgba, Some(&input), Some(&mut output))
+            .expect("normalize ICC");
+
+        assert_eq!(rgba, original_rgba);
+        assert_eq!(output.icc_profile, input.icc_profile);
+        assert_eq!(output.srgb, input.srgb);
+        assert_eq!(output.source_gamma, input.source_gamma);
+        assert_eq!(output.source_chromaticities, input.source_chromaticities);
     }
 }

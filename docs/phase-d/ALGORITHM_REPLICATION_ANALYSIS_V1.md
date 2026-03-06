@@ -371,19 +371,18 @@ pngquant /Users/5km/Downloads/demo.png --output /tmp/pngq-q6575-audit.png --qual
 
 | 场景 | 输出大小 | 质量结果 | 耗时 | 说明 |
 |---|---:|---:|---:|---|
-| 当前 `pngoptim` 默认 | `291,210` bytes | `quality_score=99`, `quality_mse=0.025` | `1.87s` | 与 `pngquant` 一样回到 `256-color / 高保真` 方向，但当前样本体积仍偏大 |
-| 当前 `pngoptim --quality 65-75` | `158,492` bytes | `quality_score=91`, `quality_mse=2.551` | `参考样本 spot check` | 默认抖动语义已回到参考方向，不再与 `--nofs` 等价 |
-| 当前 `pngoptim --quality 65-75 --floyd=0.5` | `149,967` bytes | `quality_score=92`, `quality_mse=2.296` | `参考样本 spot check` | 抖动强度链路已生效，可做中间档折中 |
-| 当前 `pngoptim --quality 65-75 --nofs` | `127,726` bytes | `quality_score=92`, `quality_mse=2.074` | `1.10s` | 无抖动路径仍更小，但不再代表默认语义 |
-| `pngquant --quality 65-75` | `136,915` bytes | `MSE=5.210 (Q=82)` | `0.40s` | 参考实现，`19` 色 |
-| `pngquant` 默认 | `249KB` | `MSE=0.021 (Q=100)` | `0.40s` | 默认同样是 `256-color / 高保真` 路径 |
+| 当前 `pngoptim --quality 65-75` | `153,467` bytes | `quality_score=88`, `quality_mse=3.314` | `1.00s` | 原始带 ICC 输入上，默认抖动已明显回落 |
+| 当前 `pngoptim --quality 65-75 --floyd=0.5` | `140,799` bytes | `quality_score=90`, `quality_mse=2.910` | `参考样本 spot check` | 半强度抖动已接近参考体积 |
+| 当前 `pngoptim --quality 65-75 --nofs` | `107,700` bytes | `quality_score=91`, `quality_mse=2.435` | `0.92s` | 原始带 ICC 输入上已接近 `pngquant --nofs` |
+| `pngquant --quality 65-75` | `136,915` bytes | `MSE=5.210 (Q=82)` | `0.55s` | 参考实现 |
+| `pngquant --quality 65-75 --nofs` | `104,038` bytes | `参考样本` | `0.45s` | 对照无抖动路径 |
 
 补充观测：
 
-1. `--quality 65-75` 路径在第二轮修复后已经不再依赖“baseline + targeted”双候选，慢路径已明显缩短。
-2. 默认抖动、半强度抖动和 `--nofs` 现在会产出三份不同结果，说明之前“开了抖动也等于没开”的语义偏差已经修掉。
-3. 当前默认路径虽然仍偏大，但至少在方向上已与 `pngquant` 对齐为 `256-color / 高保真`，因此不该再被当成“完全错误语义”处理。
-4. 你前面看到的阴影阶梯问题，剩余根因已经更集中到 `remap_to_palette` finalize 和 `dither_row` 视觉细节，而不是继续在 histogram / mediancut 外层补护栏。
+1. `--quality 65-75` 路径已经不再依赖“baseline + targeted”双候选，慢路径缩短到了约 `1s`。
+2. 当前真正的硬根因已经确认：之前引入的 ICC 像素转换会把这张图的唯一颜色数从 `1499` 膨胀到 `9347`，直接污染 histogram、palette search 和 dithering 的输入分布。
+3. 去掉这条坏支路后，原始带 ICC 输入上的 `--nofs` 已从此前的 `127KB+` 级别回落到 `107,700 bytes`，已经接近 `pngquant --nofs` 的 `104,038 bytes`。
+4. 这说明静态 PNG 主链当前剩余差距已从“基础量化完全跑偏”收敛到“selective dithering 默认路径仍偏重”，而不是继续在 histogram / mediancut 外层补护栏。
 
 ### 10.2 本轮已修复的偏差
 
@@ -400,13 +399,15 @@ pngquant /Users/5km/Downloads/demo.png --output /tmp/pngq-q6575-audit.png --qual
 11. 对齐了 `hist.rs + mediancut.rs` 的两类关键细节：
    - histogram 不再做桶内平均色，改为“代表色 + perceptual weight + 16 cluster 起始箱”
    - mediancut 改为带 `total_box_error_below_target()` / `max_mse_per_color` / best-box split 的误差约束切分
+12. 移除了当前有害的 ICC 像素转换支路：现在保留 decoder 输出像素与原始色彩元数据，不再用错误转换把颜色基数从 `1499` 扩张到 `9347`。
+13. 将 indexed PNG 编码默认策略对齐到 `pngquant` 的 `PNG_FILTER_NONE + Deflate Level(9)`，并在 `speed >= 10` 时降到 `Level(1)`。
 
 ### 10.3 仍然存在的关键偏差
 
 1. 当前 plain remap / dither remap 还没有完整实现 `remap.rs::remap_to_palette()` 的 full-image K-Means finalize 结构。
 2. 当前 selective dithering 虽然已接入 core subset，但还没达到 `remap_to_palette_floyd()` 的整套 chunk warmup / background-aware / guess 策略。
-3. 默认无 `--quality` 路径虽然方向已对齐，但在当前样本上的文件体积仍明显高于 `pngquant`，说明默认策略和最终编码联动还要继续收口。
-4. `--quality` 路径速度已明显改善，但相对 `pngquant` 仍慢约 `3x`，说明 quantizer 内部仍有可继续收紧的预算与 finalize 开销。
+3. 默认抖动路径当前仍比 `pngquant` 默认路径大约高 `16.5KB`，说明 dither map / error diffusion 的默认强度还要继续收口。
+4. `--quality` 路径速度已明显改善，但相对 `pngquant` 仍慢约 `2x`，说明 quantizer 内部仍有可继续收紧的预算与 finalize 开销。
 
 ## 11. 当前判断
 
