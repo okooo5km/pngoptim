@@ -44,5 +44,7 @@
 
 ## 阶段结论
 
-- [x] 阶段 H 当前状态：`In Progress`
-- [x] 当前优先级：先把 `H1` 接入正式 pipeline，再进入 `H2` lossless 结构优化
+- [x] 阶段 H 规划与 H1 骨架已完成
+- [x] 当前状态：`Blocked`
+- [x] 当前优先级：等待静态 PNG `reference-first` 复查收口后，再恢复 `H1 -> CLI/pipeline` 接入
+- [x] 恢复条件：`demo.png` 这类平滑阴影/UI 样本的默认抖动路径不再存在明显阶梯感

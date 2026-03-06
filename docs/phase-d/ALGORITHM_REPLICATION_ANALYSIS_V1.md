@@ -371,8 +371,8 @@ pngquant /Users/5km/Downloads/demo.png --output /tmp/pngq-q6575-audit.png --qual
 
 | 场景 | 输出大小 | 质量结果 | 耗时 | 说明 |
 |---|---:|---:|---:|---|
-| 当前 `pngoptim --quality 65-75` | `150,443` bytes | `quality_score=88`, `quality_mse=3.457` | `release spot check` | 正确颜色管理接入后，默认抖动仍偏大 |
-| 当前 `pngoptim --quality 65-75 --floyd=0.5` | `待后续复测` | `-` | `-` | 这轮重点已转到正确颜色管理，不再用半强度抖动作主结论 |
+| 当前 `pngoptim --quality 65-75` | `142,626` bytes | `quality_score=89`, `quality_mse=3.238` | `profile total≈282ms` | 默认抖动仍有可感知灰阶台阶 |
+| 当前 `pngoptim --quality 65-75 --floyd=0.5` | `133,638` bytes | `quality_score=90`, `quality_mse=2.916` | `release spot check` | 半强度抖动继续优于默认路径 |
 | 当前 `pngoptim --quality 65-75 --nofs` | `105,433` bytes | `quality_score=91`, `quality_mse=2.524` | `release spot check` | 已非常接近 `pngquant --nofs` |
 | `pngquant --quality 65-75` | `136,915` bytes | `MSE=5.210 (Q=82)` | `0.55s` | 参考实现 |
 | `pngquant --quality 65-75 --nofs` | `104,038` bytes | `参考样本` | `0.45s` | 对照无抖动路径 |
@@ -386,7 +386,7 @@ pngquant /Users/5km/Downloads/demo.png --output /tmp/pngq-q6575-audit.png --qual
    - remap / Floyd 前没有像 `init_int_palette()` 那样先按输出精度 round palette
 3. 当前已用 Little CMS 正确补回 `ICC -> sRGB` 和 `gAMA + cHRM -> sRGB` 两条参考路径。对 `demo.png` 这类带 Apple Display ICC 的输入，灰阶 palette 已明显向 `pngquant` 靠拢，`--nofs` 体积也进一步收敛到 `105,433 bytes`。
 4. 在正确颜色管理接入后，又定位到一处更直接的参考偏差：当前大图在未生成专用 dither-map 时漏掉了 `edges` fallback，导致默认 `speed=4` 更像“裸 Floyd”而不是 `pngquant` 的选择性抖动。
-5. 这条路径修正后，`demo.png` 的默认抖动已从 `150,443 bytes` 收敛到 `142,017 bytes`，`--floyd=0.5` 到 `133,223 bytes`，说明当前默认路径的剩余问题已从“大图裸扩散”进一步收敛到少量 palette 灰阶分配与 Floyd 细节，而不是输入色彩配置解析或 dither-map 主逻辑缺失。
+5. 这条路径修正后，`demo.png` 的默认抖动已从 `150,443 bytes` 收敛到 `142,626 bytes`，`--floyd=0.5` 到 `133,638 bytes`，说明当前默认路径的剩余问题已从“大图裸扩散”进一步收敛到少量 palette 灰阶分配与 Floyd 细节，而不是输入色彩配置解析或 dither-map 主逻辑缺失。
 
 ### 10.2 本轮已修复的偏差
 
@@ -428,18 +428,52 @@ pngquant /Users/5km/Downloads/demo.png --output /tmp/pngq-q6575-audit.png --qual
    - `pngoptim --quality 65-75 --nofs`: `0.246s`
    - `pngquant --quality 65-75 --nofs`: `0.286s`
 2. 内置 profile 埋点：
-   - `decode_ms≈65`
-   - `quantize_ms≈160`
-   - `encode_ms≈104`
-   - `total_ms≈339`
+   - `decode_ms≈68`
+   - `quantize_ms≈128`
+   - `encode_ms≈75`
+   - `total_ms≈282`
 
 结论：
 
 1. 在这张当前样本的热缓存本地对拍里，`pngoptim` 平均并不比 `pngquant` 慢。
 2. 但这不代表性能差距已经彻底消失。真正稳定的热点仍是 `quantize_ms`，不是 decode。
-3. 参考实现在 `/Users/5km/Dev/C/libimagequant/src/kmeans.rs` 与 `/Users/5km/Dev/C/libimagequant/src/remap.rs` 已分别使用 `par_chunks_mut()` 和 `par_bridge()`，`/Users/5km/Dev/C/pngquant/pngquant.c` 与 `rwpng.c` 也使用 OpenMP 做多文件与色彩管理并行。本轮已先把 `kmeans_iteration()` 按同类分块方式并行化，并确认 `demo.png` 与 `dataset/perf/p_large_gradient_noise.png` 两个样本的输出哈希保持一致；随后又把大图 Floyd 对齐为分块并行 + 2 行预热，进一步把 `dataset/perf/p_large_gradient_noise.png` 默认路径 3 次均值从 `1.570s` 压到 `1.260s`。
+3. 参考实现在 `/Users/5km/Dev/C/libimagequant/src/kmeans.rs` 与 `/Users/5km/Dev/C/libimagequant/src/remap.rs` 已分别使用 `par_chunks_mut()` 和 `par_bridge()`，`/Users/5km/Dev/C/pngquant/pngquant.c` 与 `rwpng.c` 也使用 OpenMP 做多文件与色彩管理并行。本轮已先把 `kmeans_iteration()` 按同类分块方式并行化，并确认 `demo.png` 与 `dataset/perf/p_large_gradient_noise.png` 两个样本的输出哈希保持一致；随后又把大图 Floyd 对齐为分块并行 + 2 行预热，进一步把 `dataset/perf/p_large_gradient_noise.png` 默认路径 3 次均值从 `1.570s` 压到 `1.260s`，并把 `demo.png --quality 65-75` 的内置 profile 收敛到 `decode≈68 / quantize≈128 / encode≈75 / total≈282ms`。
 4. 这轮顺手清掉了一个低风险冗余：`src/palette_quant.rs` 的 plain remap 现在会在已有 `contrast_pixels` 时直接复用内部浮点像素，避免重复 `RGBA -> InternalPixel` 转换。这个改动不改输出语义，但减少了 plain remap 的重复工作。
 5. 目前的并行化进展更准确地说是：`kmeans + 大图 Floyd` 已并行，但 plain remap、dither-map 生成和 palette 质量细节仍未收口。因此性能上的下一主攻点已经从 `kmeans` 转到 `remap/Floyd` 剩余部分，而质量上的主阻塞仍是 palette 灰阶分配与默认抖动视觉细节。
+
+### 10.5 恢复检查点
+
+下次恢复时，不要先回 APNG，也不要先回外围编码器或 CI。
+
+恢复顺序固定为：
+
+1. 先对照 `hist.rs + mediancut.rs` 继续核灰阶 palette 分配。
+2. 再对照 `remap.rs::remap_to_palette()` 收 full-image finalize。
+3. 再对照 `remap_to_palette_floyd()` 的剩余视觉细节。
+4. 最后才继续压剩余性能热点。
+
+当前最关键的样本判断：
+
+1. `demo.png` 上我们是 `18` 色，`pngquant` 是 `19` 色。
+2. 问题不在“整体颜色数明显不足”，而在灰阶落点不同。
+3. 当前输出里少了一档中间灰，导致阴影更容易出阶梯。
+
+下次恢复时建议直接复跑：
+
+```bash
+cargo test
+cargo build --release
+./target/release/pngoptim /Users/5km/Downloads/demo.png --output /tmp/demo-current.png --quality 65-75 --force
+pngquant /Users/5km/Downloads/demo.png --output /tmp/demo-pngquant.png --quality 65-75 --force
+cargo run --release --bin xtask -- smoke --run-id <new-run-id>
+cargo run --release --bin xtask -- compat --run-id <new-run-id>
+```
+
+最近稳定提交：
+
+1. `cf9e8b0` `perf(quant): reuse internal pixels in plain remap`
+2. `5cdccd9` `perf(quant): parallelize kmeans iteration`
+3. `9355358` `perf(quant): chunk floyd dithering for large images`
 
 ## 11. 当前判断
 

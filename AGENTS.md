@@ -108,7 +108,7 @@
 4. 再把当前静态 PNG 的 palette search / remap / selective dithering 主链提升为 animation-aware 全局量化器。
 5. 建立 APNG 数据集、质量/体积/性能门禁与跨平台回归。
 - 阶段出口：`APNG Optimization Plan v1` + `APNG Compatibility Report v1` + `APNG Optimization Report v1`
-- 当前状态：`In Progress`
+- 当前状态：`Blocked`
 
 ## 3. 验收门禁（阶段推进依据）
 
@@ -129,7 +129,7 @@
 | E | Done | 阶段收口完成 | `docs/phase-e/PHASE_E_PROGRESS.md` |
 | F | Done | 阶段收口完成 | `docs/phase-f/PHASE_F_PROGRESS.md` |
 | G | Done | 阶段收口完成 | `docs/phase-g/PHASE_G_PROGRESS.md` |
-| H | In Progress | APNG 数据结构调研与超越阶段规划冻结 | `docs/phase-h/PHASE_H_PROGRESS.md` |
+| H | Blocked | 等待静态 PNG 量化主线收口后恢复 | `docs/phase-h/PHASE_H_PROGRESS.md` |
 
 ### 附加产品轨道
 | 轨道 | 状态 | 当前焦点 | 证据/报告 |
@@ -148,11 +148,11 @@
 | RF-7 | Done | 全链路 | 重跑 quality/perf/stability/release 门禁，形成新基线 | 本地与跨平台复核均已通过 |
 
 ### 当前硬阻塞与下一步
-1. 阶段 H 目前暂缓，主任务切回静态 PNG 的 `reference-first` 复查。原因很明确：用户样本已证明当前静态量化主链在平滑阴影和 `--quality` 路径上仍存在可感知差距，不适合在这个状态下继续扩新格式能力。
-2. 当前最硬的阻塞已经进一步收敛到 remap / dither 主链的剩余细节：
-   - `remap.rs::remap_to_palette` 的 full-image K-Means finalize
-   - `remap.rs::remap_to_palette_floyd` 的剩余视觉细节
-   - palette 落点在灰阶 UI 样本上仍与 `pngquant` 有细微差异，当前会多保留一档棕色/强调色，少保留一档中间灰，导致默认抖动路径体积和阴影观感仍未完全对齐
+1. 阶段 H 当前暂停，主任务切回静态 PNG 的 `reference-first` 复查。恢复 APNG 的前提是：`demo.png` 这类平滑阴影/UI 样本的默认抖动路径不再存在明显阶梯感。
+2. 当前最硬的阻塞已经进一步收敛到 palette / remap / dither 主链：
+   - `hist.rs / mediancut.rs` 的灰阶分配仍与 `pngquant` 有细微偏差
+   - `remap.rs::remap_to_palette` 的 full-image K-Means finalize 还未完整对齐
+   - `remap.rs::remap_to_palette_floyd` 的视觉细节仍未完全抹平
 3. `src/pipeline.rs` 已不再在 `--quality` 模式下做外层色数二分，也不再在 `--quality` 模式额外跑 baseline 候选；质量约束完全收回 quantizer 内部，慢路径已明显缩短。
 4. 当前 `demo.png` spot check 的真实状态已更新为：
    - `pngoptim --quality 65-75`（默认抖动）: `142,626 bytes`, `quality_score=89`, `quality_mse=3.238`
@@ -161,16 +161,46 @@
    - `pngquant --quality 65-75`: `136,915 bytes`, `0.55s`
    - `pngquant --quality 65-75 --nofs`: `104,038 bytes`, `0.45s`
 5. 2026-03-06 新一轮时间复查表明：在本机热缓存 5 次均值下，`demo.png` 上 `pngoptim --quality 65-75` 为 `0.306s`，`pngquant --quality 65-75` 为 `0.340s`；`--nofs` 下分别为 `0.246s` 和 `0.286s`。因此“当前这张样本上我们整体更慢”并不成立，真正稳定的热点仍是 quantizer 内部。随后又补上了 `kmeans` 分块并行和大图 Floyd 分块并行，`demo.png --quality 65-75` 的内置 profile 现为 `decode_ms≈68`、`quantize_ms≈128`、`encode_ms≈75`。参考实现在 `libimagequant/src/kmeans.rs`、`remap.rs` 和 `pngquant` CLI 层分别用了 Rayon / OpenMP 并行；当前 Rust 主线已补上 `kmeans + 大图 Floyd` 两段，但 plain remap、dither-map 生成和 palette 质量细节仍会决定跨样本的剩余差距。
-6. 这轮确认的硬根因不是 palette search 本身，而是两处输入/输出对齐缺失：
+6. 当前针对 `demo.png` 的 palette 对比已经确认：剩余主差距不是“颜色数明显不够”，而是灰阶落点不完全一致。当前输出为 `18` 色，`pngquant` 为 `19` 色；我们少了一档中间灰，导致阴影更容易出现台阶。
+7. 这轮确认的已修复硬根因不是 palette search 本身，而是两处输入/输出对齐缺失：
    - 当前 ICC 像素转换支路会把同一张图的唯一颜色数从 `1499` 膨胀到 `9347`
    - remap / Floyd 之前没有像 `init_int_palette()` 一样先按输出精度 round palette
    另外，大图在未生成 dither-map 时我们此前还漏掉了 `edges` fallback，导致默认 `speed=4` 比参考实现更像“裸 Floyd”。当前三点都已修正后，默认抖动和半强度抖动都继续向 `pngquant` 靠近，剩余差距已进一步收敛到少量 palette 落点与大图 Floyd 细节。
-6. 2026-03-06 本轮 reference-first 复查又补齐了几处实现口径：
+8. 2026-03-06 本轮 reference-first 复查又补齐了几处实现口径：
    - histogram 超限时改回“请求 bits + 最多额外 1 bit”的参考语义，不再持续提到 `3` bit 上限
    - histogram 改用参考实现一致的 `U32Hasher(fxhash-mul)`，避免标准随机 `HashMap` 顺序把 mediancut 起点带偏
    - VP-tree 在 K-Means / unused color replacement 中按 palette popularity 选 vantage point，更接近 `nearest.rs`
    - plain remap 按行重置 `last_match`，与 `remap.rs::remap_to_palette()` 的行级 hint 口径一致
    这批修正本身没有单独带来体积跳变，但配合后续颜色管理和大图 `edges` fallback 修复后，默认抖动已从 `150,443 bytes` 收敛到 `142,017 bytes`。
+
+### 恢复入口（下次继续时从这里开始）
+1. 当前恢复起点不是 APNG，而是静态 PNG 的灰阶 palette 分配。
+2. 下一步执行顺序固定如下：
+   - 先对照 `libimagequant/src/hist.rs` 与 `mediancut.rs`，继续审查 histogram weight / representative color / split 细节
+   - 再对照 `libimagequant/src/remap.rs::remap_to_palette()`，补齐 full-image finalize
+   - 然后继续对照 `remap_to_palette_floyd()`，收剩余视觉细节
+   - 最后再回到 `plain remap / dither-map` 的剩余性能收口
+3. 当前不要恢复 Phase H。恢复条件是：`demo.png --quality 65-75` 默认抖动路径的视觉效果达到可接受，且 spot check 不再显示明显阴影阶梯。
+4. 当前最关键的参考文件：
+   - `/Users/5km/Dev/C/libimagequant/src/hist.rs`
+   - `/Users/5km/Dev/C/libimagequant/src/mediancut.rs`
+   - `/Users/5km/Dev/C/libimagequant/src/quant.rs`
+   - `/Users/5km/Dev/C/libimagequant/src/remap.rs`
+5. 当前最关键的本地实现文件：
+   - `src/palette_quant.rs`
+   - `src/pipeline.rs`
+   - `src/quality.rs`
+6. 下次恢复时优先执行的复现实验：
+   - `cargo test`
+   - `cargo build --release`
+   - `./target/release/pngoptim /Users/5km/Downloads/demo.png --output /tmp/demo-current.png --quality 65-75 --force`
+   - `pngquant /Users/5km/Downloads/demo.png --output /tmp/demo-pngquant.png --quality 65-75 --force`
+   - `cargo run --release --bin xtask -- smoke --run-id <new-run-id>`
+   - `cargo run --release --bin xtask -- compat --run-id <new-run-id>`
+7. 最近稳定提交，继续工作默认从这里往后接：
+   - `cf9e8b0` `perf(quant): reuse internal pixels in plain remap`
+   - `5cdccd9` `perf(quant): parallelize kmeans iteration`
+   - `9355358` `perf(quant): chunk floyd dithering for large images`
 
 ### 最近更新
 1. 2026-03-05：确认参考仓库本地路径与远程可达性，并锁定 `main` 分支 commit。
