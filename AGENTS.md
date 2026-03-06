@@ -19,6 +19,14 @@
 3. 不扩展 PNG 之外格式。
 4. v1 不引入复杂 ML 压缩策略。
 
+## 1.1 工程约束与决策锁定
+
+1. 仓库主线、CI 编排、发布资产生成统一使用 Rust；不得把 Python 重新引入为项目运行时或主线编排依赖。
+2. 临时本地分析命令不视为项目资产；若使用一次性 shell/Python 片段做实验，禁止提交进仓库，也不得让文档、workflow、CLI 依赖该运行时。
+3. 算法目标不是“完全自己发明一套”，而是尽可能对齐 `pngquant` / `libimagequant` 的成熟实现思路。
+4. 目前不直接复制或链接参考实现代码进入主线，不是出于教条式自研，而是因为当前项目已按 MIT 发布，直接引入参考实现代码需要先明确许可证策略与仓库治理方案。
+5. 如果后续决定直接复用参考实现代码，必须先把许可证、分发方式、仓库结构和发布策略记录进文档，再执行代码接入。
+
 ## 2. 分阶段开发规划（不设周期，仅阶段）
 
 执行顺序固定：A -> B -> C -> D -> E -> F -> G
@@ -115,6 +123,12 @@
 |---|---|---|---|
 | Algorithm Replication | In Progress | 对齐 `pngquant/libimagequant` 的核心量化主链 | `docs/phase-d/ALGORITHM_REPLICATION_ANALYSIS_V1.md` |
 
+### 当前硬阻塞与下一步
+1. 当前 R2 量化主链虽然已恢复 `smoke 9/9`，但在 `demo.png` 上仍只有 `quality_score=45`，无法满足 `--quality 65-75` 的最低质量门槛。
+2. naive 全图 Floyd 已被证明方向错误：会放大输出并拉低质量，后续必须实现 `dither map + selective dithering`，不能把全图误差扩散当作 pngquant 等价物。
+3. R2 把质量方向拉正后，性能明显回退，后续需要在完成 feedback loop / remap 主链后重新回到阶段 E 做性能收口。
+4. 当前最合理的执行顺序仍是：`R2.1 feedback loop` -> `R2.2 remap refinement` -> `R3 VP-tree + selective dithering` -> `E 回归优化`。
+
 ### 最近更新
 1. 2026-03-05：确认参考仓库本地路径与远程可达性，并锁定 `main` 分支 commit。
 2. 2026-03-05：新增 `Compliance Policy v1`、依赖登记模板、参数矩阵、数据集目录骨架。
@@ -151,6 +165,8 @@
 33. 2026-03-06：执行 R1 回归验证：`compat` 通过（`reports/compat/r1-compat-verify/summary.md`），但 `smoke` 在新质量门禁下仅 `2/9` 通过（`reports/smoke/r1-smoke-verify/summary.md`），确认当前旧量化器在真实质量标尺下已不能满足既有阶段 D 结论，需进入 R2 重写核心 palette search / remap。
 34. 2026-03-06：完成 R2 第一版自研量化器替换（gamma-aware histogram + weighted median cut + k-means refine + palette prune/remap），`compat` 通过（`reports/compat/r2-compat-verify/summary.md`），`smoke` 恢复到 `9/9` 通过（`reports/smoke/r2-smoke-verify/summary.md`）；但 perf 样本耗时显著上升，后续需回到阶段 E 做性能收口。
 35. 2026-03-06：验证了 naive 全图 Floyd remap：在 `demo.png` 上会把输出放大到约 `348KB` 且质量分数下降到 `22`，不符合 pngquant 的 selective dithering 思路；当前仅在启用抖动时做“择优采用”，后续需实现 dither map/选择性抖动而非全图误差扩散。
+36. 2026-03-06：完成阶段记忆审计，确认仓库中不存在 `.py` 文件、workflow 也未重新依赖 Python；此前出现的 Python 仅为一次性本地分析命令，未进入主线。
+37. 2026-03-06：将“Rust-only 主线编排”和“参考实现可借鉴但受许可证约束”的决策写入阶段记忆，避免后续在实现路线与依赖策略上反复横跳。
 
 ### 更新规则
 1. 每次推进必须更新对应阶段状态：`Not Started` / `In Progress` / `Blocked` / `Done`。
