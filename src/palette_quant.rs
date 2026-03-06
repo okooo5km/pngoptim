@@ -392,6 +392,7 @@ fn kmeans_iteration(
     palette: &mut [InternalPixel],
     adjust_weights: bool,
 ) -> PaletteStats {
+    let tree = NearestTree::new(palette);
     let mut sums = vec![[0.0f64; 4]; palette.len()];
     let mut weights = vec![0.0f64; palette.len()];
     let mut usage = vec![0usize; palette.len()];
@@ -404,18 +405,14 @@ fn kmeans_iteration(
 
     for item in histogram.iter_mut() {
         let hint = usize::from(item.likely_palette_index).min(palette.len().saturating_sub(1));
-        let nearest = nearest_internal_color_with_hint(item.color, palette, hint);
-        let diff = f64::from(item.color.diff(palette[nearest]));
+        let (nearest, diff_sq) = tree.search(item.color, hint);
+        let diff = f64::from(diff_sq);
         item.likely_palette_index = nearest as u16;
         total_error += diff * f64::from(item.weight);
 
         let weight = if adjust_weights {
             let reflected = reflected_color(item.color, palette[nearest]);
-            let reflected_diff = f64::from(nearest_internal_color_distance(
-                reflected,
-                palette,
-                nearest,
-            ));
+            let reflected_diff = f64::from(tree.search(reflected, nearest).1);
             let adjusted = (2.0 * f64::from(item.adjusted_weight) + f64::from(item.weight))
                 * (0.5 + reflected_diff.sqrt());
             item.adjusted_weight = adjusted.min(f64::from(item.weight) * 32.0) as f32;
@@ -464,19 +461,25 @@ fn replace_unused_palette_entries(
             continue;
         }
 
-        if let Some((worst_idx, _)) = histogram
-            .iter()
-            .enumerate()
-            .filter_map(|(item_idx, item)| {
-                if palette.is_empty() {
-                    return None;
-                }
-                let hint = usize::from(item.likely_palette_index).min(palette.len().saturating_sub(1));
-                let diff = nearest_internal_color_distance(item.color, palette, hint);
-                Some((item_idx, diff))
-            })
-            .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal))
-        {
+        let worst_idx = {
+            let tree = NearestTree::new(palette);
+            histogram
+                .iter()
+                .enumerate()
+                .filter_map(|(item_idx, item)| {
+                    if palette.is_empty() {
+                        return None;
+                    }
+                    let hint =
+                        usize::from(item.likely_palette_index).min(palette.len().saturating_sub(1));
+                    let diff = tree.search(item.color, hint).1;
+                    Some((item_idx, diff))
+                })
+                .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal))
+                .map(|(item_idx, _)| item_idx)
+        };
+
+        if let Some(worst_idx) = worst_idx {
             palette[pal_idx] = histogram[worst_idx].color;
         }
     }
@@ -535,6 +538,188 @@ fn reflected_color(color: InternalPixel, mapped: InternalPixel) -> InternalPixel
     }
 }
 
+const LEAF_MAX_SIZE: usize = 6;
+
+struct NearestTree<'a> {
+    root: SearchNode,
+    points: &'a [InternalPixel],
+    nearest_other_color_dist: Vec<f32>,
+}
+
+struct SearchNode {
+    idx: usize,
+    vantage_point: InternalPixel,
+    inner: SearchNodeInner,
+}
+
+enum SearchNodeInner {
+    Branch {
+        radius: f32,
+        radius_squared: f32,
+        near: Box<SearchNode>,
+        far: Box<SearchNode>,
+    },
+    Leaf {
+        idxs: Box<[usize]>,
+    },
+}
+
+struct SearchVisitor {
+    idx: usize,
+    distance: f32,
+    distance_squared: f32,
+    exclude: Option<usize>,
+}
+
+impl SearchVisitor {
+    fn visit(&mut self, idx: usize, distance_squared: f32) {
+        if self.exclude == Some(idx) || distance_squared >= self.distance_squared {
+            return;
+        }
+
+        self.idx = idx;
+        self.distance_squared = distance_squared;
+        self.distance = distance_squared.sqrt();
+    }
+}
+
+impl<'a> NearestTree<'a> {
+    fn new(points: &'a [InternalPixel]) -> Self {
+        debug_assert!(!points.is_empty());
+        let mut indexes = (0..points.len()).collect::<Vec<_>>();
+        let root = build_search_node(points, &mut indexes);
+        let mut tree = Self {
+            root,
+            points,
+            nearest_other_color_dist: vec![f32::INFINITY; points.len()],
+        };
+
+        if points.len() > 1 {
+            for (idx, point) in points.iter().copied().enumerate() {
+                let mut visitor = SearchVisitor {
+                    idx: 0,
+                    distance: f32::INFINITY,
+                    distance_squared: f32::INFINITY,
+                    exclude: Some(idx),
+                };
+                search_node(&tree.root, tree.points, point, &mut visitor);
+                tree.nearest_other_color_dist[idx] = visitor.distance_squared / 4.0;
+            }
+        }
+
+        tree
+    }
+
+    fn search(&self, needle: InternalPixel, likely_index: usize) -> (usize, f32) {
+        let mut visitor = if let Some(point) = self.points.get(likely_index) {
+            let guess_diff = needle.diff(*point);
+            if guess_diff < self.nearest_other_color_dist[likely_index] {
+                return (likely_index, guess_diff);
+            }
+            SearchVisitor {
+                idx: likely_index,
+                distance: guess_diff.sqrt(),
+                distance_squared: guess_diff,
+                exclude: None,
+            }
+        } else {
+            SearchVisitor {
+                idx: 0,
+                distance: f32::INFINITY,
+                distance_squared: f32::INFINITY,
+                exclude: None,
+            }
+        };
+
+        search_node(&self.root, self.points, needle, &mut visitor);
+        (visitor.idx, visitor.distance_squared)
+    }
+}
+
+fn build_search_node(points: &[InternalPixel], indexes: &mut [usize]) -> SearchNode {
+    debug_assert!(!indexes.is_empty());
+    if indexes.len() == 1 {
+        let idx = indexes[0];
+        return SearchNode {
+            idx,
+            vantage_point: points[idx],
+            inner: SearchNodeInner::Leaf {
+                idxs: Box::new([]),
+            },
+        };
+    }
+
+    let idx = indexes[0];
+    let vantage_point = points[idx];
+    let rest = &mut indexes[1..];
+    rest.sort_by(|left, right| {
+        vantage_point
+            .diff(points[*left])
+            .partial_cmp(&vantage_point.diff(points[*right]))
+            .unwrap_or(Ordering::Equal)
+    });
+
+    let inner = if rest.len() <= LEAF_MAX_SIZE {
+        SearchNodeInner::Leaf {
+            idxs: rest.to_vec().into_boxed_slice(),
+        }
+    } else {
+        let split = rest.len() / 2;
+        let (near_idx, far_idx) = rest.split_at_mut(split);
+        let radius_squared = vantage_point.diff(points[far_idx[0]]);
+        let radius = radius_squared.sqrt();
+        SearchNodeInner::Branch {
+            radius,
+            radius_squared,
+            near: Box::new(build_search_node(points, near_idx)),
+            far: Box::new(build_search_node(points, far_idx)),
+        }
+    };
+
+    SearchNode {
+        idx,
+        vantage_point,
+        inner,
+    }
+}
+
+fn search_node(
+    node: &SearchNode,
+    points: &[InternalPixel],
+    needle: InternalPixel,
+    visitor: &mut SearchVisitor,
+) {
+    let distance_squared = node.vantage_point.diff(needle);
+    visitor.visit(node.idx, distance_squared);
+
+    match &node.inner {
+        SearchNodeInner::Branch {
+            radius,
+            radius_squared,
+            near,
+            far,
+        } => {
+            let distance = distance_squared.sqrt();
+            if distance_squared < *radius_squared {
+                search_node(near, points, needle, visitor);
+                if distance >= *radius - visitor.distance {
+                    search_node(far, points, needle, visitor);
+                }
+            } else {
+                search_node(far, points, needle, visitor);
+                if distance <= *radius + visitor.distance {
+                    search_node(near, points, needle, visitor);
+                }
+            }
+        }
+        SearchNodeInner::Leaf { idxs } => {
+            for &idx in idxs.iter() {
+                visitor.visit(idx, points[idx].diff(needle));
+            }
+        }
+    }
+}
+
 fn refine_palette_from_pixels(
     rgba: &[u8],
     palette: &mut [InternalPixel],
@@ -547,6 +732,7 @@ fn refine_palette_from_pixels(
 
     let gamma = gamma_lut(SRGB_OUTPUT_GAMMA);
     for _ in 0..iterations {
+        let tree = NearestTree::new(palette);
         let mut sums = vec![[0.0f64; 4]; palette.len()];
         let mut weights = vec![0.0f64; palette.len()];
         let mut cache: HashMap<u32, usize> = HashMap::new();
@@ -559,7 +745,7 @@ fn refine_palette_from_pixels(
             let nearest = if let Some(&idx) = cache.get(&cache_key) {
                 idx
             } else {
-                let idx = nearest_internal_color_with_hint(color, palette, 0);
+                let idx = tree.search(color, 0).0;
                 cache.insert(cache_key, idx);
                 idx
             };
@@ -659,6 +845,9 @@ fn remap_image_plain(
     let gamma = gamma_lut(SRGB_OUTPUT_GAMMA);
     let mut cache: HashMap<u32, u8> = HashMap::new();
     let mut counts = vec![0usize; palette.len()];
+    let palette_points = palette.iter().map(|entry| entry.0).collect::<Vec<_>>();
+    let tree = NearestTree::new(&palette_points);
+    let mut last_idx = 0usize;
 
     for px in rgba.chunks_exact(4) {
         let cache_key = pack_rgba_key(px, input_posterize_bits.min(4));
@@ -666,10 +855,11 @@ fn remap_image_plain(
             cached as usize
         } else {
             let color = InternalPixel::from_rgba(&gamma, px);
-            let idx = nearest_palette(color, palette);
+            let idx = tree.search(color, last_idx).0;
             cache.insert(cache_key, idx as u8);
             idx
         };
+        last_idx = idx;
         counts[idx] += 1;
         indices.push(idx as u8);
     }
@@ -684,6 +874,8 @@ fn remap_image_dithered(
     palette: &[(InternalPixel, [u8; 4])],
 ) -> (Vec<u8>, Vec<usize>) {
     let gamma = gamma_lut(SRGB_OUTPUT_GAMMA);
+    let palette_points = palette.iter().map(|entry| entry.0).collect::<Vec<_>>();
+    let tree = NearestTree::new(&palette_points);
     let pixels = rgba
         .chunks_exact(4)
         .map(|px| InternalPixel::from_rgba(&gamma, px))
@@ -698,6 +890,7 @@ fn remap_image_dithered(
         next_errors.fill(InternalPixel::default());
 
         let even = row % 2 == 0;
+        let mut last_match = 0usize;
         for offset in 0..width {
             let x = if even { offset } else { width - 1 - offset };
             let idx = row * width + x;
@@ -708,7 +901,8 @@ fn remap_image_dithered(
             color.g = (color.g + err.g).clamp(0.0, 1.1);
             color.b = (color.b + err.b).clamp(0.0, 1.1);
 
-            let pal_idx = nearest_palette(color, palette);
+            let pal_idx = tree.search(color, last_match).0;
+            last_match = pal_idx;
             indices[idx] = pal_idx as u8;
             counts[pal_idx] += 1;
 
@@ -742,56 +936,6 @@ fn add_scaled_error(target: &mut InternalPixel, diff: InternalPixel, scale: f32)
     target.r += diff.r * scale;
     target.g += diff.g * scale;
     target.b += diff.b * scale;
-}
-
-fn nearest_palette(color: InternalPixel, palette: &[(InternalPixel, [u8; 4])]) -> usize {
-    palette
-        .iter()
-        .enumerate()
-        .min_by(|(_, a), (_, b)| {
-            color
-                .diff(a.0)
-                .partial_cmp(&color.diff(b.0))
-                .unwrap_or(Ordering::Equal)
-        })
-        .map(|(idx, _)| idx)
-        .unwrap_or(0)
-}
-
-fn nearest_internal_color_with_hint(
-    color: InternalPixel,
-    palette: &[InternalPixel],
-    hint: usize,
-) -> usize {
-    if palette.is_empty() {
-        return 0;
-    }
-
-    let mut best_idx = hint.min(palette.len().saturating_sub(1));
-    let mut best_diff = color.diff(palette[best_idx]);
-
-    for (idx, candidate) in palette.iter().enumerate() {
-        let diff = color.diff(*candidate);
-        if diff < best_diff {
-            best_diff = diff;
-            best_idx = idx;
-        }
-    }
-
-    best_idx
-}
-
-fn nearest_internal_color_distance(
-    color: InternalPixel,
-    palette: &[InternalPixel],
-    hint: usize,
-) -> f32 {
-    if palette.is_empty() {
-        return 0.0;
-    }
-
-    let idx = nearest_internal_color_with_hint(color, palette, hint);
-    color.diff(palette[idx])
 }
 
 fn channel_value(color: InternalPixel, channel: usize) -> f32 {

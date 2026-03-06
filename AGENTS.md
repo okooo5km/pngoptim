@@ -127,8 +127,8 @@
 ### 当前硬阻塞与下一步
 1. 当前 R2.1 量化主链已把 `demo.png` 的默认输出质量从 `quality_score=45` 提升到 `56`，但在 `--quality 65-75` 下仍只有 `actual=57`，尚未满足最低质量门槛。
 2. naive 全图 Floyd 已被证明方向错误：会放大输出并拉低质量，后续必须实现 `dither map + selective dithering`，不能把全图误差扩散当作 pngquant 等价物。
-3. R2.1 已引入 feedback-style palette search 与一次真实像素 remap 收敛，但 `perf-002-large-alpha-pattern` 仍从基线约 `33s` 回退到约 `104s`，性能收口仍是硬阻塞。
-4. 当前最合理的执行顺序仍是：`R2.2 selective remap refinement` -> `R3 VP-tree + selective dithering` -> `E 回归优化`。
+3. `Nearest` 结构已按 `libimagequant/src/nearest.rs` 的 VP-tree 思路接入主线，原先的 perf 大回退已显著收回；当前主要缺口重新回到质量与 remap/dither 主链，而不是 nearest search。
+4. 当前最合理的执行顺序仍是：`R2.2 remap-to-palette style feedback` -> `R3 dither map + selective dithering` -> `E 回归优化`。
 
 ### 最近更新
 1. 2026-03-05：确认参考仓库本地路径与远程可达性，并锁定 `main` 分支 commit。
@@ -171,6 +171,8 @@
 38. 2026-03-06：完成 R2.1 第一版反馈式 palette search：将 `target_mse` 与 `feedback_loop_trials` 接入 Rust quantizer，并把 histogram 权重反馈到后续 median cut；`compat` 通过（`reports/compat/r2-1d-compat-verify/summary.md`），`smoke` 通过（`reports/smoke/r2-1d-smoke-verify/summary.md`）。
 39. 2026-03-06：为中等复杂度直方图新增 1 次真实像素 remap 收敛，`demo.png` 默认输出提升到 `quality_score=56`, `quality_mse=14.644`, `131278 bytes`；但 `--quality 65-75` 仍失败（`actual=57`），且 `perf-002-large-alpha-pattern` 仍为当前主要性能回退样本（`104049.867 ms`）。
 40. 2026-03-06：确认算法推进方法调整为 `reference-first`：后续 R2/R3 只按 `pngquant.c`、`libimagequant/src/attr.rs`、`quant.rs`、`mediancut.rs`、`kmeans.rs`、`nearest.rs`、`remap.rs` 的对应模块逐段复刻，不再以“自拟近似方案”为主。
+41. 2026-03-06：完成 R2.2 第一步 `nearest.rs` 对齐：引入 VP-tree 风格 nearest search、likely-index 提前命中和 nearest-other-color 距离剪枝，并切换 kmeans/remap/dither/pixel-refine 全部调用点；`compat` 通过（`reports/compat/r2-2-compat-verify/summary.md`），`smoke` 通过（`reports/smoke/r2-2-smoke-verify/summary.md`）。
+42. 2026-03-06：`Nearest` 对齐后，perf 样本显著恢复：`perf-001-large-gradient-noise` 从 `35490.128 ms` 降到 `5085.685 ms`，`perf-002-large-alpha-pattern` 从 `104049.867 ms` 降到 `11901.303 ms`；`demo.png` 质量保持在 `quality_score=56/57`，说明下一步瓶颈已转移到 `remap.rs` / selective dithering。
 
 ### 更新规则
 1. 每次推进必须更新对应阶段状态：`Not Started` / `In Progress` / `Blocked` / `Done`。

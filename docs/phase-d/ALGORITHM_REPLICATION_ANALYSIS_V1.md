@@ -215,22 +215,21 @@
 - 当前缺口：搜索过程已具备反馈式雏形，但还没有达到 `libimagequant` 那种围绕 `target_mse/max_mse` 的稳定收缩闭环。
 - 参考：`quality -> target_mse/max_mse -> feedback loop -> 满足质量约束的更小 palette`。
 
-### 7.2 palette search 与 remap refine 已进入正确方向，但仍未达到参考实现
+### 7.2 palette search、remap refine 与 nearest search 已进入正确方向，但仍未达到参考实现
 
-- 当前：R2 已替换掉旧桶统计截断量化器，R2.1 又补上了 feedback-style palette search、unused color replacement 和 1 次真实像素 remap 收敛，见 [`src/palette_quant.rs`](/Users/5km/Dev/Rust/pngoptim/src/palette_quant.rs)。
-- 当前缺口：仍缺少 `libimagequant` 风格更稳定的多轮 palette 缩减、VP-tree nearest 和 selective dithering/dither map。
+- 当前：R2 已替换掉旧桶统计截断量化器，R2.1 补上了 feedback-style palette search、unused color replacement 和 1 次真实像素 remap 收敛；R2.2 又补上了 VP-tree 风格 nearest search 与 likely-index 剪枝，见 [`src/palette_quant.rs`](/Users/5km/Dev/Rust/pngoptim/src/palette_quant.rs)。
+- 当前缺口：仍缺少 `libimagequant` 风格更稳定的 remap-to-palette feedback、dither map 和 selective dithering。
 
 这条链路当前仍然缺少：
 
 1. 更稳定的 feedback loop palette 缩减。
 2. remap 阶段继续累计统计并回灌 palette。
-3. VP-tree nearest。
-4. `dither map + selective Floyd`。
+3. `dither map + selective Floyd`。
 
 ### 7.3 remap / dithering 仍是最大架构缺口
 
 - 当前：[`src/pipeline.rs`](/Users/5km/Dev/Rust/pngoptim/src/pipeline.rs) 已改为优先评估非抖动结果，再在抖动开启时对抖动结果做“择优采用”。
-- 当前：[`src/palette_quant.rs`](/Users/5km/Dev/Rust/pngoptim/src/palette_quant.rs) 中的抖动仍是 naive 全图误差扩散，不是 `libimagequant` 的 dither map + selective Floyd。
+- 当前：[`src/palette_quant.rs`](/Users/5km/Dev/Rust/pngoptim/src/palette_quant.rs) 已补上 VP-tree 风格 nearest，但抖动仍是 naive 全图误差扩散，不是 `libimagequant` 的 dither map + selective Floyd。
 - 已验证：naive 全图 Floyd 在真实样本上会同时拉低质量并放大体积，因此只能作为受保护的实验路径，不能视为参考实现等价物。
 
 这意味着当前 `--floyd` 兼容的是参数形状，不是算法行为。
@@ -265,6 +264,14 @@ pngquant /Users/5km/Downloads/demo.png --output /tmp/pngquant-demo-q6575.png --q
 1. R2.1 证明当前主要收益确实来自 palette search + remap refine，而不是 PNG 编码尾部微调。
 2. 在真正可比的 `--quality 65-75` 场景下，当前实现仍直接失败，而 `pngquant` 可以在满足质量门槛的同时输出 `136,915` bytes。
 3. 这说明当前缺口已经从“完全走错方向”收窄为“还差更成熟的 remap/search/dither 主链”。
+
+补充观测（R2.2 / `nearest.rs` 对齐）：
+
+1. `reports/smoke/r2-2-smoke-verify/smoke_report.csv` 显示 perf 样本已明显恢复：
+   - `perf-001-large-gradient-noise`: `5085.685 ms`
+   - `perf-002-large-alpha-pattern`: `11901.303 ms`
+2. 说明 `nearest.rs` 对齐已经解决了此前的大部分搜索性能回退。
+3. 在这个前提下，下一步应把主要精力转到 `remap.rs` 的 palette feedback 与 selective dithering，而不是继续在 nearest search 上打补丁。
 
 结论：这不是编码器调优问题，主要差距来自 palette 搜索、remap 与 dithering 算法本身。
 
@@ -304,6 +311,6 @@ pngquant /Users/5km/Downloads/demo.png --output /tmp/pngquant-demo-q6575.png --q
 ## 10. 本轮结论
 
 1. 当前项目已经完成 Rust 工程化与发布链路，不再依赖 Python 编排。
-2. R1 已完成质量标尺纠偏，R2.1 已把量化器推进到 feedback-style search + 像素级 remap refine，但离参考实现仍有实质差距。
-3. 下一步不应回退到“再打一层小补丁”，而应继续完成更强的 remap 收敛、VP-tree nearest 和 selective dithering/dither map。
+2. R1 已完成质量标尺纠偏，R2.1 已把量化器推进到 feedback-style search + 像素级 remap refine，R2.2 又补上了 VP-tree 风格 nearest；离参考实现的主要剩余差距已经集中到 `remap.rs`。
+3. 下一步不应回退到“再打一层小补丁”，而应继续完成 remap-to-palette feedback、dither map 和 selective dithering。
 4. 复刻优先级应回到 Phase D 核心：先对齐质量语义、palette 搜索、remap/dither，再重新跑 E/F/G 回归。
