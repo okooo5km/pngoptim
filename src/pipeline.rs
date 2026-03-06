@@ -117,11 +117,17 @@ pub fn process_png_bytes(
         options.speed,
     )?;
     let encode_ms = t_encode.elapsed().as_secs_f64() * 1000.0;
-    if options.skip_if_larger && (png_data.len() as u64) > (input_bytes.len() as u64) {
-        return Err(AppError::OutputLarger {
-            input_bytes: input_bytes.len() as u64,
-            output_bytes: png_data.len() as u64,
-        });
+    if options.skip_if_larger {
+        let max_file_size =
+            skip_if_larger_max_file_size(input_bytes.len() as u64, candidate.quality.quality_score);
+        if (png_data.len() as u64) > max_file_size {
+            return Err(AppError::SkipIfLargerRejected {
+                input_bytes: input_bytes.len() as u64,
+                output_bytes: png_data.len() as u64,
+                maximum_file_size: max_file_size,
+                quality_score: candidate.quality.quality_score,
+            });
+        }
     }
     let total_ms = t_total.elapsed().as_secs_f64() * 1000.0;
 
@@ -355,6 +361,16 @@ fn remapped_rgba_from_indices(indices: &[u8], palette: &[[u8; 4]]) -> Vec<u8> {
         out.extend_from_slice(&px);
     }
     out
+}
+
+fn skip_if_larger_max_file_size(input_bytes: u64, quality_score: u8) -> u64 {
+    if input_bytes == 0 {
+        return 0;
+    }
+
+    let quality = f64::from(quality_score) / 100.0;
+    let expected_reduced_size = quality.powf(1.5).max(0.5);
+    ((input_bytes.saturating_sub(1)) as f64 * expected_reduced_size).floor() as u64
 }
 
 pub fn write_output_file(path: &Path, png_data: &[u8], force: bool) -> Result<(), AppError> {
@@ -622,6 +638,7 @@ mod tests {
     use super::{
         QuantizeCandidate, apply_posterize_palette, equal_score_mse_tolerance, indexed_bit_depth,
         pack_indices_by_bit_depth, remapped_rgba_from_indices, should_prefer_candidate,
+        skip_if_larger_max_file_size,
     };
     use crate::palette_quant::IndexedImage;
     use crate::quality::QualityMetrics;
@@ -729,5 +746,16 @@ mod tests {
             4
         ));
         assert!(equal_score_mse_tolerance(5.0, 5.5) < 0.6);
+    }
+
+    #[test]
+    fn skip_if_larger_requires_at_least_one_byte_of_savings_at_high_quality() {
+        assert_eq!(skip_if_larger_max_file_size(1_000, 100), 999);
+    }
+
+    #[test]
+    fn skip_if_larger_demands_stronger_savings_at_low_quality() {
+        assert_eq!(skip_if_larger_max_file_size(1_000, 10), 499);
+        assert_eq!(skip_if_larger_max_file_size(1_000, 75), 648);
     }
 }

@@ -15,9 +15,11 @@ pub enum AppError {
         minimum: u8,
         actual: u8,
     },
-    OutputLarger {
+    SkipIfLargerRejected {
         input_bytes: u64,
         output_bytes: u64,
+        maximum_file_size: u64,
+        quality_score: u8,
     },
 }
 
@@ -28,7 +30,7 @@ impl AppError {
             AppError::Io { .. } => 3,
             AppError::Decode(_) | AppError::Encode(_) => 4,
             AppError::QualityTooLow { .. } => 98,
-            AppError::OutputLarger { .. } => 99,
+            AppError::SkipIfLargerRejected { .. } => 99,
         }
     }
 
@@ -53,13 +55,15 @@ impl fmt::Display for AppError {
             AppError::QualityTooLow { minimum, actual } => {
                 write!(f, "quality too low: actual={actual}, minimum={minimum}")
             }
-            AppError::OutputLarger {
+            AppError::SkipIfLargerRejected {
                 input_bytes,
                 output_bytes,
+                maximum_file_size,
+                quality_score,
             } => write!(
                 f,
-                "output would be larger: input={} bytes, output={} bytes",
-                input_bytes, output_bytes
+                "skip-if-larger rejected output: input={} bytes, output={} bytes, max_allowed={} bytes, quality_score={}",
+                input_bytes, output_bytes, maximum_file_size, quality_score
             ),
         }
     }

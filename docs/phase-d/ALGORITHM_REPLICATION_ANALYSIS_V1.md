@@ -264,9 +264,9 @@ pngquant /Users/5km/Downloads/demo.png --output /tmp/pngquant-demo-q6575.png --q
 1. R2.1 到 RF-6 的轨道判断是对的：当前主要收益确实来自 palette search + remap 主链，而不是 PNG 编码尾部微调。
 2. RF-4 第二段把 `importance_map` 接入 histogram/remap，并让 dither 路径在进入 selective Floyd 前先做一次 plain remap feedback 后，`demo.png` 从长期停滞的 `quality_score=56/57` 直接提升到默认 `77`、`--quality 65-75` 下 `75`。
 3. 这说明此前真正缺的不是 nearest search 或候选选择，而是 `importance/remap feedback` 没有贯通到 dither 分支。
-4. RF-6 第一段 same-score size-aware 决策仍然有效，但它不再是主瓶颈；当前主要剩余问题已经收敛到 `background-aware dithering`、更完整的 `dither decision` 和 `skip-if-larger` 的 quality/size 联动。
-5. 单样本 spot check 已过门槛，不等于整条复刻轨道已收口；仍需重跑更广样本上的 quality/perf/stability 门禁。
-6. 当前阶段可以明确排除的方向是：继续在 nearest search 上打补丁，或者把问题归因到编码器末端微调。
+4. RF-5 后续又补了透明区域/近透明像素的 plain-match fallback，把参考实现中“静态背景/透明区域避免抖动伪影”的思路收敛成当前 PNG CLI 可落地的版本。
+5. RF-6 现已完成：same-score size-aware 决策与 `skip-if-larger` 的 quality/size 联动都已接入，`skip-if-larger` 不再是“只要输出更大就失败”的粗糙规则。
+6. RF-7 本地门禁已通过：`quality-size`、`perf`、`stability`、`release-check` 均为 pass。当前剩余动作主要是跨平台复核，以及评估是否要把显式 background 图像分支产品化。
 
 补充观测（R2.2 / `nearest.rs` 对齐）：
 
@@ -322,15 +322,15 @@ pngquant /Users/5km/Downloads/demo.png --output /tmp/pngquant-demo-q6575.png --q
 3. 对齐 serpentine 扫描与 `max_dither_error`。
 4. 对齐 background-aware dithering。
 5. 状态：`Partially Done`
-6. 已完成 contrast-map 驱动的 selective Floyd core subset；剩余 background-aware 分支和更强的 dither 决策仍待补齐。
+6. 已完成 contrast-map 驱动的 selective Floyd core subset，并补上透明区域/近透明像素的 plain-match fallback；剩余显式 background 图像分支仍待补齐。
 
 ### RF-6. `pngquant.c` + `quant.rs` 决策层
 
 1. 对齐 `skip-if-larger` 启发式。
 2. 对齐 remap 后质量决策与退出条件。
 3. 对齐输出决策与质量/尺寸联动逻辑。
-4. 状态：`Partially Done`
-5. 已完成 same-score 候选的 size-aware 选择；剩余 `skip-if-larger` 质量损失/体积收益启发式仍待补齐。
+4. 状态：`Done`
+5. 已完成 same-score 候选的 size-aware 选择，并对齐 `skip-if-larger` 的质量损失/体积收益启发式。
 
 ### RF-7. 全门禁收口
 
@@ -338,7 +338,8 @@ pngquant /Users/5km/Downloads/demo.png --output /tmp/pngquant-demo-q6575.png --q
 2. 重跑 `perf`。
 3. 重跑 `stability` / `cross-platform` / `release-check`。
 4. 更新公开发布资产与阶段结论。
-5. 状态：`Pending`
+5. 状态：`In Progress`
+6. 当前结果：本地 `quality-size` / `perf` / `stability` / `release-check` 已全部通过，跨平台复核待 CI。
 
 ### 最后才回到编码与体积微调
 
@@ -353,5 +354,5 @@ pngquant /Users/5km/Downloads/demo.png --output /tmp/pngquant-demo-q6575.png --q
 
 1. 当前项目已经完成 Rust 工程化与发布链路，不再依赖 Python 编排。
 2. 当前计划需要调整的点不在“大方向”，而在执行粒度：算法轨道必须从粗粒度 `R1/R2/R3` 改成模块驱动的 `RF-1 .. RF-7`。
-3. 下一步不应回退到“再打一层小补丁”，而应按 `RF-4 收口 -> RF-5 收口 -> RF-6 启发式收口 -> RF-7` 顺序推进。
-4. 复刻优先级应回到 Phase D 核心：先对齐质量语义、palette 搜索、remap/dither，再重新跑 E/F/G 回归。
+3. 当前不应再回到“凭感觉打补丁”的模式；最合理的下一步是用 CI 做跨平台复核，确认 RF-7 可以正式收口。
+4. 若跨平台结果稳定，则算法轨道可以从“实现主链收口”切换到“是否产品化显式 background 图像分支”的决策阶段。

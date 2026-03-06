@@ -48,7 +48,7 @@ target/release/pngoptim dataset/functional/pngquant_test.png dataset/functional/
 2. `--speed 1..11`：编码速度档位
 3. `--strip`：剥离元数据
 4. `--posterize 0..8`：色阶量化
-5. `--skip-if-larger`：若输出更大则失败并返回 99
+5. `--skip-if-larger`：若压缩收益不足以匹配当前质量损失则失败并返回 99
 6. `--force`：允许覆盖输出文件
 7. `--quiet`：静默模式
 
@@ -62,7 +62,7 @@ target/release/pngoptim dataset/functional/pngquant_test.png dataset/functional/
 3. `3`：I/O 错误
 4. `4`：解码/编码错误
 5. `98`：质量门禁失败
-6. `99`：输出大于输入且启用 `--skip-if-larger`
+6. `99`：启用 `--skip-if-larger` 且压缩收益不足以覆盖质量损失
 
 ## 6. 工程命令（xtask）
 

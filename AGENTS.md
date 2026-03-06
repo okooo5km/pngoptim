@@ -122,7 +122,7 @@
 ### 附加产品轨道
 | 轨道 | 状态 | 当前焦点 | 证据/报告 |
 |---|---|---|---|
-| Algorithm Replication | In Progress | 对齐 `pngquant/libimagequant` 的核心量化主链 | `docs/phase-d/ALGORITHM_REPLICATION_ANALYSIS_V1.md` |
+| Algorithm Replication | In Progress | RF-7 本地门禁收口，待跨平台复核 | `docs/phase-d/ALGORITHM_REPLICATION_ANALYSIS_V1.md` |
 
 ### Algorithm Replication 新规划（Reference-First）
 | 子阶段 | 状态 | 参考模块 | 目标 | 当前结论 |
@@ -131,15 +131,15 @@
 | RF-2 | Partially Done | `quant.rs` + `mediancut.rs` + `kmeans.rs` | 对齐 feedback loop、palette search、unused color replacement | 已有骨架，但误差约束收缩仍不稳定 |
 | RF-3 | Done | `nearest.rs` | 对齐 VP-tree nearest、likely-index、剪枝逻辑 | 已完成，性能回退已大幅收回 |
 | RF-4 | Partially Done | `remap.rs::remap_to_palette` | 对齐 remap 阶段 palette 统计回灌、background/importance 处理 | plain remap 回灌、importance 权重与 dither 前 remap 已接入，剩余显式 background 分支 |
-| RF-5 | Partially Done | `remap.rs::dither_map` + `remap_to_palette_floyd` | 对齐 dither map、selective Floyd、background-aware 分支 | core subset 已接入，background-aware 与质量收益仍不足 |
-| RF-6 | Partially Done | `pngquant.c` + `quant.rs` | 对齐 `skip-if-larger` 启发式和 remap 后质量决策 | same-score 候选已按更小输出优先，完整启发式仍缺 |
-| RF-7 | Pending | 全链路 | 重跑 quality/perf/stability/release 门禁，形成新基线 | 在 RF-4/5 完成后执行 |
+| RF-5 | Partially Done | `remap.rs::dither_map` + `remap_to_palette_floyd` | 对齐 dither map、selective Floyd、background-aware 分支 | core subset、透明区域 plain-fallback 已接入，剩余显式 background 图像分支 |
+| RF-6 | Done | `pngquant.c` + `quant.rs` | 对齐 `skip-if-larger` 启发式和 remap 后质量决策 | same-score size-aware 与 `skip-if-larger` 质量/体积联动均已接入 |
+| RF-7 | In Progress | 全链路 | 重跑 quality/perf/stability/release 门禁，形成新基线 | 本地 quality/perf/stability/release 已通过，待跨平台复核 |
 
 ### 当前硬阻塞与下一步
 1. `demo.png` spot check 已出现实质跃迁：默认输出提升到 `130792 bytes`, `quality_score=77`, `quality_mse=7.091`；`--quality 65-75` 现可成功输出 `125259 bytes`, `quality_score=75`, `quality_mse=7.618`。此前长期卡住的 `actual=57 < minimum=65` 已解除。
 2. 这轮收益来自两处主链对齐：`importance_map` 已进入 histogram/remap 权重，且 dither 路径不再绕开 plain remap feedback，而是先做一次 remap 回灌再进入 selective Floyd。
 3. `compat` 与 `smoke` 已验证无回归（`reports/compat/rf4-importance-verify/summary.md`、`reports/smoke/rf4-importance-smoke/summary.md`），说明当前收益不是以基本行为破坏换来的。
-4. 当前最合理的执行顺序已更新为：`RF-5 background-aware / dither decision 收口` -> `RF-6 skip-if-larger 启发式收口` -> `RF-7 全门禁回归`。`RF-4` 仍未完全关闭的部分主要是显式 background 分支。
+4. RF-7 本地门禁已全部通过：`quality-size`、`perf`、`stability`、`release-check` 均为 pass。当前剩余动作主要是跨平台复核，以及评估是否有必要把 `libimagequant` 的显式 background 图像分支产品化到当前 PNG CLI。
 
 ### 最近更新
 1. 2026-03-05：确认参考仓库本地路径与远程可达性，并锁定 `main` 分支 commit。
@@ -190,6 +190,9 @@
 46. 2026-03-06：启动 RF-6 第一段决策层对齐：同一色数下 plain/dither 候选在相同 `quality_score` 且 MSE 接近时，改为优先保留更小输出的候选；`compat` 通过（`reports/compat/rf6-compat-verify/summary.md`），`smoke` 通过（`reports/smoke/rf6-smoke-verify/summary.md`），`q_gradient_photo_like` 进一步降到 `327981 bytes`（`quality_score=70`, `quality_mse=9.215`）。但 `demo.png` 仍保持在 `131919 bytes`, `quality_score=56`，说明 RF-6 只能改善候选选择，无法替代质量主链收口。
 47. 2026-03-06：修复 Phase F 跨平台聚合门禁再次误判的问题：`xtask cross-platform aggregate` 新增 `--strict-size-ratio` 与 `--strict-output-bytes`，默认将 `size_ratio_*` 漂移和样本输出字节差异降为 advisory，仅在显式 strict 模式下阻断；并补充 `xtask` 端到端单测覆盖默认告警/严格失败两条路径，防止同类 CI 回归。
 48. 2026-03-06：继续对齐 `libimagequant` 的 `hist.rs` / `remap.rs`：将 `importance_map` 接入 histogram 与 plain remap feedback 权重，并让 dither 路径在 selective Floyd 前先执行一次 plain remap 回灌；`compat` 通过（`reports/compat/rf4-importance-verify/summary.md`），`smoke` 通过（`reports/smoke/rf4-importance-smoke/summary.md`）。`demo.png` spot check 提升到默认 `130792 bytes`, `quality_score=77`，`--quality 65-75` 可输出 `125259 bytes`, `quality_score=75`。
+49. 2026-03-06：继续收口 RF-5：为 selective Floyd 增加透明区域/近透明像素的 plain-match fallback，避免 dithering 在透明边缘制造伪影；`compat` 通过（`reports/compat/rf5-transparent-verify/summary.md`），`smoke` 通过（`reports/smoke/rf5-transparent-smoke/summary.md`），`demo.png` spot check 结果保持稳定（默认 `130791 bytes`, `quality_score=77`；`--quality 65-75` 为 `125255 bytes`, `quality_score=75`）。
+50. 2026-03-06：完成 RF-6 决策层收口：`skip-if-larger` 已从“输出大于输入则失败”改为对齐 `pngquant` 的质量/体积联动启发式（`quality^1.5`，最低 50% 收益门槛），退出码仍保持 `99`；`compat` 通过（`reports/compat/rf6-skip-verify/summary.md`），`smoke` 通过（`reports/smoke/rf6-skip-smoke/summary.md`）。
+51. 2026-03-06：启动 RF-7 全门禁回归并完成本地收口：`quality-size` 通过（`reports/quality-size/rf7-quality-size/summary.md`，7/7 failed=0），`perf` 通过（`reports/perf/rf7-perf/summary.md`，mean `3490.456 ms`，p95 `16535.485 ms`，failed=0），`stability` 通过（`reports/stability/rf7-stability/summary.md`，0 crash_like / 0 failures），`release-check` 通过（`reports/release/rf7-release-check/summary.md`）。算法轨道已进入“待跨平台复核”的最终阶段。
 
 ### 更新规则
 1. 每次推进必须更新对应阶段状态：`Not Started` / `In Progress` / `Blocked` / `Done`。

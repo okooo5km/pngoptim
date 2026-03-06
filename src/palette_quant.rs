@@ -1035,12 +1035,15 @@ fn remap_image_dithered(
                 pixels[idx],
             );
 
-            let guess = if !dither_map.is_empty() {
+            let plain_idx = if !dither_map.is_empty() {
                 plain_pass.indices[idx] as usize
             } else {
                 last_match
             };
-            let (pal_idx, _) = tree.search(color, guess);
+            let (mut pal_idx, _) = tree.search(color, plain_idx);
+            if should_prefer_plain_match(pixels[idx], plain_idx, pal_idx, &palette_points) {
+                pal_idx = plain_idx;
+            }
             last_match = pal_idx;
             indices[idx] = pal_idx as u8;
             counts[pal_idx] += 1;
@@ -1081,6 +1084,34 @@ fn remap_image_dithered(
         .collect::<Vec<_>>();
 
     (remapped_palette, indices, counts)
+}
+
+fn should_prefer_plain_match(
+    input: InternalPixel,
+    plain_idx: usize,
+    dithered_idx: usize,
+    palette_points: &[InternalPixel],
+) -> bool {
+    if plain_idx == dithered_idx || palette_points.is_empty() {
+        return false;
+    }
+
+    let Some(&plain) = palette_points.get(plain_idx) else {
+        return false;
+    };
+    let Some(&dithered) = palette_points.get(dithered_idx) else {
+        return false;
+    };
+
+    if !is_transparentish(input) && !is_transparentish(plain) && !is_transparentish(dithered) {
+        return false;
+    }
+
+    input.diff(plain) <= input.diff(dithered) * 1.02
+}
+
+fn is_transparentish(px: InternalPixel) -> bool {
+    px.a <= 8.0 / 255.0 * 0.625
 }
 
 fn get_dithered_pixel(
@@ -1373,7 +1404,7 @@ mod tests {
     use super::{
         InternalPixel, QuantizerSettings, apply_remap_feedback, gamma_lut,
         max_colors_from_quality_speed, quantize_indexed, quantizer_settings, remap_image_dithered,
-        remap_image_plain_pass,
+        remap_image_plain_pass, should_prefer_plain_match,
     };
     use crate::quality::{DitherMapMode, SRGB_OUTPUT_GAMMA};
 
@@ -1464,5 +1495,23 @@ mod tests {
         assert_eq!(indices.len(), 2);
         assert_eq!(counts[0], 2);
         assert_eq!(palette[0].1, plain_palette[0].1);
+    }
+
+    #[test]
+    fn transparent_pixels_prefer_plain_match_when_dither_is_worse() {
+        let gamma = gamma_lut(SRGB_OUTPUT_GAMMA);
+        let input = InternalPixel::from_rgba(&gamma, &[32, 32, 32, 6]);
+        let palette = vec![
+            InternalPixel::from_rgba(&gamma, &[0, 0, 0, 0]),
+            InternalPixel::from_rgba(&gamma, &[255, 0, 0, 255]),
+        ];
+
+        assert!(should_prefer_plain_match(input, 0, 1, &palette));
+        assert!(!should_prefer_plain_match(
+            InternalPixel::from_rgba(&gamma, &[255, 0, 0, 255]),
+            0,
+            1,
+            &palette,
+        ));
     }
 }
