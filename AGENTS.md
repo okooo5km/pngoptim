@@ -124,11 +124,22 @@
 |---|---|---|---|
 | Algorithm Replication | In Progress | 对齐 `pngquant/libimagequant` 的核心量化主链 | `docs/phase-d/ALGORITHM_REPLICATION_ANALYSIS_V1.md` |
 
+### Algorithm Replication 新规划（Reference-First）
+| 子阶段 | 状态 | 参考模块 | 目标 | 当前结论 |
+|---|---|---|---|---|
+| RF-1 | Done | `pngquant.c` + `attr.rs` | 对齐 `quality/speed` 语义、预算和门禁标尺 | `quality <-> MSE` 已接通 |
+| RF-2 | Partially Done | `quant.rs` + `mediancut.rs` + `kmeans.rs` | 对齐 feedback loop、palette search、unused color replacement | 已有骨架，但误差约束收缩仍不稳定 |
+| RF-3 | Done | `nearest.rs` | 对齐 VP-tree nearest、likely-index、剪枝逻辑 | 已完成，性能回退已大幅收回 |
+| RF-4 | In Progress | `remap.rs::remap_to_palette` | 对齐 remap 阶段 palette 统计回灌、background/importance 处理 | 当前最关键缺口 |
+| RF-5 | Pending | `remap.rs::dither_map` + `remap_to_palette_floyd` | 对齐 dither map、selective Floyd、background-aware 分支 | 当前未实现 |
+| RF-6 | Pending | `pngquant.c` + `quant.rs` | 对齐 `skip-if-larger` 启发式和 remap 后质量决策 | 当前仍是粗糙版 |
+| RF-7 | Pending | 全链路 | 重跑 quality/perf/stability/release 门禁，形成新基线 | 在 RF-4/5 完成后执行 |
+
 ### 当前硬阻塞与下一步
 1. 当前 R2.1 量化主链已把 `demo.png` 的默认输出质量从 `quality_score=45` 提升到 `56`，但在 `--quality 65-75` 下仍只有 `actual=57`，尚未满足最低质量门槛。
 2. naive 全图 Floyd 已被证明方向错误：会放大输出并拉低质量，后续必须实现 `dither map + selective dithering`，不能把全图误差扩散当作 pngquant 等价物。
 3. `Nearest` 结构已按 `libimagequant/src/nearest.rs` 的 VP-tree 思路接入主线，原先的 perf 大回退已显著收回；当前主要缺口重新回到质量与 remap/dither 主链，而不是 nearest search。
-4. 当前最合理的执行顺序仍是：`R2.2 remap-to-palette style feedback` -> `R3 dither map + selective dithering` -> `E 回归优化`。
+4. 当前最合理的执行顺序已经调整为：`RF-4 remap_to_palette 对齐` -> `RF-5 dither map + selective Floyd` -> `RF-6 skip-if-larger / 质量决策对齐` -> `RF-7 全门禁回归`。
 
 ### 最近更新
 1. 2026-03-05：确认参考仓库本地路径与远程可达性，并锁定 `main` 分支 commit。
@@ -173,6 +184,7 @@
 40. 2026-03-06：确认算法推进方法调整为 `reference-first`：后续 R2/R3 只按 `pngquant.c`、`libimagequant/src/attr.rs`、`quant.rs`、`mediancut.rs`、`kmeans.rs`、`nearest.rs`、`remap.rs` 的对应模块逐段复刻，不再以“自拟近似方案”为主。
 41. 2026-03-06：完成 R2.2 第一步 `nearest.rs` 对齐：引入 VP-tree 风格 nearest search、likely-index 提前命中和 nearest-other-color 距离剪枝，并切换 kmeans/remap/dither/pixel-refine 全部调用点；`compat` 通过（`reports/compat/r2-2-compat-verify/summary.md`），`smoke` 通过（`reports/smoke/r2-2-smoke-verify/summary.md`）。
 42. 2026-03-06：`Nearest` 对齐后，perf 样本显著恢复：`perf-001-large-gradient-noise` 从 `35490.128 ms` 降到 `5085.685 ms`，`perf-002-large-alpha-pattern` 从 `104049.867 ms` 降到 `11901.303 ms`；`demo.png` 质量保持在 `quality_score=56/57`，说明下一步瓶颈已转移到 `remap.rs` / selective dithering。
+43. 2026-03-06：对算法复刻轨道重新规划，废弃过粗的 `R1/R2/R3` 执行粒度，改为 `RF-1 .. RF-7` 的 reference-first 模块计划；后续不再按“先写近似实现再逐步修正”的方式推进。
 
 ### 更新规则
 1. 每次推进必须更新对应阶段状态：`Not Started` / `In Progress` / `Blocked` / `Done`。

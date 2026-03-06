@@ -275,33 +275,69 @@ pngquant /Users/5km/Downloads/demo.png --output /tmp/pngquant-demo-q6575.png --q
 
 结论：这不是编码器调优问题，主要差距来自 palette 搜索、remap 与 dithering 算法本身。
 
-## 9. 复刻策略建议
+## 9. 复刻策略建议（已重规划为 Reference-First 模块路线）
 
-建议按下面顺序替换核心实现，而不是继续在当前量化器上打补丁：
+原先的 `R1/R2/R3/R4` 粒度过粗，容易把“参考实现驱动”重新滑回“边写边猜”。当前已改为按参考模块推进：
 
-### R1. 先复刻 `quality` / `speed` 语义
+### RF-1. `pngquant.c` + `attr.rs`
 
 1. 引入 `quality_to_mse()` / `mse_to_quality()`。
 2. 让 `--quality` 真正转为 `target_mse` / `max_mse`。
 3. 让 `speed` 驱动搜索预算、posterization、dither-map 策略。
+4. 状态：`Done`
 
-### R2. 重写 histogram 与 palette search
+### RF-2. `quant.rs` + `mediancut.rs` + `kmeans.rs`
 
 1. 引入 gamma-aware 浮点感知空间。
 2. 引入感知权重直方图与自适应 posterization。
 3. 引入 mediancut + feedback loop。
 4. 引入 remap 前后的 k-means refinement。
+5. 状态：`Partially Done`
+6. 剩余缺口：feedback loop 收缩还不够稳定，remap 后 palette 回灌还没按 `remap_to_palette()` 结构做。
 
-### R3. 重写 remap / dither 路径
+### RF-3. `nearest.rs`
 
 1. 引入 VP-tree nearest。
-2. 引入 remap 阶段 palette 再收敛。
-3. 引入 selective Floyd + dither map。
-4. 再对 `--floyd`、`--ordered`、背景透明处理做兼容性校验。
+2. 引入 likely-index 提前命中。
+3. 引入 nearest-other-color 距离剪枝。
+4. 状态：`Done`
+5. 结果：perf 回退已大幅收回。
 
-### R4. 最后回到编码与体积微调
+### RF-4. `remap.rs::remap_to_palette`
 
-当 palette / remap 算法对齐后，再做：
+1. 对齐 remap 时的 palette 统计回灌。
+2. 对齐 background 分支。
+3. 对齐 importance-map 权重入口。
+4. 对齐 remap error 计算口径。
+5. 状态：`In Progress`
+6. 这是当前主优先级。
+
+### RF-5. `remap.rs::dither_map` + `remap_to_palette_floyd`
+
+1. 引入 dither map。
+2. 引入 selective Floyd，而不是全图误差扩散。
+3. 对齐 serpentine 扫描与 `max_dither_error`。
+4. 对齐 background-aware dithering。
+5. 状态：`Pending`
+
+### RF-6. `pngquant.c` + `quant.rs` 决策层
+
+1. 对齐 `skip-if-larger` 启发式。
+2. 对齐 remap 后质量决策与退出条件。
+3. 对齐输出决策与质量/尺寸联动逻辑。
+4. 状态：`Pending`
+
+### RF-7. 全门禁收口
+
+1. 重跑 `quality-size`。
+2. 重跑 `perf`。
+3. 重跑 `stability` / `cross-platform` / `release-check`。
+4. 更新公开发布资产与阶段结论。
+5. 状态：`Pending`
+
+### 最后才回到编码与体积微调
+
+当 RF-4 / RF-5 / RF-6 对齐后，再做：
 
 1. palette 排序策略细化。
 2. `tRNS` 裁剪与透明索引排序。
@@ -311,6 +347,6 @@ pngquant /Users/5km/Downloads/demo.png --output /tmp/pngquant-demo-q6575.png --q
 ## 10. 本轮结论
 
 1. 当前项目已经完成 Rust 工程化与发布链路，不再依赖 Python 编排。
-2. R1 已完成质量标尺纠偏，R2.1 已把量化器推进到 feedback-style search + 像素级 remap refine，R2.2 又补上了 VP-tree 风格 nearest；离参考实现的主要剩余差距已经集中到 `remap.rs`。
-3. 下一步不应回退到“再打一层小补丁”，而应继续完成 remap-to-palette feedback、dither map 和 selective dithering。
+2. 当前计划需要调整的点不在“大方向”，而在执行粒度：算法轨道必须从粗粒度 `R1/R2/R3` 改成模块驱动的 `RF-1 .. RF-7`。
+3. 下一步不应回退到“再打一层小补丁”，而应按 `RF-4 -> RF-5 -> RF-6 -> RF-7` 顺序推进。
 4. 复刻优先级应回到 Phase D 核心：先对齐质量语义、palette 搜索、remap/dither，再重新跑 E/F/G 回归。
