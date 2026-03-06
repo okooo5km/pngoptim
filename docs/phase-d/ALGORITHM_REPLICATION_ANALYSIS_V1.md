@@ -371,21 +371,22 @@ pngquant /Users/5km/Downloads/demo.png --output /tmp/pngq-q6575-audit.png --qual
 
 | 场景 | 输出大小 | 质量结果 | 耗时 | 说明 |
 |---|---:|---:|---:|---|
-| 当前 `pngoptim --quality 65-75` | `144,803` bytes | `quality_score=89`, `quality_mse=3.105` | `0.73s` | 默认抖动继续向参考收敛 |
-| 当前 `pngoptim --quality 65-75 --floyd=0.5` | `133,985` bytes | `quality_score=90`, `quality_mse=2.789` | `参考样本 spot check` | 半强度抖动已非常接近参考体积 |
-| 当前 `pngoptim --quality 65-75 --nofs` | `107,965` bytes | `quality_score=91`, `quality_mse=2.430` | `0.72s` | 原始带 ICC 输入上已接近 `pngquant --nofs` |
+| 当前 `pngoptim --quality 65-75` | `150,443` bytes | `quality_score=88`, `quality_mse=3.457` | `release spot check` | 正确颜色管理接入后，默认抖动仍偏大 |
+| 当前 `pngoptim --quality 65-75 --floyd=0.5` | `待后续复测` | `-` | `-` | 这轮重点已转到正确颜色管理，不再用半强度抖动作主结论 |
+| 当前 `pngoptim --quality 65-75 --nofs` | `105,433` bytes | `quality_score=91`, `quality_mse=2.524` | `release spot check` | 已非常接近 `pngquant --nofs` |
 | `pngquant --quality 65-75` | `136,915` bytes | `MSE=5.210 (Q=82)` | `0.55s` | 参考实现 |
 | `pngquant --quality 65-75 --nofs` | `104,038` bytes | `参考样本` | `0.45s` | 对照无抖动路径 |
 
 补充观测：
 
 1. `--quality 65-75` 路径已经不再依赖“baseline + targeted”双候选，慢路径缩短到了约 `1s`。
-2. 当前真正的硬根因已经确认有两处：
-   - 之前引入的 ICC 像素转换会把这张图的唯一颜色数从 `1499` 膨胀到 `9347`
+2. 当前真正的硬根因已经确认有三处：
+   - 之前错误的 ICC 像素转换会把这张图的唯一颜色数从 `1499` 膨胀到 `9347`
+   - 在彻底移除坏支路后，`normalize_rgba_to_srgb_if_needed()` 其实变成了空实现，导致带 Apple Display ICC 的输入被直接按 sRGB 字节量化
    - remap / Floyd 前没有像 `init_int_palette()` 那样先按输出精度 round palette
-3. 去掉坏的 ICC 转换、补齐“先 round 再 remap/dither”后，再把大图无 dither-map 时的 `edges` fallback 接回主线，原始带 ICC 输入上的默认抖动和半强度抖动都继续缩小，`--nofs` 保持在接近 `pngquant --nofs` 的区间。
-4. 当前继续做 reference-first 对齐后，`demo.png` 的体积没有再明显跳变，但 palette 对比已经暴露出更具体的剩余差异：`pngoptim` 仍会给棕色/强调色多留一档颜色，而 `pngquant` 会把同一预算更多分配给中间灰阶，这正是灰色阴影台阶感的主要来源之一。
-5. 这说明静态 PNG 主链当前剩余差距已从“基础量化完全跑偏”收敛到 palette 灰阶分配和 Floyd 细节，而不是继续在 histogram / mediancut 外层补护栏。
+3. 当前已用 Little CMS 正确补回 `ICC -> sRGB` 和 `gAMA + cHRM -> sRGB` 两条参考路径。对 `demo.png` 这类带 Apple Display ICC 的输入，灰阶 palette 已明显向 `pngquant` 靠拢，`--nofs` 体积也进一步收敛到 `105,433 bytes`。
+4. 但正确颜色管理接入后，默认抖动路径仍为 `150,443 bytes`，反而比 `pngquant` 默认的 `136,915 bytes` 更大。这说明当前默认路径的剩余问题已经高度集中到大图 selective Floyd / edges fallback，而不是输入色彩配置解析。
+5. palette 对比已经暴露出更具体的剩余差异：`pngoptim` 的灰阶分布虽然已明显改善，但在默认抖动路径上仍没有把 `pngquant` 那套大图边缘/平坦区域抖动策略完全复现。
 
 ### 10.2 本轮已修复的偏差
 
@@ -402,19 +403,19 @@ pngquant /Users/5km/Downloads/demo.png --output /tmp/pngq-q6575-audit.png --qual
 11. 对齐了 `hist.rs + mediancut.rs` 的两类关键细节：
    - histogram 不再做桶内平均色，改为“代表色 + perceptual weight + 16 cluster 起始箱”
    - mediancut 改为带 `total_box_error_below_target()` / `max_mse_per_color` / best-box split 的误差约束切分
-12. 移除了当前有害的 ICC 像素转换支路：现在保留 decoder 输出像素与原始色彩元数据，不再用错误转换把颜色基数从 `1499` 扩张到 `9347`。
+12. 移除了当前有害的 ICC 像素转换支路：不再用错误转换把颜色基数从 `1499` 扩张到 `9347`。
 13. 将 indexed PNG 编码默认策略对齐到 `pngquant` 的 `PNG_FILTER_NONE + Deflate Level(9)`，并在 `speed >= 10` 时降到 `Level(1)`。
 14. 将 plain remap / Floyd 的 palette 使用顺序改回与 `init_int_palette()` 一致：先按输出 posterize 精度 round palette，再做 remap/dither。
-15. 对大图默认 Floyd 补上一次 plain remap feedback，让未生成 dither-map 的路径也能拿到更接近 `remap_to_palette()` 的 full-image finalize。
-16. 保留 contrast maps 的 `edges` 图，并在大图未生成 dither-map 时退回使用 `edges` 作为选择性抖动图，而不是直接做“裸 Floyd”。
-17. histogram 在超出 `max_histogram_entries` 时会持续升级 input posterize 到 `3` bit 上限，VP-tree 的 histogram key 改为固定 `u32` identity hasher，K-Means / unused color replacement 改成 popularity-root vantage point，plain remap 的 `last_match` 也改为按行重置。
+15. 保留 contrast maps 的 `edges` 图，并在大图未生成 dither-map 时退回使用 `edges` 作为选择性抖动图，而不是直接做“裸 Floyd”。
+16. 重新引入正确的颜色管理：`src/pipeline.rs::normalize_rgba_to_srgb_if_needed()` 现已通过 Little CMS 支持 `ICC -> sRGB` 和 `gAMA + cHRM -> sRGB` 两条参考路径；无效 ICC 会回退原像素，不阻断主流程。
+17. histogram key 已改为 native-endian 打包，`U32Hasher` 也改回参考实现使用的 fxhash 常量乘法；importance 累计改为 `u32` 饱和加法，posterize 升级语义改为“请求 bits + 最多额外 1 bit”，plain remap 的 `last_match` 也改为按行重置。
 
 ### 10.3 仍然存在的关键偏差
 
 1. 当前 plain remap / dither remap 还没有完整实现 `remap.rs::remap_to_palette()` 的 full-image K-Means finalize 结构。
 2. 当前 selective dithering 虽然已接入 core subset，但还没达到 `remap_to_palette_floyd()` 的整套 chunk warmup / background-aware / guess 策略。
-3. 默认抖动路径当前仍比 `pngquant` 默认路径大约高 `7.9KB`，而且即便强制 `pngquant` 也只用 `18` 色，它仍然会把预算更多给中间灰而不是额外强调色，说明当前剩余差距已明确落在 palette 分配策略本身。
-4. `--quality` 路径速度已明显改善，但相对 `pngquant` 仍慢约 `2x`，说明 quantizer 内部仍有可继续收紧的预算与 finalize 开销。
+3. 默认抖动路径当前仍比 `pngquant` 默认路径大约高 `13.5KB`，但 `--nofs` 已只剩约 `1.4KB` 差距。这说明当前剩余差距已从 palette 搜索本身进一步收敛到大图 selective Floyd / edges fallback 细节。
+4. `--quality` 路径速度已明显改善，但相对 `pngquant` 仍慢，说明 quantizer 内部仍有可继续收紧的预算与 finalize 开销。
 
 ## 11. 当前判断
 

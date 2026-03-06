@@ -1,6 +1,6 @@
 use std::cmp::Ordering;
 use std::collections::HashMap;
-use std::hash::{BuildHasherDefault, Hasher};
+use std::hash::Hasher;
 
 use crate::quality::{
     DitherMapMode, InternalPixel, SRGB_OUTPUT_GAMMA, SpeedSettings, gamma_lut, quality_to_mse,
@@ -148,18 +148,26 @@ struct HistItem {
 
 #[derive(Default)]
 struct HistAccumulator {
-    importance_sum: f64,
+    importance_sum: u32,
     representative: [u8; 4],
     cluster_index: u8,
     initialized: bool,
 }
 
 #[derive(Default)]
-struct U32IdentityHasher(u32);
+struct U32HashBuilder(u32);
 
-impl Hasher for U32IdentityHasher {
+impl std::hash::BuildHasher for U32HashBuilder {
+    type Hasher = Self;
+
+    fn build_hasher(&self) -> Self {
+        Self(0)
+    }
+}
+
+impl Hasher for U32HashBuilder {
     fn finish(&self) -> u64 {
-        u64::from(self.0)
+        u64::from(self.0).wrapping_mul(0x517c_c1b7_2722_0a95)
     }
 
     fn write(&mut self, bytes: &[u8]) {
@@ -174,7 +182,6 @@ impl Hasher for U32IdentityHasher {
     }
 }
 
-type U32HashBuilder = BuildHasherDefault<U32IdentityHasher>;
 type HistMap = HashMap<u32, HistAccumulator, U32HashBuilder>;
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -412,32 +419,32 @@ fn build_histogram(
     gamma: &[f32; 256],
     importance_map: Option<&[u8]>,
 ) -> HistogramData {
-    let mut bits = initial_posterize_bits.min(3);
-    let mut map = build_histogram_map(rgba, bits, importance_map);
-    while map.len() > max_histogram_entries as usize && bits < 3 {
-        bits += 1;
-        map = build_histogram_map(rgba, bits, importance_map);
+    let mut map = build_histogram_map(rgba, importance_map);
+    let mut bits = 0u8;
+    let requested_bits = initial_posterize_bits.min(3);
+    if requested_bits > 0 {
+        reposterize_histogram_map(&mut map, requested_bits);
+        bits = requested_bits;
+    }
+    if map.len() > max_histogram_entries as usize && bits < 3 {
+        reposterize_histogram_map(&mut map, bits + 1);
     }
     finalize_histogram(map, gamma)
 }
 
-fn build_histogram_map(rgba: &[u8], posterize_bits: u8, importance_map: Option<&[u8]>) -> HistMap {
+fn build_histogram_map(rgba: &[u8], importance_map: Option<&[u8]>) -> HistMap {
     let mut map: HistMap = HashMap::with_hasher(U32HashBuilder::default());
     for (pixel_idx, px) in rgba.chunks_exact(4).enumerate() {
-        let mut bucket_rgba = posterized_rgba(px, posterize_bits);
         let representative = [px[0], px[1], px[2], px[3]];
-        if bucket_rgba[3] == 0 {
-            bucket_rgba = [0, 0, 0, 0];
-        }
-        let key = pack_rgba_key(&bucket_rgba, 0);
+        let key = pack_rgba_key(&representative, 0);
         let entry = map.entry(key).or_default();
-        let importance = f64::from(
+        let importance = u32::from(
             importance_map
                 .and_then(|map| map.get(pixel_idx))
                 .copied()
                 .unwrap_or(255),
         );
-        entry.importance_sum += importance;
+        entry.importance_sum = entry.importance_sum.saturating_add(importance);
         if !entry.initialized {
             entry.representative = representative;
             entry.cluster_index = cluster_index(representative);
@@ -447,6 +454,22 @@ fn build_histogram_map(rgba: &[u8], posterize_bits: u8, importance_map: Option<&
     map
 }
 
+fn reposterize_histogram_map(map: &mut HistMap, posterize_bits: u8) {
+    if posterize_bits == 0 || map.is_empty() {
+        return;
+    }
+
+    let channel_mask = 255u8 << posterize_bits;
+    let mask = u32::from_ne_bytes([channel_mask, channel_mask, channel_mask, channel_mask]);
+    let old_size = map.len();
+    let new_capacity = (old_size / 3).max(map.capacity() / 5);
+    let old_map = std::mem::replace(
+        map,
+        HashMap::with_capacity_and_hasher(new_capacity, U32HashBuilder::default()),
+    );
+    map.extend(old_map.into_iter().map(|(key, value)| (key & mask, value)));
+}
+
 fn finalize_histogram(map: HistMap, gamma: &[f32; 256]) -> HistogramData {
     if map.is_empty() {
         return HistogramData::default();
@@ -454,7 +477,7 @@ fn finalize_histogram(map: HistMap, gamma: &[f32; 256]) -> HistogramData {
 
     let temp = map
         .into_values()
-        .filter(|acc| acc.initialized && acc.importance_sum > 0.0)
+        .filter(|acc| acc.initialized && acc.importance_sum > 0)
         .collect::<Vec<_>>();
     if temp.is_empty() {
         return HistogramData::default();
@@ -473,8 +496,11 @@ fn finalize_histogram(map: HistMap, gamma: &[f32; 256]) -> HistogramData {
         next_begin += count;
     }
 
-    let max_perceptual_weight =
-        ((0.1 / 255.0) * temp.iter().map(|item| item.importance_sum).sum::<f64>()) as f32;
+    let max_perceptual_weight = ((0.1 / 255.0)
+        * temp
+            .iter()
+            .map(|item| f64::from(item.importance_sum))
+            .sum::<f64>()) as f32;
     let mut items = vec![
         HistItem {
             color: InternalPixel::default(),
@@ -1416,15 +1442,16 @@ fn remap_image_dithered(
     let is_image_huge = width.saturating_mul(height) > 2000 * 2000;
     let generate_dither_map = settings.use_dither_map == DitherMapMode::Always
         || (!is_image_huge && settings.use_dither_map != DitherMapMode::None);
-    // Align the dither path with remap-to-palette finalize: even when the dither map is
-    // skipped for very large images, do one plain remap pass first so Floyd uses an
-    // actual full-image palette refinement instead of the histogram-only estimate.
-    let plain_pass = Some(finalize_plain_remap(
-        rgba,
-        width,
-        &mut palette_points,
-        importance_map,
-    ));
+    let plain_pass = if generate_dither_map {
+        Some(finalize_plain_remap(
+            rgba,
+            width,
+            &mut palette_points,
+            importance_map,
+        ))
+    } else {
+        None
+    };
     let output_image_is_remapped = generate_dither_map;
     let dither_map = if let Some(plain_pass) = plain_pass.as_ref() {
         if generate_dither_map {
@@ -1827,7 +1854,7 @@ fn pack_rgba_key(rgba: &[u8], posterize_bits: u8) -> u32 {
     if px[3] == 0 {
         px = [0, 0, 0, 0];
     }
-    u32::from_be_bytes(px)
+    u32::from_ne_bytes(px)
 }
 
 fn posterized_rgba(rgba: &[u8], bits: u8) -> [u8; 4] {
@@ -1897,15 +1924,19 @@ mod tests {
     }
 
     #[test]
-    fn histogram_escalates_posterize_until_within_limit() {
+    fn histogram_matches_reference_single_step_posterize_bump() {
         let rgba = [240u8, 242, 244]
             .into_iter()
             .flat_map(|r| [128u8, 130].into_iter().flat_map(move |g| [r, g, 64, 255]))
             .collect::<Vec<_>>();
         let gamma = gamma_lut(SRGB_OUTPUT_GAMMA);
+        let mut expected_map = super::build_histogram_map(&rgba, None);
+        super::reposterize_histogram_map(&mut expected_map, 1);
+        let expected = super::finalize_histogram(expected_map, &gamma);
         let histogram = super::build_histogram(&rgba, 8, 0, 4, &gamma, None);
 
-        assert!(histogram.items.len() <= 4);
+        assert_eq!(histogram.items.len(), expected.items.len());
+        assert!(histogram.items.len() > 4);
     }
 
     #[test]

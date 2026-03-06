@@ -1,4 +1,5 @@
 use image::ImageFormat;
+use lcms2::{CIExyY, CIExyYTRIPLE, Intent, PixelFormat, Profile, ToneCurve, Transform};
 use std::borrow::Cow;
 use std::fs;
 use std::io::BufWriter;
@@ -484,8 +485,93 @@ fn normalize_rgba_to_srgb_if_needed(
     input_metadata: Option<&PreservedMetadata>,
     output_metadata: Option<&mut PreservedMetadata>,
 ) -> Result<(), AppError> {
-    let _ = (rgba, input_metadata, output_metadata);
+    let Some(input_metadata) = input_metadata else {
+        return Ok(());
+    };
+
+    if let Some(icc_profile) = input_metadata.icc_profile.as_deref() {
+        let Ok(input_profile) = Profile::new_icc(icc_profile) else {
+            return Ok(());
+        };
+        return normalize_rgba_with_profile(rgba, &input_profile, output_metadata);
+    }
+
+    let Some(source_gamma) = input_metadata.source_gamma else {
+        return Ok(());
+    };
+    let Some(source_chromaticities) = input_metadata.source_chromaticities else {
+        return Ok(());
+    };
+    if input_metadata.srgb.is_some() {
+        return Ok(());
+    }
+
+    let gamma = f64::from(source_gamma.into_value());
+    if !(gamma > 0.0 && gamma <= 1.0) {
+        return Ok(());
+    }
+
+    let input_profile = build_rgb_profile_from_png_chromaticities(source_chromaticities, gamma)
+        .ok_or_else(|| {
+            AppError::Decode("failed to build RGB profile from PNG gAMA/cHRM metadata".to_string())
+        })?;
+    normalize_rgba_with_profile(rgba, &input_profile, output_metadata)
+}
+
+fn normalize_rgba_with_profile(
+    rgba: &mut [u8],
+    input_profile: &Profile,
+    output_metadata: Option<&mut PreservedMetadata>,
+) -> Result<(), AppError> {
+    let srgb_profile = Profile::new_srgb();
+    let Ok(transform) = Transform::<u8, u8>::new(
+        input_profile,
+        PixelFormat::RGBA_8,
+        &srgb_profile,
+        PixelFormat::RGBA_8,
+        Intent::Perceptual,
+    ) else {
+        return Ok(());
+    };
+    transform.transform_in_place(rgba);
+
+    if let Some(output_metadata) = output_metadata {
+        output_metadata.source_gamma = None;
+        output_metadata.source_chromaticities = None;
+        output_metadata.srgb = Some(png::SrgbRenderingIntent::Perceptual);
+        output_metadata.icc_profile = None;
+    }
     Ok(())
+}
+
+fn build_rgb_profile_from_png_chromaticities(
+    chroma: png::SourceChromaticities,
+    gamma: f64,
+) -> Option<Profile> {
+    let white_point = CIExyY {
+        x: f64::from(chroma.white.0.into_value()),
+        y: f64::from(chroma.white.1.into_value()),
+        Y: 1.0,
+    };
+    let primaries = CIExyYTRIPLE {
+        Red: CIExyY {
+            x: f64::from(chroma.red.0.into_value()),
+            y: f64::from(chroma.red.1.into_value()),
+            Y: 1.0,
+        },
+        Green: CIExyY {
+            x: f64::from(chroma.green.0.into_value()),
+            y: f64::from(chroma.green.1.into_value()),
+            Y: 1.0,
+        },
+        Blue: CIExyY {
+            x: f64::from(chroma.blue.0.into_value()),
+            y: f64::from(chroma.blue.1.into_value()),
+            Y: 1.0,
+        },
+    };
+    let curve = ToneCurve::new(1.0 / gamma);
+    Profile::new_rgb(&white_point, &primaries, &[&curve, &curve, &curve]).ok()
 }
 
 #[cfg(test)]
@@ -513,6 +599,8 @@ fn apply_posterize_palette(palette: &mut [[u8; 4]], bits: u8) {
 
 #[cfg(test)]
 mod tests {
+    use lcms2::Profile;
+
     use super::{
         PreservedMetadata, apply_posterize_palette, indexed_bit_depth,
         normalize_rgba_to_srgb_if_needed, pack_indices_by_bit_depth, remapped_rgba_from_indices,
@@ -569,7 +657,7 @@ mod tests {
     }
 
     #[test]
-    fn icc_normalization_keeps_pixels_and_metadata_unchanged() {
+    fn invalid_icc_normalization_keeps_pixels_and_metadata_unchanged() {
         let icc_profile = vec![1u8, 2, 3, 4];
         let input = PreservedMetadata {
             icc_profile: Some(icc_profile),
@@ -587,5 +675,26 @@ mod tests {
         assert_eq!(output.srgb, input.srgb);
         assert_eq!(output.source_gamma, input.source_gamma);
         assert_eq!(output.source_chromaticities, input.source_chromaticities);
+    }
+
+    #[test]
+    fn valid_icc_normalization_converts_metadata_to_srgb() {
+        let icc_profile = Profile::new_srgb().icc().expect("serialize sRGB ICC");
+        let input = PreservedMetadata {
+            icc_profile: Some(icc_profile),
+            ..PreservedMetadata::default()
+        };
+        let mut output = input.clone();
+        let original_rgba = vec![10u8, 20, 30, 255, 200, 210, 220, 255];
+        let mut rgba = original_rgba.clone();
+
+        normalize_rgba_to_srgb_if_needed(&mut rgba, Some(&input), Some(&mut output))
+            .expect("normalize valid ICC");
+
+        assert_eq!(rgba, original_rgba);
+        assert_eq!(output.icc_profile, None);
+        assert_eq!(output.srgb, Some(png::SrgbRenderingIntent::Perceptual));
+        assert_eq!(output.source_gamma, None);
+        assert_eq!(output.source_chromaticities, None);
     }
 }
