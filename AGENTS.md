@@ -149,6 +149,7 @@
 31. 2026-03-06：完成 `pngquant` / `libimagequant` 深度实现分析，确认当前实现与参考主链在 `quality` 语义、histogram、palette search、remap、dither 上存在架构级差距，新增 `docs/phase-d/ALGORITHM_REPLICATION_ANALYSIS_V1.md` 并启动 `Algorithm Replication` 附加产品轨道。
 32. 2026-03-06：启动 R1，已将 `--quality` 解析扩展为 `N / -N / N- / min-max`，引入 libimagequant 风格 `quality <-> MSE` 标尺、speed 策略骨架与基于质量目标的最小色数搜索桥接实现，为后续 R2 的 palette search 重写清理接口。
 33. 2026-03-06：执行 R1 回归验证：`compat` 通过（`reports/compat/r1-compat-verify/summary.md`），但 `smoke` 在新质量门禁下仅 `2/9` 通过（`reports/smoke/r1-smoke-verify/summary.md`），确认当前旧量化器在真实质量标尺下已不能满足既有阶段 D 结论，需进入 R2 重写核心 palette search / remap。
+34. 2026-03-06：完成 R2 第一版自研量化器替换（gamma-aware histogram + weighted median cut + k-means refine + palette prune/remap），`compat` 通过（`reports/compat/r2-compat-verify/summary.md`），`smoke` 恢复到 `9/9` 通过（`reports/smoke/r2-smoke-verify/summary.md`）；但 perf 样本耗时显著上升，后续需回到阶段 E 做性能收口。
 
 ### 更新规则
 1. 每次推进必须更新对应阶段状态：`Not Started` / `In Progress` / `Blocked` / `Done`。

@@ -8,7 +8,9 @@ use std::time::Instant;
 
 use crate::cli::QualityRange;
 use crate::error::AppError;
-use crate::palette_quant::quantize_indexed;
+use crate::palette_quant::{
+    IndexedImage, max_colors_from_quality_speed, quantize_indexed, quantizer_settings,
+};
 use crate::quality::{QualityMetrics, SpeedSettings, evaluate_quality_against_rgba};
 
 #[derive(Debug, Clone)]
@@ -139,7 +141,7 @@ pub fn process_png_bytes(
 
 #[derive(Debug, Clone)]
 struct QuantizeCandidate {
-    indexed: crate::palette_quant::IndexedImage,
+    indexed: IndexedImage,
     quality: QualityMetrics,
 }
 
@@ -158,13 +160,20 @@ fn select_palette_candidate(
             height,
             max_colors,
             output_posterize_bits,
-            speed_settings.input_posterize_bits,
+            speed_settings,
         )
     };
 
-    let default_colors = 256usize;
+    let default_colors = quality
+        .map(|range| max_colors_from_quality_speed(range.max, speed_settings.effective_speed))
+        .unwrap_or(256);
 
-    let high_quality = evaluate(default_colors);
+    let mut high_quality = evaluate(default_colors);
+    if high_quality.quality.quality_score < quality.map_or(0, |range| range.max)
+        && default_colors < 256
+    {
+        high_quality = evaluate(256);
+    }
     let Some(range) = quality else {
         return high_quality;
     };
@@ -208,9 +217,10 @@ fn evaluate_candidate(
     height: usize,
     max_colors: usize,
     output_posterize_bits: u8,
-    input_posterize_bits: u8,
+    speed_settings: SpeedSettings,
 ) -> QuantizeCandidate {
-    let mut indexed = quantize_indexed(rgba, width, height, max_colors, input_posterize_bits);
+    let quantizer = quantizer_settings(max_colors, speed_settings);
+    let mut indexed = quantize_indexed(rgba, width, height, quantizer);
     if output_posterize_bits > 0 {
         apply_posterize_palette(&mut indexed.palette, output_posterize_bits);
     }

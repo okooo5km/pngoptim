@@ -4,7 +4,7 @@ const LIQ_WEIGHT_R: f64 = 0.5;
 const LIQ_WEIGHT_G: f64 = 1.0;
 const LIQ_WEIGHT_B: f64 = 0.45;
 const LIQ_WEIGHT_MSE: f64 = 0.45;
-const SRGB_OUTPUT_GAMMA: f64 = 0.45455;
+pub(crate) const SRGB_OUTPUT_GAMMA: f64 = 0.45455;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DitherMapMode {
@@ -135,16 +135,16 @@ pub fn evaluate_quality_against_rgba(original_rgba: &[u8], remapped_rgba: &[u8])
     }
 }
 
-#[derive(Debug, Clone, Copy)]
-struct InternalPixel {
-    a: f32,
-    r: f32,
-    g: f32,
-    b: f32,
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct InternalPixel {
+    pub(crate) a: f32,
+    pub(crate) r: f32,
+    pub(crate) g: f32,
+    pub(crate) b: f32,
 }
 
 impl InternalPixel {
-    fn from_rgba(gamma_lut: &[f32; 256], rgba: &[u8]) -> Self {
+    pub(crate) fn from_rgba(gamma_lut: &[f32; 256], rgba: &[u8]) -> Self {
         let alpha = f32::from(rgba[3]) / 255.0;
         Self {
             a: alpha * LIQ_WEIGHT_A as f32,
@@ -154,7 +154,7 @@ impl InternalPixel {
         }
     }
 
-    fn diff(self, other: Self) -> f32 {
+    pub(crate) fn diff(self, other: Self) -> f32 {
         let alpha_diff = other.a - self.a;
         let black_r = self.r - other.r;
         let black_g = self.g - other.g;
@@ -168,14 +168,36 @@ impl InternalPixel {
             + black_g.mul_add(black_g, 0.0).max(white_g * white_g)
             + black_b.mul_add(black_b, 0.0).max(white_b * white_b)
     }
+
+    pub(crate) fn to_rgba(self, gamma: f64) -> [u8; 4] {
+        if self.a <= (1.0 / 255.0 * LIQ_WEIGHT_A) as f32 {
+            return [0, 0, 0, 0];
+        }
+
+        let r = (LIQ_WEIGHT_A / LIQ_WEIGHT_R) as f32 * self.r / self.a;
+        let g = (LIQ_WEIGHT_A / LIQ_WEIGHT_G) as f32 * self.g / self.a;
+        let b = (LIQ_WEIGHT_A / LIQ_WEIGHT_B) as f32 * self.b / self.a;
+        let gamma = (gamma / INTERNAL_GAMMA) as f32;
+
+        [
+            float_to_byte(r.max(0.0).powf(gamma) * 256.0),
+            float_to_byte(g.max(0.0).powf(gamma) * 256.0),
+            float_to_byte(b.max(0.0).powf(gamma) * 256.0),
+            float_to_byte(self.a * (256.0 / LIQ_WEIGHT_A as f32)),
+        ]
+    }
 }
 
-fn gamma_lut(gamma: f64) -> [f32; 256] {
+pub(crate) fn gamma_lut(gamma: f64) -> [f32; 256] {
     let mut lut = [0.0; 256];
     for (idx, value) in lut.iter_mut().enumerate() {
         *value = ((idx as f32) / 255.0).powf((INTERNAL_GAMMA / gamma) as f32);
     }
     lut
+}
+
+fn float_to_byte(value: f32) -> u8 {
+    value.clamp(0.0, 255.0) as u8
 }
 
 fn unit_mse_to_internal_mse(mse: f64) -> f64 {
