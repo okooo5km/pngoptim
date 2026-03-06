@@ -164,67 +164,17 @@ fn select_palette_candidate(
     speed_settings: SpeedSettings,
     dither: bool,
 ) -> QuantizeCandidate {
-    let mut baseline = evaluate_candidate(
+    let target_mse = quality.map(|range| quality_to_mse(range.max));
+    evaluate_candidate(
         rgba,
         width,
         height,
         DEFAULT_MAX_COLORS,
         output_posterize_bits,
         speed_settings,
-        None,
+        target_mse,
         dither,
-    );
-    let Some(range) = quality else {
-        return baseline;
-    };
-
-    let mut targeted = evaluate_candidate(
-        rgba,
-        width,
-        height,
-        DEFAULT_MAX_COLORS,
-        output_posterize_bits,
-        speed_settings,
-        Some(quality_to_mse(range.max)),
-        dither,
-    );
-
-    if targeted.quality.quality_score < range.min {
-        return baseline;
-    }
-    if baseline.quality.quality_score < range.min {
-        return targeted;
-    }
-
-    if targeted.quality.quality_score >= range.max {
-        let baseline_size = estimate_output_bytes(
-            &mut baseline,
-            width as u32,
-            height as u32,
-            speed_settings.raw_speed,
-        );
-        let targeted_size = estimate_output_bytes(
-            &mut targeted,
-            width as u32,
-            height as u32,
-            speed_settings.raw_speed,
-        );
-        if targeted_size < baseline_size {
-            return targeted;
-        }
-    }
-
-    if should_prefer_candidate(
-        &mut baseline,
-        &mut targeted,
-        width as u32,
-        height as u32,
-        speed_settings.raw_speed,
-    ) {
-        targeted
-    } else {
-        baseline
-    }
+    )
 }
 
 fn evaluate_candidate(

@@ -371,33 +371,36 @@ pngquant /Users/5km/Downloads/demo.png --output /tmp/pngq-q6575-audit.png --qual
 
 | 场景 | 输出大小 | 质量结果 | 耗时 | 说明 |
 |---|---:|---:|---:|---|
-| 当前 `pngoptim` 默认 | `137,110` bytes | `quality_score=77`, `quality_mse=6.825` | `0.80s` | 质量回到稳定水位 |
-| 当前 `pngoptim --quality 65-75` | `141,651` bytes | `quality_score=81`, `quality_mse=5.608` | `2.38s` | 质量已接近参考，但体积更大、速度更慢 |
+| 当前 `pngoptim` 默认 | `291,210` bytes | `quality_score=99`, `quality_mse=0.025` | `1.87s` | 与 `pngquant` 一样回到 `256-color / 高保真` 方向，但当前样本体积仍偏大 |
+| 当前 `pngoptim --quality 65-75` | `127,726` bytes | `quality_score=92`, `quality_mse=2.074` | `1.10s` | 第二轮 reference-first 修复后，质量和速度都继续收敛 |
 | `pngquant --quality 65-75` | `136,915` bytes | `MSE=5.210 (Q=82)` | `0.40s` | 参考实现，`19` 色 |
+| `pngquant` 默认 | `249KB` | `MSE=0.021 (Q=100)` | `0.40s` | 默认同样是 `256-color / 高保真` 路径 |
 
 补充观测：
 
-1. 当前 `pngoptim --quality 65-75` 的输出已回到 `256` 色级别。
-2. 这说明前面的阴影阶梯问题，核心不是“色数太少”，而是 palette 落点、remap refinement 和 selective dithering 还不够接近参考实现。
-3. 第一轮修复后，`--quality` 已不再走外层二分导致的 `7.58s` 慢路径，但相比 `pngquant` 仍有明显性能差距。
+1. `--quality 65-75` 路径在第二轮修复后已经不再依赖“baseline + targeted”双候选，单图耗时从上一轮的 `2.22s` / `2.38s` 降到约 `1.10s`。
+2. 当前默认路径虽然仍偏大，但至少在方向上已与 `pngquant` 对齐为 `256-color / 高保真`，因此不该再被当成“完全错误语义”处理。
+3. 你前面看到的阴影阶梯问题，剩余根因已经更集中到 `remap_to_palette` finalize 和 `dither_row` 视觉细节，而不是继续在 histogram / mediancut 外层补护栏。
 
 ### 10.2 本轮已修复的偏差
 
 1. 去掉 [`src/pipeline.rs`](/Users/5km/Dev/Rust/pngoptim/src/pipeline.rs) 中外层 `quality -> colors` 二分搜索。
 2. 将 `kmeans_iteration_limit` 接入 [`src/quality.rs`](/Users/5km/Dev/Rust/pngoptim/src/quality.rs) 和 [`src/palette_quant.rs`](/Users/5km/Dev/Rust/pngoptim/src/palette_quant.rs)，预算口径向 `attr.rs` 靠拢。
 3. 将 feedback loop 的 K-Means 试探改回“每轮 1 次主迭代 + 最终单独 refine”的结构，不再在 trial 阶段连续做多轮收敛。
-4. 为 `--quality` 模式增加“高质量 256 色基线 + 目标质量候选”的内部比较护栏：如果目标候选未达到最低质量，不再把更差结果直接交给用户。
-5. 对齐了 `hist.rs + mediancut.rs` 的两类关键细节：
+4. 去掉 [`src/palette_quant.rs`](/Users/5km/Dev/Rust/pngoptim/src/palette_quant.rs) 中自拟的 `refine_palette_from_pixels()`。
+5. 将 `find_best_palette()` 的 trial 失败惩罚、`kmeans adjust_weight` 公式和 unused color replacement 进一步对齐到 `libimagequant/src/quant.rs` / `kmeans.rs`。
+6. 让 plain remap 的 `palette_error` 真正进入 dithering 的误差阈值决策。
+7. 去掉 `--quality` 模式额外跑 baseline 候选的自定义比较，质量请求现在只走目标约束候选。
+8. 对齐了 `hist.rs + mediancut.rs` 的两类关键细节：
    - histogram 不再做桶内平均色，改为“代表色 + perceptual weight + 16 cluster 起始箱”
    - mediancut 改为带 `total_box_error_below_target()` / `max_mse_per_color` / best-box split 的误差约束切分
 
 ### 10.3 仍然存在的关键偏差
 
-1. [`src/palette_quant.rs`](/Users/5km/Dev/Rust/pngoptim/src/palette_quant.rs) 的 histogram 仍缺少 `hist.rs` 中 `perceptual_weight` / `mc_color_weight` / cluster 初始化的完整细节。
-2. 当前 mediancut 仍未实现 `mediancut.rs` 中的 `total_box_error_below_target()`、`max_mse_per_color`、`take_best_splittable_box()` 这套误差约束切分逻辑。
-3. 当前 plain remap / dither remap 还没有完整实现 `remap.rs::remap_to_palette()` 的 full-image K-Means finalize 结构。
-4. 当前 selective dithering 虽然已接入 core subset，但还没达到 `remap_to_palette_floyd()` 的整套 chunk warmup / background-aware / guess 策略。
-5. 默认无 `--quality` 路径现在过于保守：在当前样本上已拉到 `255` 色、`291,209 bytes`，说明默认策略还需要单独校回到更接近 `pngquant` 的收缩行为。
+1. 当前 plain remap / dither remap 还没有完整实现 `remap.rs::remap_to_palette()` 的 full-image K-Means finalize 结构。
+2. 当前 selective dithering 虽然已接入 core subset，但还没达到 `remap_to_palette_floyd()` 的整套 chunk warmup / background-aware / guess 策略。
+3. 默认无 `--quality` 路径虽然方向已对齐，但在当前样本上的文件体积仍明显高于 `pngquant`，说明默认策略和最终编码联动还要继续收口。
+4. `--quality` 路径速度已明显改善，但相对 `pngquant` 仍慢约 `3x`，说明 quantizer 内部仍有可继续收紧的预算与 finalize 开销。
 
 ## 11. 当前判断
 
@@ -406,5 +409,5 @@ pngquant /Users/5km/Downloads/demo.png --output /tmp/pngq-q6575-audit.png --qual
 3. 继续推进的优先级应该是：
    1. `remap.rs::remap_to_palette` 的 full-image finalize 对齐
    2. `remap.rs::remap_to_palette_floyd` 的剩余视觉细节对齐
-   3. 默认无 `--quality` 路径的颜色收缩行为校回
+   3. 默认无 `--quality` 路径的颜色收缩行为与编码联动校回
    4. 最后再继续压 `--quality` 模式的速度

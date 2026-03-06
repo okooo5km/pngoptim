@@ -70,9 +70,6 @@ pub fn quantize_indexed(
     if palette.is_empty() {
         palette = vec![InternalPixel::default()];
     }
-    if histogram.items.len() <= 4_096 {
-        refine_palette_from_pixels(rgba, &mut palette, settings.input_posterize_bits, 1);
-    }
 
     let final_palette = dedup_palette(&palette);
     remap_image(
@@ -530,122 +527,84 @@ fn find_best_palette(histogram: &HistogramData, settings: QuantizerSettings) -> 
     let max_colors = settings.max_colors.clamp(2, 256);
     let mut hist = histogram.clone();
     let hist_items = hist.items.len();
-    let total_trials = effective_feedback_trials(settings.feedback_loop_trials, hist_items);
+    let total_trials = effective_feedback_trials(settings.feedback_loop_trials, hist_items) as i32;
     let final_iteration_limit =
         effective_kmeans_iteration_limit(settings.kmeans_iteration_limit, hist_items);
     let has_quality_target = settings.target_mse.is_some();
-    let final_iterations = effective_kmeans_iterations(
-        settings.kmeans_iterations,
-        hist_items,
-        false,
-        has_quality_target,
-    );
-
-    if hist.items.len() <= max_colors || total_trials == 0 || !has_quality_target {
-        let mut palette = if hist.items.len() <= max_colors {
-            hist.items.iter().map(|item| item.color).collect::<Vec<_>>()
-        } else {
-            median_cut_palette(&mut hist, max_colors, f64::INFINITY, f64::INFINITY)
-        };
-        let _ = refine_palette(
-            &mut hist.items,
-            &mut palette,
-            final_iterations,
-            false,
-            final_iteration_limit,
-        );
-        return palette;
-    }
-
     let target_mse = settings.target_mse.unwrap_or(f64::INFINITY);
-    let mut current_max_colors = max_colors;
-    let mut trials_left = total_trials as i32;
-    let mut baseline_hist = histogram.clone();
-    let mut baseline_palette = if baseline_hist.items.len() <= max_colors {
-        baseline_hist
-            .items
-            .iter()
-            .map(|item| item.color)
-            .collect::<Vec<_>>()
-    } else {
-        median_cut_palette(&mut baseline_hist, max_colors, f64::INFINITY, f64::INFINITY)
-    };
-    let baseline_stats = refine_palette(
-        &mut baseline_hist.items,
-        &mut baseline_palette,
-        final_iterations,
-        false,
-        final_iteration_limit,
-    );
-    let baseline_used_colors = baseline_stats
-        .used_colors
-        .max(2)
-        .min(baseline_palette.len());
-    let mut best_palette = Some(baseline_palette);
-    let mut best_error = baseline_stats.error;
-    let mut best_used_colors = baseline_used_colors;
-    let mut fails_in_a_row = 0i32;
-    let mut target_mse_overshoot = if total_trials > 0 { 1.05 } else { 1.0 };
-
-    if best_error < target_mse && best_error > 0.0 {
-        current_max_colors = current_max_colors
-            .min(best_used_colors.saturating_add(1))
-            .saturating_sub(1)
-            .max(2);
+    let few_input_colors = hist.items.len() <= max_colors;
+    if few_input_colors && target_mse == 0.0 {
+        return hist.items.iter().map(|item| item.color).collect::<Vec<_>>();
     }
 
-    while trials_left > 0 && current_max_colors >= 2 {
+    let mut current_max_colors = max_colors;
+    let mut trials_left = total_trials;
+    let mut best_palette = None;
+    let mut target_mse_overshoot = if total_trials > 0 { 1.05 } else { 1.0 };
+    let mut fails_in_a_row = 0i32;
+    let mut palette_error = None::<f64>;
+
+    let mut palette = loop {
         let max_mse_per_color = target_mse
-            .max(best_error.min(quality_to_mse(1)))
+            .max(palette_error.unwrap_or(quality_to_mse(1)))
             .max(quality_to_mse(51))
             * 1.2;
-        let mut palette = median_cut_palette(
-            &mut hist,
-            current_max_colors,
-            target_mse * target_mse_overshoot,
-            max_mse_per_color,
-        );
+        let mut new_palette = if few_input_colors {
+            hist.items.iter().map(|item| item.color).collect::<Vec<_>>()
+        } else {
+            median_cut_palette(
+                &mut hist,
+                current_max_colors,
+                target_mse * target_mse_overshoot,
+                max_mse_per_color,
+            )
+        };
+
+        if trials_left <= 0 {
+            break Some(new_palette);
+        }
+
         let first_target_run = best_palette.is_none() && target_mse > 0.0;
-        let stats = kmeans_iteration(&mut hist.items, &mut palette, !first_target_run);
-        let used_colors = stats.used_colors.max(2).min(palette.len());
-        let better = best_palette.is_none()
-            || stats.error < best_error
-            || (stats.error <= target_mse && used_colors < best_used_colors);
-
-        if better {
-            best_error = stats.error;
-            best_used_colors = used_colors;
-            best_palette = Some(palette);
-            fails_in_a_row = 0;
-            trials_left -= 1;
-
-            if stats.error <= target_mse && current_max_colors > 2 {
+        let stats = kmeans_iteration(&mut hist.items, &mut new_palette, !first_target_run);
+        if best_palette.is_none()
+            || stats.error < palette_error.unwrap_or(f64::MAX)
+            || (stats.error <= target_mse && new_palette.len() < current_max_colors)
+        {
+            if stats.error < target_mse && stats.error > 0.0 {
                 target_mse_overshoot = (target_mse_overshoot * 1.25)
                     .min(target_mse / stats.error.max(f64::MIN_POSITIVE));
-                current_max_colors = current_max_colors
-                    .min(used_colors.saturating_add(1))
-                    .saturating_sub(1)
-                    .max(2);
             }
+            palette_error = Some(stats.error);
+            current_max_colors = current_max_colors.min(new_palette.len().saturating_add(1));
+            trials_left -= 1;
+            fails_in_a_row = 0;
+            best_palette = Some(new_palette);
         } else {
             fails_in_a_row += 1;
             target_mse_overshoot = 1.0;
-            trials_left -= 1 + fails_in_a_row.min(2);
+            trials_left -= 5 + fails_in_a_row;
+        }
+
+        if trials_left <= 0 {
+            break best_palette;
         }
     }
+    .unwrap_or_else(|| {
+        if few_input_colors {
+            hist.items.iter().map(|item| item.color).collect::<Vec<_>>()
+        } else {
+            median_cut_palette(&mut hist, max_colors, f64::INFINITY, f64::INFINITY)
+        }
+    });
 
-    let mut palette = best_palette
-        .unwrap_or_else(|| median_cut_palette(&mut hist, max_colors, f64::INFINITY, f64::INFINITY));
-    let mut final_hist = histogram.clone();
-    let palette_error_is_known = best_error.is_finite();
     let final_iterations = effective_kmeans_iterations(
         settings.kmeans_iterations,
         hist_items,
-        palette_error_is_known,
+        palette_error.is_some(),
         has_quality_target,
     );
     let _ = refine_palette(
-        &mut final_hist.items,
+        &mut hist.items,
         &mut palette,
         final_iterations,
         false,
@@ -657,7 +616,6 @@ fn find_best_palette(histogram: &HistogramData, settings: QuantizerSettings) -> 
 #[derive(Debug, Clone, Copy)]
 struct PaletteStats {
     error: f64,
-    used_colors: usize,
 }
 
 fn refine_palette(
@@ -668,10 +626,7 @@ fn refine_palette(
     iteration_limit: f64,
 ) -> PaletteStats {
     if palette.is_empty() {
-        return PaletteStats {
-            error: 0.0,
-            used_colors: 0,
-        };
+        return PaletteStats { error: 0.0 };
     }
 
     let mut stats = kmeans_iteration(histogram, palette, adjust_weights);
@@ -704,23 +659,22 @@ fn kmeans_iteration(
     for item in histogram.iter_mut() {
         let hint = usize::from(item.likely_palette_index).min(palette.len().saturating_sub(1));
         let (nearest, diff_sq) = tree.search(item.color, hint);
-        let diff = f64::from(diff_sq);
+        let mut diff = f64::from(diff_sq);
         item.likely_palette_index = nearest as u16;
-        total_error += diff * f64::from(item.perceptual_weight);
 
         let weight = if adjust_weights {
             let reflected = reflected_color(item.color, palette[nearest]);
             let reflected_diff = f64::from(tree.search(reflected, nearest).1);
-            let adjusted = (2.0 * f64::from(item.adjusted_weight)
-                + f64::from(item.perceptual_weight))
-                * (0.5 + reflected_diff.sqrt());
-            item.adjusted_weight = adjusted.min(f64::from(item.perceptual_weight) * 32.0) as f32;
+            diff = reflected_diff;
+            item.adjusted_weight = ((2.0 * item.adjusted_weight) + item.perceptual_weight)
+                * (0.5 + reflected_diff as f32);
             item.adjusted_weight
         } else {
             item.adjusted_weight = item.perceptual_weight;
             item.perceptual_weight
         };
 
+        total_error += diff * f64::from(item.perceptual_weight);
         let weight = f64::from(weight);
         usage[nearest] += 1;
         weights[nearest] += weight;
@@ -746,7 +700,6 @@ fn kmeans_iteration(
 
     PaletteStats {
         error: total_error / total_weight,
-        used_colors: usage.iter().filter(|&&count| count > 0).count(),
     }
 }
 
@@ -762,20 +715,25 @@ fn replace_unused_palette_entries(
 
         let worst_idx = {
             let tree = NearestTree::new(palette);
-            histogram
-                .iter()
-                .enumerate()
-                .filter_map(|(item_idx, item)| {
-                    if palette.is_empty() {
-                        return None;
-                    }
-                    let hint =
-                        usize::from(item.likely_palette_index).min(palette.len().saturating_sub(1));
-                    let diff = tree.search(item.color, hint).1;
-                    Some((item_idx, diff))
-                })
-                .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal))
-                .map(|(item_idx, _)| item_idx)
+            let mut worst_idx = None;
+            let mut worst_diff = 0.0f32;
+            for (item_idx, item) in histogram.iter().enumerate() {
+                let hint =
+                    usize::from(item.likely_palette_index).min(palette.len().saturating_sub(1));
+                let may_be_worst = palette
+                    .get(hint)
+                    .map_or(true, |pal| pal.diff(item.color) > worst_diff);
+                if !may_be_worst {
+                    continue;
+                }
+
+                let diff = tree.search(item.color, hint).1;
+                if diff > worst_diff {
+                    worst_diff = diff;
+                    worst_idx = Some(item_idx);
+                }
+            }
+            worst_idx
         };
 
         if let Some(worst_idx) = worst_idx {
@@ -1023,67 +981,6 @@ fn search_node(
     }
 }
 
-fn refine_palette_from_pixels(
-    rgba: &[u8],
-    palette: &mut [InternalPixel],
-    input_posterize_bits: u8,
-    iterations: u8,
-) {
-    if palette.is_empty() || iterations == 0 {
-        return;
-    }
-
-    let gamma = gamma_lut(SRGB_OUTPUT_GAMMA);
-    for _ in 0..iterations {
-        let tree = NearestTree::new(palette);
-        let mut sums = vec![[0.0f64; 4]; palette.len()];
-        let mut weights = vec![0.0f64; palette.len()];
-        let mut cache: HashMap<u32, usize> = HashMap::new();
-        let mut worst_color = None;
-        let mut worst_diff = 0.0f32;
-
-        for px in rgba.chunks_exact(4) {
-            let cache_key = pack_rgba_key(px, input_posterize_bits.min(4));
-            let color = InternalPixel::from_rgba(&gamma, px);
-            let nearest = if let Some(&idx) = cache.get(&cache_key) {
-                idx
-            } else {
-                let idx = tree.search(color, 0).0;
-                cache.insert(cache_key, idx);
-                idx
-            };
-
-            let diff = color.diff(palette[nearest]);
-            if diff > worst_diff {
-                worst_diff = diff;
-                worst_color = Some(color);
-            }
-
-            weights[nearest] += 1.0;
-            sums[nearest][0] += f64::from(color.a);
-            sums[nearest][1] += f64::from(color.r);
-            sums[nearest][2] += f64::from(color.g);
-            sums[nearest][3] += f64::from(color.b);
-        }
-
-        for idx in 0..palette.len() {
-            if weights[idx] == 0.0 {
-                if let Some(color) = worst_color {
-                    palette[idx] = color;
-                }
-                continue;
-            }
-
-            palette[idx] = InternalPixel {
-                a: (sums[idx][0] / weights[idx]) as f32,
-                r: (sums[idx][1] / weights[idx]) as f32,
-                g: (sums[idx][2] / weights[idx]) as f32,
-                b: (sums[idx][3] / weights[idx]) as f32,
-            };
-        }
-    }
-}
-
 fn dedup_palette(palette: &[InternalPixel]) -> Vec<(InternalPixel, [u8; 4])> {
     let mut out = Vec::new();
     for &color in palette {
@@ -1174,6 +1071,7 @@ struct PlainRemapPass {
     counts: Vec<usize>,
     sums: Vec<[f64; 4]>,
     weights: Vec<f64>,
+    palette_error: f64,
     worst_color: Option<InternalPixel>,
 }
 
@@ -1187,6 +1085,8 @@ fn remap_image_plain_pass(
     let mut counts = vec![0usize; palette_points.len()];
     let mut sums = vec![[0.0f64; 4]; palette_points.len()];
     let mut weights = vec![0.0f64; palette_points.len()];
+    let mut total_error = 0.0f64;
+    let mut total_pixels = 0usize;
     let mut worst_color = None;
     let mut worst_diff = 0.0f32;
     let tree = NearestTree::new(palette_points);
@@ -1197,6 +1097,8 @@ fn remap_image_plain_pass(
         let (idx, diff) = tree.search(color, last_idx);
         last_idx = idx;
         counts[idx] += 1;
+        total_error += f64::from(diff);
+        total_pixels += 1;
         let importance = importance_map
             .and_then(|map| map.get(pixel_idx))
             .copied()
@@ -1219,6 +1121,7 @@ fn remap_image_plain_pass(
         counts,
         sums,
         weights,
+        palette_error: total_error / total_pixels.max(1) as f64,
         worst_color,
     }
 }
@@ -1282,9 +1185,9 @@ fn remap_image_dithered(
     if !dither_map.is_empty() {
         base_dithering_level *= 1.0 / 255.0;
     }
-    let max_dither_error = settings
-        .target_mse
-        .unwrap_or_else(|| quality_to_mse(80))
+    let max_dither_error = plain_pass
+        .palette_error
+        .max(f64::MIN_POSITIVE)
         .mul_add(2.4, 0.0)
         .max(quality_to_mse(35)) as f32;
 
