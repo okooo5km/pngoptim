@@ -1523,33 +1523,68 @@ fn remap_image_plain_pass(
     palette_points: &[InternalPixel],
     importance_map: Option<&[u8]>,
 ) -> PlainRemapPass {
-    let mut indices = Vec::with_capacity(pixels.len());
-    let mut counts = vec![0usize; palette_points.len()];
-    let mut sums = vec![[0.0f64; 4]; palette_points.len()];
-    let mut weights = vec![0.0f64; palette_points.len()];
-    let mut total_error = 0.0f64;
+    let pal_len = palette_points.len();
     let tree = NearestTree::new(palette_points);
-    for (pixel_idx, color) in pixels.iter().copied().enumerate() {
-        let row_offset = pixel_idx % width;
-        let last_idx = if row_offset == 0 {
-            0usize
-        } else {
-            indices[pixel_idx - 1] as usize
-        };
-        let (idx, diff) = tree.search(color, last_idx);
-        counts[idx] += 1;
-        total_error += f64::from(diff);
-        let importance = importance_map
-            .and_then(|map| map.get(pixel_idx))
-            .copied()
-            .map(f64::from)
-            .unwrap_or(1.0);
-        weights[idx] += importance;
-        sums[idx][0] += f64::from(color.a) * importance;
-        sums[idx][1] += f64::from(color.r) * importance;
-        sums[idx][2] += f64::from(color.g) * importance;
-        sums[idx][3] += f64::from(color.b) * importance;
-        indices.push(idx as u8);
+    let height = (pixels.len() + width - 1) / width;
+
+    // Process rows in parallel — row hint dependency is within-row only
+    let row_results: Vec<(Vec<u8>, Vec<usize>, Vec<[f64; 4]>, Vec<f64>, f64)> = (0..height)
+        .into_par_iter()
+        .map(|row| {
+            let row_start = row * width;
+            let row_end = (row_start + width).min(pixels.len());
+            let row_pixels = &pixels[row_start..row_end];
+            let mut row_indices = Vec::with_capacity(row_pixels.len());
+            let mut counts = vec![0usize; pal_len];
+            let mut sums = vec![[0.0f64; 4]; pal_len];
+            let mut weights = vec![0.0f64; pal_len];
+            let mut total_error = 0.0f64;
+            let mut last_idx = 0usize;
+
+            for (col, &color) in row_pixels.iter().enumerate() {
+                if col == 0 {
+                    last_idx = 0;
+                }
+                let (idx, diff) = tree.search(color, last_idx);
+                last_idx = idx;
+                counts[idx] += 1;
+                total_error += f64::from(diff);
+                let pixel_idx = row_start + col;
+                let importance = importance_map
+                    .and_then(|map| map.get(pixel_idx))
+                    .copied()
+                    .map(f64::from)
+                    .unwrap_or(1.0);
+                weights[idx] += importance;
+                sums[idx][0] += f64::from(color.a) * importance;
+                sums[idx][1] += f64::from(color.r) * importance;
+                sums[idx][2] += f64::from(color.g) * importance;
+                sums[idx][3] += f64::from(color.b) * importance;
+                row_indices.push(idx as u8);
+            }
+
+            (row_indices, counts, sums, weights, total_error)
+        })
+        .collect();
+
+    // Merge row results
+    let mut indices = Vec::with_capacity(pixels.len());
+    let mut counts = vec![0usize; pal_len];
+    let mut sums = vec![[0.0f64; 4]; pal_len];
+    let mut weights = vec![0.0f64; pal_len];
+    let mut total_error = 0.0f64;
+
+    for (row_idx, row_counts, row_sums, row_weights, row_error) in row_results {
+        indices.extend_from_slice(&row_idx);
+        total_error += row_error;
+        for i in 0..pal_len {
+            counts[i] += row_counts[i];
+            weights[i] += row_weights[i];
+            sums[i][0] += row_sums[i][0];
+            sums[i][1] += row_sums[i][1];
+            sums[i][2] += row_sums[i][2];
+            sums[i][3] += row_sums[i][3];
+        }
     }
 
     PlainRemapPass {
