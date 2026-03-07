@@ -153,11 +153,13 @@ jobs:
 
           git clone "https://x-access-token:${HOMEBREW_TAP_TOKEN}@github.com/okooo5km/homebrew-tap.git" homebrew-tap
 
+          DOWNLOAD_URL="https://github.com/okooo5km/pngoptim/releases/download/v${VERSION}/pngoptim_${VERSION}_darwin_universal.tar.gz"
+
           cat > homebrew-tap/pngoptim.rb << FORMULA
           class Pngoptim < Formula
             desc "Fast PNG quantization CLI tool — a Rust alternative to pngquant"
             homepage "https://github.com/okooo5km/pngoptim"
-            url "https://github.com/okooo5km/pngoptim/releases/download/v#{version}/pngoptim_#{version}_darwin_universal.tar.gz"
+            url "${DOWNLOAD_URL}"
             sha256 "${SHA256}"
             version "${VERSION}"
             license "MIT"
