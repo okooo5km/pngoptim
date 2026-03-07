@@ -142,24 +142,24 @@
 | RF-1 | Done | `pngquant.c` + `attr.rs` | 对齐 `quality/speed` 语义、预算和门禁标尺 | `quality <-> MSE` 已接通 |
 | RF-2 | Partially Done | `quant.rs` + `mediancut.rs` + `kmeans.rs` | 对齐 feedback loop、palette search、unused color replacement | 已有骨架，但误差约束收缩仍不稳定 |
 | RF-3 | Done | `nearest.rs` | 对齐 VP-tree nearest、likely-index、剪枝逻辑 | 已完成，性能回退已大幅收回 |
-| RF-4 | Partially Done | `remap.rs::remap_to_palette` | 对齐 remap 阶段 palette 统计回灌、background/importance 处理 | plain remap 回灌、importance 权重与 dither 前 remap 已接入，剩余显式 background 分支 |
+| RF-4 | Done | `remap.rs::remap_to_palette` | 对齐 remap 阶段 palette 统计回灌、background/importance 处理 | plain/dithered remap 均已对齐 K-Means finalize + init_int_palette 时序，剩余显式 background 分支（APNG 需要时再加） |
 | RF-5 | Partially Done | `remap.rs::dither_map` + `remap_to_palette_floyd` | 对齐 dither map、selective Floyd、background-aware 分支 | core subset、透明区域 plain-fallback 已接入，剩余显式 background 图像分支 |
 | RF-6 | Done | `pngquant.c` + `quant.rs` | 对齐 `skip-if-larger` 启发式和 remap 后质量决策 | same-score size-aware 与 `skip-if-larger` 质量/体积联动均已接入 |
 | RF-7 | Done | 全链路 | 重跑 quality/perf/stability/release 门禁，形成新基线 | 本地与跨平台复核均已通过 |
 
 ### 当前硬阻塞与下一步
 1. 阶段 H 当前暂停，主任务切回静态 PNG 的 `reference-first` 复查。恢复 APNG 的前提是：`demo.png` 这类平滑阴影/UI 样本的默认抖动路径不再存在明显阶梯感。
-2. 当前最硬的阻塞已经进一步收敛到 palette / remap / dither 主链：
-   - `hist.rs / mediancut.rs` 的灰阶分配仍与 `pngquant` 有细微偏差
-   - `remap.rs::remap_to_palette` 的 full-image K-Means finalize 还未完整对齐
-   - `remap.rs::remap_to_palette_floyd` 的视觉细节仍未完全抹平
+2. 当前最硬的阻塞已进一步收敛到 palette search 阶段的灰阶分配：
+   - remap 阶段 K-Means finalize 已完整对齐（RF-4 Done）
+   - `hist.rs / mediancut.rs` 的灰阶分配仍与 `pngquant` 有 1 色偏差（18 vs 19 色），根因可能在 median cut split 决策的浮点累积差异
+   - `remap.rs::remap_to_palette_floyd` 的 background-aware 三分支逻辑待 APNG 时接入
 3. `src/pipeline.rs` 已不再在 `--quality` 模式下做外层色数二分，也不再在 `--quality` 模式额外跑 baseline 候选；质量约束完全收回 quantizer 内部，慢路径已明显缩短。
-4. 当前 `demo.png` spot check 的真实状态已更新为：
-   - `pngoptim --quality 65-75`（默认抖动）: `142,626 bytes`, `quality_score=89`, `quality_mse=3.238`
-   - `pngoptim --quality 65-75 --floyd=0.5`: `133,638 bytes`, `quality_score=90`, `quality_mse=2.916`
-   - `pngoptim --quality 65-75 --nofs`: `105,433 bytes`, `quality_score=91`, `quality_mse=2.524`
-   - `pngquant --quality 65-75`: `136,915 bytes`, `0.55s`
-   - `pngquant --quality 65-75 --nofs`: `104,038 bytes`, `0.45s`
+4. 当前 `demo.png` spot check 的真实状态已更新为（2026-03-07 K-Means finalize 对齐后）：
+   - `pngoptim --quality 65-75`（默认抖动）: `141,274 bytes`, `quality_score=89`, `quality_mse=3.256`
+   - `pngoptim --quality 65-75 --floyd=0.5`: `133,140 bytes`, `quality_score=90`, `quality_mse=2.892`
+   - `pngoptim --quality 65-75 --nofs`: `105,412 bytes`, `quality_score=91`, `quality_mse=2.529`
+   - `pngquant --quality 65-75`: `136,915 bytes`
+   - `pngquant --quality 65-75 --nofs`: `104,038 bytes`
 5. 2026-03-06 新一轮时间复查表明：在本机热缓存 5 次均值下，`demo.png` 上 `pngoptim --quality 65-75` 为 `0.306s`，`pngquant --quality 65-75` 为 `0.340s`；`--nofs` 下分别为 `0.246s` 和 `0.286s`。因此“当前这张样本上我们整体更慢”并不成立，真正稳定的热点仍是 quantizer 内部。随后又补上了 `kmeans` 分块并行和大图 Floyd 分块并行，`demo.png --quality 65-75` 的内置 profile 现为 `decode_ms≈68`、`quantize_ms≈128`、`encode_ms≈75`。参考实现在 `libimagequant/src/kmeans.rs`、`remap.rs` 和 `pngquant` CLI 层分别用了 Rayon / OpenMP 并行；当前 Rust 主线已补上 `kmeans + 大图 Floyd` 两段，但 plain remap、dither-map 生成和 palette 质量细节仍会决定跨样本的剩余差距。
 6. 当前针对 `demo.png` 的 palette 对比已经确认：剩余主差距不是“颜色数明显不够”，而是灰阶落点不完全一致。当前输出为 `18` 色，`pngquant` 为 `19` 色；我们少了一档中间灰，导致阴影更容易出现台阶。
 7. 这轮确认的已修复硬根因不是 palette search 本身，而是两处输入/输出对齐缺失：
@@ -174,13 +174,15 @@
    这批修正本身没有单独带来体积跳变，但配合后续颜色管理和大图 `edges` fallback 修复后，默认抖动已从 `150,443 bytes` 收敛到 `142,017 bytes`。
 
 ### 恢复入口（下次继续时从这里开始）
-1. 当前恢复起点不是 APNG，而是静态 PNG 的灰阶 palette 分配。
-2. 下一步执行顺序固定如下：
-   - 先对照 `libimagequant/src/hist.rs` 与 `mediancut.rs`，继续审查 histogram weight / representative color / split 细节
-   - 再对照 `libimagequant/src/remap.rs::remap_to_palette()`，补齐 full-image finalize
-   - 然后继续对照 `remap_to_palette_floyd()`，收剩余视觉细节
+1. 当前恢复起点不是 APNG，而是静态 PNG 的灰阶 palette 分配（18 vs 19 色差距）。
+2. 已完成的对齐工作：
+   - RF-4: remap K-Means finalize 已完整对齐（plain + dithered 路径均始终执行 finalize，init_int_palette 时序正确）
+   - 逐模块对照审查完成：hist.rs、mediancut.rs、kmeans.rs、remap.rs、quant.rs
+3. 下一步执行顺序固定如下：
+   - 继续排查 mediancut split 决策中的 1 色差异（灰阶 71→110 区间 vs pngquant 65→92→121）
+   - 可能的切入点：median cut 的 `prepare_color_weight_total` 和 `hist_item_sort_half` 的边界行为
    - 最后再回到 `plain remap / dither-map` 的剩余性能收口
-3. 当前不要恢复 Phase H。恢复条件是：`demo.png --quality 65-75` 默认抖动路径的视觉效果达到可接受，且 spot check 不再显示明显阴影阶梯。
+4. 当前不要恢复 Phase H。恢复条件是：`demo.png --quality 65-75` 默认抖动路径的视觉效果达到可接受，且 spot check 不再显示明显阴影阶梯。
 4. 当前最关键的参考文件：
    - `/Users/5km/Dev/C/libimagequant/src/hist.rs`
    - `/Users/5km/Dev/C/libimagequant/src/mediancut.rs`
@@ -203,6 +205,7 @@
    - `9355358` `perf(quant): chunk floyd dithering for large images`
 
 ### 最近更新
+0. 2026-03-07：完成 RF-4 K-Means finalize 完整对齐：plain remap 和 dithered remap 均始终执行 K-Means finalize，output RGBA 生成时序对齐参考 `init_int_palette()`。demo.png 默认抖动从 `142,626` 降至 `141,274` bytes。完成 5 模块逐行对照审查（hist/mediancut/kmeans/remap/quant），生成差异清单。新增项目 CLAUDE.md。smoke 9/9、compat、quality-size 7/7、stability 24/24 全部通过。
 1. 2026-03-05：确认参考仓库本地路径与远程可达性，并锁定 `main` 分支 commit。
 2. 2026-03-05：新增 `Compliance Policy v1`、依赖登记模板、参数矩阵、数据集目录骨架。
 3. 2026-03-05：新增 `Baseline Report v1`（源锁定与环境快照），阶段 A 进入 `In Progress`。

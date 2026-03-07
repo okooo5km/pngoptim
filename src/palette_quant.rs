@@ -1372,8 +1372,6 @@ fn remap_image_plain(
     contrast_pixels: Option<&[InternalPixel]>,
 ) -> (Vec<(InternalPixel, [u8; 4])>, Vec<u8>, Vec<usize>) {
     let mut palette_points = palette.iter().map(|entry| entry.0).collect::<Vec<_>>();
-    let output_palette =
-        round_palette_for_output_in_place(&mut palette_points, output_posterize_bits);
     let gamma = gamma_lut(SRGB_OUTPUT_GAMMA);
     let owned_pixels;
     let pixels = if let Some(pixels) = contrast_pixels {
@@ -1385,7 +1383,14 @@ fn remap_image_plain(
             .collect::<Vec<_>>();
         &owned_pixels
     };
-    let final_pass = remap_image_plain_pass(width, pixels, &palette_points, importance_map);
+
+    // Reference dither_level=0 path: init_int_palette() first, then remap_to_palette().
+    // init_int_palette rounds palette and overwrites f_pixel values.
+    // remap_to_palette uses rounded palette for nearest search + k-means finalize.
+    // The int_palette (output RGBA) is set before finalize, so finalize doesn't affect output.
+    let output_palette =
+        round_palette_for_output_in_place(&mut palette_points, output_posterize_bits);
+    let final_pass = finalize_plain_remap(width, pixels, &mut palette_points, importance_map);
 
     let remapped_palette = palette_points
         .into_iter()
@@ -1493,8 +1498,6 @@ fn remap_image_dithered(
     contrast_pixels: Option<&[InternalPixel]>,
 ) -> (Vec<(InternalPixel, [u8; 4])>, Vec<u8>, Vec<usize>) {
     let mut palette_points = palette.iter().map(|entry| entry.0).collect::<Vec<_>>();
-    let output_palette =
-        round_palette_for_output_in_place(&mut palette_points, settings.output_posterize_bits);
     let gamma = gamma_lut(SRGB_OUTPUT_GAMMA);
     let owned_pixels;
     let pixels = if let Some(pixels) = contrast_pixels {
@@ -1509,6 +1512,11 @@ fn remap_image_dithered(
     let is_image_huge = width.saturating_mul(height) > 2000 * 2000;
     let generate_dither_map = settings.use_dither_map == DitherMapMode::Always
         || (!is_image_huge && settings.use_dither_map != DitherMapMode::None);
+
+    // Always run plain remap + k-means finalize before dithering.
+    // Reference remap_to_palette() always calls kmeans.finalize(palette).
+    // When generate_dither_map is true, finalize_plain_remap does remap+feedback+re-remap.
+    // When false, we still need the k-means feedback to refine palette colors.
     let plain_pass = if generate_dither_map {
         Some(finalize_plain_remap(
             width,
@@ -1516,15 +1524,30 @@ fn remap_image_dithered(
             &mut palette_points,
             importance_map,
         ))
+    } else if palette_points.len() > 1 {
+        // K-Means finalize even without dither map generation
+        let feedback = remap_image_plain_pass(width, pixels, &palette_points, importance_map);
+        apply_remap_feedback(&mut palette_points, &feedback);
+        Some(remap_image_plain_pass(
+            width,
+            pixels,
+            &palette_points,
+            importance_map,
+        ))
     } else {
         None
     };
-    let output_image_is_remapped = generate_dither_map;
+    let output_image_is_remapped = plain_pass.is_some();
+
+    // Output RGBA generated AFTER k-means finalize, matching reference init_int_palette() timing
+    let output_palette =
+        round_palette_for_output_in_place(&mut palette_points, settings.output_posterize_bits);
+
     let dither_map = select_dither_map(
         pixels,
         width,
         height,
-        plain_pass.as_ref(),
+        plain_pass.as_ref().filter(|_| generate_dither_map),
         &palette_points,
         settings.use_dither_map,
         generate_dither_map,
