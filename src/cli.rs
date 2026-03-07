@@ -25,7 +25,7 @@ impl QualityRange {
 #[command(
     name = "pngoptim",
     version,
-    about = "PNG quantization CLI (Phase C compatibility work)"
+    about = "Fast PNG quantization CLI — lossy PNG compression like pngquant"
 )]
 pub struct Cli {
     #[arg(value_name = "INPUT", required = true)]

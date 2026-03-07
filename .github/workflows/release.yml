@@ -1,0 +1,180 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+env:
+  CARGO_TERM_COLOR: always
+
+permissions:
+  contents: write
+
+jobs:
+  build-macos:
+    name: macOS Universal
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Test
+        run: cargo test
+
+      - name: Build arm64
+        run: cargo build --release --target aarch64-apple-darwin
+
+      - name: Build x86_64
+        run: cargo build --release --target x86_64-apple-darwin
+
+      - name: Create universal binary
+        run: |
+          lipo -create \
+            target/aarch64-apple-darwin/release/pngoptim \
+            target/x86_64-apple-darwin/release/pngoptim \
+            -output pngoptim
+
+      - name: Package
+        run: |
+          VERSION=${GITHUB_REF_NAME#v}
+          tar czf pngoptim_${VERSION}_darwin_universal.tar.gz pngoptim
+          shasum -a 256 pngoptim_${VERSION}_darwin_universal.tar.gz > pngoptim_${VERSION}_darwin_universal.tar.gz.sha256
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-universal
+          path: pngoptim_*.tar.gz*
+
+  build-linux-x86_64:
+    name: Linux x86_64
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --release
+
+      - name: Package
+        run: |
+          VERSION=${GITHUB_REF_NAME#v}
+          tar czf pngoptim_${VERSION}_linux_x86_64.tar.gz -C target/release pngoptim
+          sha256sum pngoptim_${VERSION}_linux_x86_64.tar.gz > pngoptim_${VERSION}_linux_x86_64.tar.gz.sha256
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-x86_64
+          path: pngoptim_*.tar.gz*
+
+  build-linux-arm64:
+    name: Linux arm64
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --release
+
+      - name: Package
+        run: |
+          VERSION=${GITHUB_REF_NAME#v}
+          tar czf pngoptim_${VERSION}_linux_arm64.tar.gz -C target/release pngoptim
+          sha256sum pngoptim_${VERSION}_linux_arm64.tar.gz > pngoptim_${VERSION}_linux_arm64.tar.gz.sha256
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-arm64
+          path: pngoptim_*.tar.gz*
+
+  build-windows:
+    name: Windows x86_64
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --release
+
+      - name: Package
+        shell: bash
+        run: |
+          VERSION=${GITHUB_REF_NAME#v}
+          7z a pngoptim_${VERSION}_windows_x86_64.zip ./target/release/pngoptim.exe
+          sha256sum pngoptim_${VERSION}_windows_x86_64.zip > pngoptim_${VERSION}_windows_x86_64.zip.sha256
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-x86_64
+          path: pngoptim_*.zip*
+
+  release:
+    name: Create Release
+    needs: [build-macos, build-linux-x86_64, build-linux-arm64, build-windows]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create ${{ github.ref_name }} \
+            --repo ${{ github.repository }} \
+            --title "${{ github.ref_name }}" \
+            --generate-notes \
+            pngoptim_*
+
+  homebrew:
+    name: Update Homebrew Tap
+    needs: [release]
+    if: "!contains(github.ref_name, '-')"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: macos-universal
+
+      - name: Update formula
+        env:
+          GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          VERSION=${GITHUB_REF_NAME#v}
+          SHA256=$(cat pngoptim_${VERSION}_darwin_universal.tar.gz.sha256 | awk '{print $1}')
+
+          gh repo clone okooo5km/homebrew-tap homebrew-tap
+
+          cat > homebrew-tap/Formula/pngoptim.rb << FORMULA
+          class Pngoptim < Formula
+            desc "Fast PNG quantization CLI tool — a Rust alternative to pngquant"
+            homepage "https://github.com/okooo5km/pngoptim"
+            url "https://github.com/okooo5km/pngoptim/releases/download/v#{version}/pngoptim_#{version}_darwin_universal.tar.gz"
+            sha256 "${SHA256}"
+            version "${VERSION}"
+            license "MIT"
+
+            def install
+              bin.install "pngoptim"
+            end
+
+            test do
+              system bin/"pngoptim", "--version"
+            end
+          end
+          FORMULA
+
+          cd homebrew-tap
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Formula/pngoptim.rb
+          git commit -m "pngoptim ${VERSION}"
+          git push

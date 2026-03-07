@@ -84,6 +84,24 @@ All algorithm work follows reference-first methodology: read the reference imple
 - Lossless path reports `quality_score=100, quality_mse=0.0`
 - `skip-if-larger` check applies to APNG output
 
+## CI/CD Workflows
+
+| Workflow | Trigger | Purpose |
+|----------|---------|---------|
+| `ci.yml` | push/PR to main | Test (ubuntu + macOS), clippy, fmt |
+| `release.yml` | tag `v*` | Multi-platform build → GitHub Release → Homebrew tap update |
+
+### Release Platforms
+- macOS Universal (arm64 + x86_64 via lipo)
+- Linux x86_64 (ubuntu-latest)
+- Linux arm64 (ubuntu-24.04-arm native)
+- Windows x86_64 (windows-latest)
+
+### Homebrew
+- Tap: `okooo5km/homebrew-tap`
+- Formula auto-updated on non-prerelease tags
+- Requires `HOMEBREW_TAP_TOKEN` secret with repo access to homebrew-tap
+
 ## Engineering Constraints
 
 1. Rust toolchain + zlib-rs for deflate compression (direct dependency for custom mem_level); no Python in mainline
