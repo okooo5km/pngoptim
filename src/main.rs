@@ -1,14 +1,7 @@
-mod apng;
-mod cli;
-mod error;
-mod palette_quant;
-mod pipeline;
-mod quality;
-
 use clap::Parser;
-use cli::{Cli, OutputTarget, QualityRange};
-use error::AppError;
-use pipeline::{
+use pngoptim::cli::{Cli, OutputTarget, QualityRange};
+use pngoptim::error::AppError;
+use pngoptim::pipeline::{
     PipelineOptions, PipelineResult, process_png_bytes, process_png_file, write_output_file,
 };
 use std::io::{Read, Write};
@@ -191,8 +184,8 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::format_success_message;
-    use crate::cli::QualityRange;
-    use crate::pipeline::{PipelineMetrics, PipelineResult};
+    use pngoptim::cli::QualityRange;
+    use pngoptim::pipeline::{PipelineMetrics, PipelineResult};
     use std::path::Path;
 
     fn sample_result() -> PipelineResult {

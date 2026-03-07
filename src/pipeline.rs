@@ -27,6 +27,20 @@ pub struct PipelineOptions {
     pub no_icc: bool,
 }
 
+impl Default for PipelineOptions {
+    fn default() -> Self {
+        Self {
+            quality: None,
+            speed: 4,
+            dither_level: 1.0,
+            posterize: None,
+            strip: false,
+            skip_if_larger: false,
+            no_icc: false,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct PipelineResult {
     pub width: u32,
