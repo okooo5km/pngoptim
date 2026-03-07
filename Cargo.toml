@@ -14,4 +14,6 @@ serde_json = "1.0.145"
 csv = "1.4.0"
 sha2 = "0.10.9"
 rayon = "1.11.0"
-flate2 = { version = "1", default-features = false, features = ["zlib-ng"] }
+flate2 = { version = "1", default-features = false, features = ["zlib-rs"] }
+zlib-rs = "0.6.3"
+crc32fast = "1"

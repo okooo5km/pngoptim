@@ -1,6 +1,5 @@
 use image::ImageFormat;
 use lcms2::{CIExyY, CIExyYTRIPLE, Intent, PixelFormat, Profile, ToneCurve, Transform};
-use std::borrow::Cow;
 use std::fs;
 use std::io::BufWriter;
 use std::io::Cursor;
@@ -367,16 +366,11 @@ fn encode_indexed_png_to_vec(
 ) -> Result<Vec<u8>, AppError> {
     let bit_depth = indexed_bit_depth(palette_rgba.len());
     let packed_indices = pack_indices_by_bit_depth(indices, width, height, bit_depth)?;
-    let compression = if speed >= 10 {
-        png::DeflateCompression::Level(1)
-    } else {
-        png::DeflateCompression::Level(9)
-    };
-    let filters = [png::Filter::NoFilter];
+    let compression_level = if speed >= 10 { 1 } else { 9 };
 
-    let mut best: Option<Vec<u8>> = None;
-    for filter in filters {
-        let encoded = encode_indexed_png_with_filter(
+    if speed >= 10 {
+        // Fast mode: single attempt with default mem_level
+        return encode_indexed_png_raw(
             width,
             height,
             bit_depth,
@@ -384,21 +378,67 @@ fn encode_indexed_png_to_vec(
             palette_rgba,
             metadata,
             strip,
-            filter,
-            compression,
-        )?;
-        if best
-            .as_ref()
-            .is_none_or(|existing| encoded.len() < existing.len())
-        {
-            best = Some(encoded);
-        }
+            compression_level,
+            8,
+        );
     }
 
-    Ok(best.unwrap_or_default())
+    // Try both mem_level=5 and mem_level=8 in parallel, pick smaller output.
+    // mem_level=5 often wins for small palettes / repetitive data,
+    // mem_level=8 wins for larger images with more varied index patterns.
+    let (out_ml5, out_ml8) = rayon::join(
+        || {
+            encode_indexed_png_raw(
+                width,
+                height,
+                bit_depth,
+                &packed_indices,
+                palette_rgba,
+                metadata,
+                strip,
+                compression_level,
+                5,
+            )
+        },
+        || {
+            encode_indexed_png_raw(
+                width,
+                height,
+                bit_depth,
+                &packed_indices,
+                palette_rgba,
+                metadata,
+                strip,
+                compression_level,
+                8,
+            )
+        },
+    );
+    let out_ml5 = out_ml5?;
+    let out_ml8 = out_ml8?;
+
+    Ok(if out_ml5.len() <= out_ml8.len() {
+        out_ml5
+    } else {
+        out_ml8
+    })
 }
 
-fn encode_indexed_png_with_filter(
+// ── Hand-written PNG encoder with zlib-rs (mem_level=5) ──
+
+const PNG_SIGNATURE: [u8; 8] = [137, 80, 78, 71, 13, 10, 26, 10];
+
+fn write_png_chunk(out: &mut Vec<u8>, chunk_type: &[u8; 4], data: &[u8]) {
+    out.extend_from_slice(&(data.len() as u32).to_be_bytes());
+    out.extend_from_slice(chunk_type);
+    out.extend_from_slice(data);
+    let mut crc = crc32fast::Hasher::new();
+    crc.update(chunk_type);
+    crc.update(data);
+    out.extend_from_slice(&crc.finalize().to_be_bytes());
+}
+
+fn encode_indexed_png_raw(
     width: u32,
     height: u32,
     bit_depth: png::BitDepth,
@@ -406,55 +446,187 @@ fn encode_indexed_png_with_filter(
     palette_rgba: &[[u8; 4]],
     metadata: Option<&PreservedMetadata>,
     strip: bool,
-    filter: png::Filter,
-    compression: png::DeflateCompression,
+    compression_level: i32,
+    mem_level: i32,
 ) -> Result<Vec<u8>, AppError> {
-    let mut info = png::Info::with_size(width, height);
-    info.color_type = png::ColorType::Indexed;
-    info.bit_depth = bit_depth;
-    info.palette = Some(Cow::Owned(
-        palette_rgba
-            .iter()
-            .flat_map(|v| [v[0], v[1], v[2]])
-            .collect::<Vec<u8>>(),
-    ));
-    if let Some(last_non_opaque) = palette_rgba.iter().rposition(|v| v[3] < 255) {
-        info.trns = Some(Cow::Owned(
-            palette_rgba
-                .iter()
-                .take(last_non_opaque + 1)
-                .map(|v| v[3])
-                .collect::<Vec<u8>>(),
-        ));
+    let row_bytes = row_byte_count(width, bit_depth);
+    if packed_indices.len() != row_bytes * height as usize {
+        return Err(AppError::Encode(format!(
+            "packed data length mismatch: expected={}, actual={}",
+            row_bytes * height as usize,
+            packed_indices.len()
+        )));
     }
 
+    // Build filtered row data (NoFilter: prepend 0x00 to each row)
+    let filtered_len = (row_bytes + 1) * height as usize;
+    let mut filtered = Vec::with_capacity(filtered_len);
+    for row in packed_indices.chunks(row_bytes) {
+        filtered.push(0u8); // NoFilter
+        filtered.extend_from_slice(row);
+    }
+
+    let config = zlib_rs::DeflateConfig {
+        level: compression_level,
+        mem_level,
+        ..zlib_rs::DeflateConfig::default()
+    };
+    let bound = zlib_rs::compress_bound(filtered.len());
+    let mut compressed = vec![0u8; bound];
+    let (compressed_data, rc) = zlib_rs::compress_slice(&mut compressed, &filtered, config);
+    if rc != zlib_rs::ReturnCode::Ok {
+        return Err(AppError::Encode(format!(
+            "zlib compression failed: {rc:?}"
+        )));
+    }
+    let compressed_len = compressed_data.len();
+
+    // Estimate output size and allocate
+    let est_size = 8 + 25 + 12 + palette_rgba.len() * 3 + 12 + compressed_len + 12 + 256;
+    let mut out = Vec::with_capacity(est_size);
+
+    // PNG signature
+    out.extend_from_slice(&PNG_SIGNATURE);
+
+    // IHDR
+    let mut ihdr = [0u8; 13];
+    ihdr[0..4].copy_from_slice(&width.to_be_bytes());
+    ihdr[4..8].copy_from_slice(&height.to_be_bytes());
+    ihdr[8] = bit_depth as u8;
+    ihdr[9] = 3; // ColorType::Indexed
+    // compression=0, filter=0, interlace=0
+    write_png_chunk(&mut out, b"IHDR", &ihdr);
+
+    // Metadata chunks (only if not stripped)
     if !strip {
         if let Some(meta) = metadata {
-            info.source_gamma = meta.source_gamma;
-            info.source_chromaticities = meta.source_chromaticities;
-            info.srgb = meta.srgb;
-            info.pixel_dims = meta.pixel_dims;
-            info.icc_profile = meta.icc_profile.as_ref().map(|v| Cow::Owned(v.clone()));
-            info.exif_metadata = meta.exif_metadata.as_ref().map(|v| Cow::Owned(v.clone()));
-            info.uncompressed_latin1_text = meta.uncompressed_latin1_text.clone();
-            info.compressed_latin1_text = meta.compressed_latin1_text.clone();
-            info.utf8_text = meta.utf8_text.clone();
+            // pHYs
+            if let Some(pd) = meta.pixel_dims {
+                let mut phys = [0u8; 9];
+                phys[0..4].copy_from_slice(&pd.xppu.to_be_bytes());
+                phys[4..8].copy_from_slice(&pd.yppu.to_be_bytes());
+                phys[8] = match pd.unit {
+                    png::Unit::Meter => 1,
+                    png::Unit::Unspecified => 0,
+                };
+                write_png_chunk(&mut out, b"pHYs", &phys);
+            }
+
+            // Color space: sRGB takes precedence, otherwise gAMA/cHRM/iCCP
+            if let Some(srgb) = meta.srgb {
+                // sRGB chunk (1 byte: rendering intent)
+                write_png_chunk(&mut out, b"sRGB", &[srgb as u8]);
+                // When sRGB is set, omit gAMA and cHRM — they're implied by sRGB
+                // and pngquant does the same. This saves ~20 bytes.
+            } else {
+                if let Some(gamma) = meta.source_gamma {
+                    write_png_chunk(&mut out, b"gAMA", &gamma.into_value().to_be_bytes());
+                }
+                if let Some(chrm) = meta.source_chromaticities {
+                    let mut data = [0u8; 32];
+                    data[0..4]
+                        .copy_from_slice(&chrm.white.0.into_value().to_be_bytes());
+                    data[4..8]
+                        .copy_from_slice(&chrm.white.1.into_value().to_be_bytes());
+                    data[8..12]
+                        .copy_from_slice(&chrm.red.0.into_value().to_be_bytes());
+                    data[12..16]
+                        .copy_from_slice(&chrm.red.1.into_value().to_be_bytes());
+                    data[16..20]
+                        .copy_from_slice(&chrm.green.0.into_value().to_be_bytes());
+                    data[20..24]
+                        .copy_from_slice(&chrm.green.1.into_value().to_be_bytes());
+                    data[24..28]
+                        .copy_from_slice(&chrm.blue.0.into_value().to_be_bytes());
+                    data[28..32]
+                        .copy_from_slice(&chrm.blue.1.into_value().to_be_bytes());
+                    write_png_chunk(&mut out, b"cHRM", &data);
+                }
+                if let Some(icc) = &meta.icc_profile {
+                    // iCCP: profile_name + null + compression_method(0) + compressed_profile
+                    let name = b"_\0\0"; // name "_", null, compression method 0
+                    let mut iccp_data = Vec::with_capacity(name.len() + icc.len());
+                    iccp_data.extend_from_slice(name);
+                    let mut icc_compressed =
+                        vec![0u8; zlib_rs::compress_bound(icc.len())];
+                    let (icc_out, _) = zlib_rs::compress_slice(
+                        &mut icc_compressed,
+                        icc,
+                        zlib_rs::DeflateConfig::default(),
+                    );
+                    iccp_data.extend_from_slice(icc_out);
+                    write_png_chunk(&mut out, b"iCCP", &iccp_data);
+                }
+            }
+
+            // eXIf
+            if let Some(exif) = &meta.exif_metadata {
+                write_png_chunk(&mut out, b"eXIf", exif);
+            }
         }
     }
 
-    let mut out = Vec::new();
-    let mut encoder = png::Encoder::with_info(&mut out, info)
-        .map_err(|e| AppError::Encode(format!("failed to initialize PNG encoder: {e}")))?;
-    encoder.set_deflate_compression(compression);
-    encoder.set_filter(filter);
-    let mut writer = encoder
-        .write_header()
-        .map_err(|e| AppError::Encode(format!("failed to write PNG header: {e}")))?;
-    writer
-        .write_image_data(packed_indices)
-        .map_err(|e| AppError::Encode(format!("failed to write PNG image data: {e}")))?;
-    drop(writer);
+    // PLTE
+    let plte_data: Vec<u8> = palette_rgba.iter().flat_map(|v| [v[0], v[1], v[2]]).collect();
+    write_png_chunk(&mut out, b"PLTE", &plte_data);
+
+    // tRNS (only if any non-opaque entries)
+    if let Some(last_non_opaque) = palette_rgba.iter().rposition(|v| v[3] < 255) {
+        let trns: Vec<u8> = palette_rgba
+            .iter()
+            .take(last_non_opaque + 1)
+            .map(|v| v[3])
+            .collect();
+        write_png_chunk(&mut out, b"tRNS", &trns);
+    }
+
+    // Text chunks (before IDAT, per PNG spec recommendation)
+    if !strip {
+        if let Some(meta) = metadata {
+            use png::text_metadata::EncodableTextChunk;
+            let mut text_buf = Vec::new();
+            for chunk in &meta.uncompressed_latin1_text {
+                text_buf.clear();
+                if chunk.encode(&mut text_buf).is_ok() {
+                    out.extend_from_slice(&text_buf);
+                }
+            }
+            for chunk in &meta.compressed_latin1_text {
+                text_buf.clear();
+                if chunk.encode(&mut text_buf).is_ok() {
+                    out.extend_from_slice(&text_buf);
+                }
+            }
+            for chunk in &meta.utf8_text {
+                text_buf.clear();
+                if chunk.encode(&mut text_buf).is_ok() {
+                    out.extend_from_slice(&text_buf);
+                }
+            }
+        }
+    }
+
+    // IDAT (split into max 2GB chunks per PNG spec, but typically one chunk suffices)
+    const MAX_IDAT_LEN: usize = (u32::MAX >> 1) as usize;
+    for chunk in compressed[..compressed_len].chunks(MAX_IDAT_LEN) {
+        write_png_chunk(&mut out, b"IDAT", chunk);
+    }
+
+    // IEND
+    write_png_chunk(&mut out, b"IEND", &[]);
+
     Ok(out)
+}
+
+fn row_byte_count(width: u32, bit_depth: png::BitDepth) -> usize {
+    let bits_per_pixel = match bit_depth {
+        png::BitDepth::One => 1usize,
+        png::BitDepth::Two => 2,
+        png::BitDepth::Four => 4,
+        png::BitDepth::Eight => 8,
+        png::BitDepth::Sixteen => 16,
+    };
+    (width as usize * bits_per_pixel).div_ceil(8)
 }
 
 fn indexed_bit_depth(palette_len: usize) -> png::BitDepth {

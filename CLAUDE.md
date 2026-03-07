@@ -32,7 +32,7 @@ cargo run --release --bin xtask -- stability --run-id <id>
 | File | Lines | Purpose |
 |------|-------|---------|
 | `src/palette_quant.rs` | ~2462 | Core quantization: histogram, median cut, k-means, VP-tree nearest search, remap (plain + Floyd dithering), dither map, contrast maps |
-| `src/pipeline.rs` | ~750 | Processing pipeline: decode -> color management -> quantize -> encode. APNG detection/routing. Quality gating, metadata preservation, ICC/gAMA normalization |
+| `src/pipeline.rs` | ~850 | Processing pipeline: decode -> color management -> quantize -> encode. Hand-written PNG encoder with zlib-rs (dual mem_level). APNG detection/routing. Quality gating, metadata preservation, ICC/gAMA normalization |
 | `src/quality.rs` | ~257 | InternalPixel (gamma-weighted ARGB), quality<->MSE mapping, SpeedSettings, quality evaluation |
 | `src/cli.rs` | ~293 | CLI argument parsing (clap), QualityRange, output path logic |
 | `src/main.rs` | ~252 | Entry point, batch processing, exit codes |
@@ -86,7 +86,7 @@ All algorithm work follows reference-first methodology: read the reference imple
 
 ## Engineering Constraints
 
-1. Rust toolchain + zlib-ng (C) for deflate compression; no Python in mainline
+1. Rust toolchain + zlib-rs for deflate compression (direct dependency for custom mem_level); no Python in mainline
 2. Algorithm alignment with pngquant/libimagequant, not blind invention
 3. MIT license; reference code not directly copied (license policy pending)
 4. Every change must pass regression gates before merging
