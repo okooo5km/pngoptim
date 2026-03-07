@@ -146,12 +146,12 @@ jobs:
 
       - name: Update formula
         env:
-          GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
         run: |
           VERSION=${GITHUB_REF_NAME#v}
           SHA256=$(cat pngoptim_${VERSION}_darwin_universal.tar.gz.sha256 | awk '{print $1}')
 
-          gh repo clone okooo5km/homebrew-tap homebrew-tap
+          git clone "https://x-access-token:${HOMEBREW_TAP_TOKEN}@github.com/okooo5km/homebrew-tap.git" homebrew-tap
 
           cat > homebrew-tap/pngoptim.rb << FORMULA
           class Pngoptim < Formula
