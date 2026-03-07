@@ -526,10 +526,7 @@ fn pack_indices_by_bit_depth(
 
 fn extract_metadata(input_bytes: &[u8]) -> Option<PreservedMetadata> {
     let decoder = png::Decoder::new(Cursor::new(input_bytes));
-    let mut reader = decoder.read_info().ok()?;
-    let out_size = reader.output_buffer_size()?;
-    let mut buf = vec![0; out_size];
-    let _ = reader.next_frame(&mut buf).ok()?;
+    let reader = decoder.read_info().ok()?;
     let info = reader.info();
 
     Some(PreservedMetadata {

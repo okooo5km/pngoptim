@@ -57,12 +57,11 @@ pub fn quantize_indexed(
             indices: Vec::new(),
         };
     }
-
     let gamma = gamma_lut(SRGB_OUTPUT_GAMMA);
     let contrast_pixels =
         if settings.use_contrast_maps || settings.use_dither_map != DitherMapMode::None {
             Some(
-                rgba.chunks_exact(4)
+                rgba.par_chunks_exact(4)
                     .map(|px| InternalPixel::from_rgba(&gamma, px))
                     .collect::<Vec<_>>(),
             )
@@ -525,22 +524,51 @@ fn build_histogram(
 }
 
 fn build_histogram_map(rgba: &[u8], importance_map: Option<&[u8]>) -> HistMap {
-    let mut map: HistMap = HashMap::with_hasher(U32HashBuilder::default());
-    for (pixel_idx, px) in rgba.chunks_exact(4).enumerate() {
-        let representative = [px[0], px[1], px[2], px[3]];
-        let key = pack_rgba_key(&representative, 0);
-        let entry = map.entry(key).or_default();
-        let importance = u32::from(
-            importance_map
-                .and_then(|map| map.get(pixel_idx))
-                .copied()
-                .unwrap_or(255),
-        );
-        entry.importance_sum = entry.importance_sum.saturating_add(importance);
-        if !entry.initialized {
-            entry.representative = representative;
-            entry.cluster_index = cluster_index(representative);
-            entry.initialized = true;
+    let pixel_count = rgba.len() / 4;
+    let num_threads = rayon::current_num_threads().max(1);
+    let chunk_pixels = (pixel_count + num_threads - 1) / num_threads;
+    let chunk_bytes = chunk_pixels * 4;
+
+    let partial_maps: Vec<HistMap> = rgba
+        .par_chunks(chunk_bytes)
+        .enumerate()
+        .map(|(chunk_idx, chunk)| {
+            let base_pixel = chunk_idx * chunk_pixels;
+            let mut map: HistMap = HashMap::with_hasher(U32HashBuilder::default());
+            for (local_idx, px) in chunk.chunks_exact(4).enumerate() {
+                let representative = [px[0], px[1], px[2], px[3]];
+                let key = pack_rgba_key(&representative, 0);
+                let entry = map.entry(key).or_default();
+                let pixel_idx = base_pixel + local_idx;
+                let importance = u32::from(
+                    importance_map
+                        .and_then(|m| m.get(pixel_idx))
+                        .copied()
+                        .unwrap_or(255),
+                );
+                entry.importance_sum = entry.importance_sum.saturating_add(importance);
+                if !entry.initialized {
+                    entry.representative = representative;
+                    entry.cluster_index = cluster_index(representative);
+                    entry.initialized = true;
+                }
+            }
+            map
+        })
+        .collect();
+
+    // Merge partial maps
+    let mut iter = partial_maps.into_iter();
+    let mut map = iter.next().unwrap_or_else(|| HashMap::with_hasher(U32HashBuilder::default()));
+    for partial in iter {
+        for (key, acc) in partial {
+            let entry = map.entry(key).or_default();
+            entry.importance_sum = entry.importance_sum.saturating_add(acc.importance_sum);
+            if !entry.initialized {
+                entry.representative = acc.representative;
+                entry.cluster_index = acc.cluster_index;
+                entry.initialized = acc.initialized;
+            }
         }
     }
     map
@@ -2005,41 +2033,46 @@ fn compute_contrast_maps(
     let mut noise = vec![0u8; width * height];
     let mut edges = vec![0u8; width * height];
 
-    for row in 0..height {
-        let prev_row = row.saturating_sub(1);
-        let next_row = (row + 1).min(height - 1);
-        for col in 0..width {
-            let prev = pixels[row * width + col.saturating_sub(1)];
-            let curr = pixels[row * width + col];
-            let next = pixels[row * width + (col + 1).min(width - 1)];
-            let prev_line = pixels[prev_row * width + col];
-            let next_line = pixels[next_row * width + col];
+    // Parallel row computation — each row's noise/edge only depends on
+    // its own row and the adjacent rows (read-only), so rows are independent.
+    noise
+        .par_chunks_mut(width)
+        .zip(edges.par_chunks_mut(width))
+        .enumerate()
+        .for_each(|(row, (noise_row, edges_row))| {
+            let prev_row = row.saturating_sub(1);
+            let next_row = (row + 1).min(height - 1);
+            for col in 0..width {
+                let prev = pixels[row * width + col.saturating_sub(1)];
+                let curr = pixels[row * width + col];
+                let next = pixels[row * width + (col + 1).min(width - 1)];
+                let prev_line = pixels[prev_row * width + col];
+                let next_line = pixels[next_row * width + col];
 
-            let horiz = InternalPixel {
-                a: (prev.a + next.a - curr.a * 2.0).abs(),
-                r: (prev.r + next.r - curr.r * 2.0).abs(),
-                g: (prev.g + next.g - curr.g * 2.0).abs(),
-                b: (prev.b + next.b - curr.b * 2.0).abs(),
-            };
-            let vert = InternalPixel {
-                a: (prev_line.a + next_line.a - curr.a * 2.0).abs(),
-                r: (prev_line.r + next_line.r - curr.r * 2.0).abs(),
-                g: (prev_line.g + next_line.g - curr.g * 2.0).abs(),
-                b: (prev_line.b + next_line.b - curr.b * 2.0).abs(),
-            };
+                let horiz = InternalPixel {
+                    a: (prev.a + next.a - curr.a * 2.0).abs(),
+                    r: (prev.r + next.r - curr.r * 2.0).abs(),
+                    g: (prev.g + next.g - curr.g * 2.0).abs(),
+                    b: (prev.b + next.b - curr.b * 2.0).abs(),
+                };
+                let vert = InternalPixel {
+                    a: (prev_line.a + next_line.a - curr.a * 2.0).abs(),
+                    r: (prev_line.r + next_line.r - curr.r * 2.0).abs(),
+                    g: (prev_line.g + next_line.g - curr.g * 2.0).abs(),
+                    b: (prev_line.b + next_line.b - curr.b * 2.0).abs(),
+                };
 
-            let horiz_max = horiz.a.max(horiz.r).max(horiz.g.max(horiz.b));
-            let vert_max = vert.a.max(vert.r).max(vert.g.max(vert.b));
-            let edge = horiz_max.max(vert_max);
-            let mut z = (horiz_max - vert_max).abs().mul_add(-0.5, edge);
-            z = 1.0 - z.max(horiz_max.min(vert_max));
-            z *= z;
-            z *= z;
-            let idx = row * width + col;
-            noise[idx] = z.mul_add(176.0, 80.0) as u8;
-            edges[idx] = ((1.0 - edge).clamp(0.0, 1.0) * 256.0) as u8;
-        }
-    }
+                let horiz_max = horiz.a.max(horiz.r).max(horiz.g.max(horiz.b));
+                let vert_max = vert.a.max(vert.r).max(vert.g.max(vert.b));
+                let edge = horiz_max.max(vert_max);
+                let mut z = (horiz_max - vert_max).abs().mul_add(-0.5, edge);
+                z = 1.0 - z.max(horiz_max.min(vert_max));
+                z *= z;
+                z *= z;
+                noise_row[col] = z.mul_add(176.0, 80.0) as u8;
+                edges_row[col] = ((1.0 - edge).clamp(0.0, 1.0) * 256.0) as u8;
+            }
+        });
 
     let mut tmp = vec![0u8; width * height];
     max3(&noise, &mut tmp, width, height);
@@ -2066,27 +2099,34 @@ fn min3(src: &[u8], dst: &mut [u8], width: usize, height: usize) {
     op3(src, dst, width, height, |a, b| a.min(b));
 }
 
-fn op3(src: &[u8], dst: &mut [u8], width: usize, height: usize, op: impl Fn(u8, u8) -> u8) {
-    for row in 0..height {
-        let row_slice = &src[row * width..][..width];
-        let dst_slice = &mut dst[row * width..][..width];
-        let prev_row = &src[row.saturating_sub(1) * width..][..width];
-        let next_row = &src[(row + 1).min(height - 1) * width..][..width];
+fn op3(
+    src: &[u8],
+    dst: &mut [u8],
+    width: usize,
+    height: usize,
+    op: impl Fn(u8, u8) -> u8 + Sync,
+) {
+    dst.par_chunks_mut(width)
+        .enumerate()
+        .for_each(|(row, dst_slice)| {
+            let row_slice = &src[row * width..][..width];
+            let prev_row = &src[row.saturating_sub(1) * width..][..width];
+            let next_row = &src[(row + 1).min(height - 1) * width..][..width];
 
-        let mut curr = row_slice[0];
-        let mut next = row_slice[0];
-        for col in 0..width - 1 {
-            let prev = curr;
-            curr = next;
-            next = row_slice[col + 1];
-            let t1 = op(prev, next);
-            let t2 = op(next_row[col], prev_row[col]);
-            dst_slice[col] = op(curr, op(t1, t2));
-        }
-        let t1 = op(curr, next);
-        let t2 = op(next_row[width - 1], prev_row[width - 1]);
-        dst_slice[width - 1] = op(curr, op(t1, t2));
-    }
+            let mut curr = row_slice[0];
+            let mut next_val = row_slice[0];
+            for col in 0..width - 1 {
+                let prev = curr;
+                curr = next_val;
+                next_val = row_slice[col + 1];
+                let t1 = op(prev, next_val);
+                let t2 = op(next_row[col], prev_row[col]);
+                dst_slice[col] = op(curr, op(t1, t2));
+            }
+            let t1 = op(curr, next_val);
+            let t2 = op(next_row[width - 1], prev_row[width - 1]);
+            dst_slice[width - 1] = op(curr, op(t1, t2));
+        });
 }
 
 fn blur(src_dst: &mut [u8], tmp: &mut [u8], width: usize, height: usize, size: u16) {
