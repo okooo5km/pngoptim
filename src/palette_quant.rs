@@ -353,10 +353,10 @@ impl ColorBox {
 
     fn prepare_sort(self, items: &mut [HistItem]) {
         let mut channels = [
-            (0usize, self.variance[0] as f32),
-            (1usize, self.variance[1] as f32),
-            (2usize, self.variance[2] as f32),
-            (3usize, self.variance[3] as f32),
+            (0usize, self.variance[0]),
+            (1usize, self.variance[1]),
+            (2usize, self.variance[2]),
+            (3usize, self.variance[3]),
         ];
         channels.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal));
 
@@ -526,7 +526,7 @@ fn build_histogram(
 fn build_histogram_map(rgba: &[u8], importance_map: Option<&[u8]>) -> HistMap {
     let pixel_count = rgba.len() / 4;
     let num_threads = rayon::current_num_threads().max(1);
-    let chunk_pixels = (pixel_count + num_threads - 1) / num_threads;
+    let chunk_pixels = pixel_count.div_ceil(num_threads);
     let chunk_bytes = chunk_pixels * 4;
 
     let partial_maps: Vec<HistMap> = rgba
@@ -559,7 +559,9 @@ fn build_histogram_map(rgba: &[u8], importance_map: Option<&[u8]>) -> HistMap {
 
     // Merge partial maps
     let mut iter = partial_maps.into_iter();
-    let mut map = iter.next().unwrap_or_else(|| HashMap::with_hasher(U32HashBuilder::default()));
+    let mut map = iter
+        .next()
+        .unwrap_or_else(|| HashMap::with_hasher(U32HashBuilder::default()));
     for partial in iter {
         for (key, acc) in partial {
             let entry = map.entry(key).or_default();
@@ -895,9 +897,7 @@ fn find_best_palette(
             break best_palette;
         }
     }
-    .unwrap_or_else(|| {
-        median_cut_palette(&mut hist, max_colors, f64::INFINITY, f64::INFINITY)
-    });
+    .unwrap_or_else(|| median_cut_palette(&mut hist, max_colors, f64::INFINITY, f64::INFINITY));
 
     let final_iterations = effective_kmeans_iterations(
         settings.kmeans_iterations,
@@ -990,10 +990,10 @@ fn refine_palette(
         let stats = kmeans_iteration(histogram, palette, false);
         let previous_error = *palette_error;
         *palette_error = Some(stats.error);
-        if let Some(previous_error) = previous_error {
-            if (previous_error - stats.error).abs() < iteration_limit {
-                break;
-            }
+        if let Some(previous_error) = previous_error
+            && (previous_error - stats.error).abs() < iteration_limit
+        {
+            break;
         }
         iteration += if stats.error > max_mse.unwrap_or(1e20) * 1.5 {
             2
@@ -1034,15 +1034,15 @@ fn kmeans_iteration(
             KmeansAccumulator::merge,
         );
 
-    for idx in 0..palette.len() {
-        palette[idx].popularity = acc.weights[idx] as f32;
+    for (idx, entry) in palette.iter_mut().enumerate() {
+        entry.popularity = acc.weights[idx] as f32;
         if acc.weights[idx] == 0.0 {
             continue;
         }
-        if palette[idx].color.a == 0.0 {
+        if entry.color.a == 0.0 {
             continue;
         }
-        palette[idx].color = InternalPixel {
+        entry.color = InternalPixel {
             a: (acc.sums[idx][0] / acc.weights[idx]) as f32,
             r: (acc.sums[idx][1] / acc.weights[idx]) as f32,
             g: (acc.sums[idx][2] / acc.weights[idx]) as f32,
@@ -1109,7 +1109,7 @@ fn replace_unused_palette_entries(histogram: &[HistItem], palette: &mut [Palette
                     usize::from(item.likely_palette_index).min(palette.len().saturating_sub(1));
                 let may_be_worst = palette
                     .get(hint)
-                    .map_or(true, |pal| pal.color.diff(item.color) > worst_diff);
+                    .is_none_or(|pal| pal.color.diff(item.color) > worst_diff);
                 if !may_be_worst {
                     continue;
                 }
@@ -1148,16 +1148,16 @@ fn sort_palette_entries(palette: &mut [PaletteEntry]) {
 fn effective_feedback_trials(base_trials: u16, hist_items: usize) -> u16 {
     let mut trials = base_trials;
     if hist_items > 5_000 {
-        trials = (trials * 3 + 3) / 4;
+        trials = (trials * 3).div_ceil(4);
     }
     if hist_items > 25_000 {
-        trials = (trials * 3 + 3) / 4;
+        trials = (trials * 3).div_ceil(4);
     }
     if hist_items > 50_000 {
-        trials = (trials * 3 + 3) / 4;
+        trials = (trials * 3).div_ceil(4);
     }
     if hist_items > 100_000 {
-        trials = (trials * 3 + 3) / 4;
+        trials = (trials * 3).div_ceil(4);
     }
     trials
 }
@@ -1170,16 +1170,16 @@ fn effective_kmeans_iterations(
 ) -> u16 {
     let mut iterations = base_iterations;
     if hist_items > 5_000 {
-        iterations = (iterations * 3 + 3) / 4;
+        iterations = (iterations * 3).div_ceil(4);
     }
     if hist_items > 25_000 {
-        iterations = (iterations * 3 + 3) / 4;
+        iterations = (iterations * 3).div_ceil(4);
     }
     if hist_items > 50_000 {
-        iterations = (iterations * 3 + 3) / 4;
+        iterations = (iterations * 3).div_ceil(4);
     }
     if hist_items > 100_000 {
-        iterations = (iterations * 3 + 3) / 4;
+        iterations = (iterations * 3).div_ceil(4);
     }
     if iterations == 0 && !palette_error_is_known && has_quality_target {
         iterations = 1;
@@ -1321,8 +1321,8 @@ fn build_search_node(
         };
     }
 
-    if let Some(popularities) = popularities {
-        if let Some((most_popular, _)) =
+    if let Some(popularities) = popularities
+        && let Some((most_popular, _)) =
             indexes
                 .iter()
                 .enumerate()
@@ -1331,9 +1331,8 @@ fn build_search_node(
                     let right = popularities.get(**right_idx).copied().unwrap_or_default();
                     left.partial_cmp(&right).unwrap_or(Ordering::Equal)
                 })
-        {
-            indexes.swap(0, most_popular);
-        }
+    {
+        indexes.swap(0, most_popular);
     }
 
     let idx = indexes[0];
@@ -1407,6 +1406,7 @@ fn search_node(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn remap_image(
     rgba: &[u8],
     width: usize,
@@ -1471,6 +1471,7 @@ fn remap_image(
     }
 }
 
+#[allow(clippy::type_complexity)]
 fn remap_image_plain(
     rgba: &[u8],
     width: usize,
@@ -1503,7 +1504,6 @@ fn remap_image_plain(
     let remapped_palette = palette_points
         .into_iter()
         .zip(output_palette)
-        .map(|(color, rgba)| (color, rgba))
         .collect::<Vec<_>>();
 
     (remapped_palette, final_pass.indices, final_pass.counts)
@@ -1525,9 +1525,10 @@ fn remap_image_plain_pass(
 ) -> PlainRemapPass {
     let pal_len = palette_points.len();
     let tree = NearestTree::new(palette_points);
-    let height = (pixels.len() + width - 1) / width;
+    let height = pixels.len().div_ceil(width);
 
     // Process rows in parallel — row hint dependency is within-row only
+    #[allow(clippy::type_complexity)]
     let row_results: Vec<(Vec<u8>, Vec<usize>, Vec<[f64; 4]>, Vec<f64>, f64)> = (0..height)
         .into_par_iter()
         .map(|row| {
@@ -1612,15 +1613,15 @@ fn finalize_plain_remap(
 }
 
 fn apply_remap_feedback(palette_points: &mut [InternalPixel], pass: &PlainRemapPass) {
-    for idx in 0..palette_points.len() {
+    for (idx, point) in palette_points.iter_mut().enumerate() {
         if pass.weights[idx] == 0.0 {
             continue;
         }
-        if palette_points[idx].a == 0.0 {
+        if point.a == 0.0 {
             continue;
         }
 
-        palette_points[idx] = InternalPixel {
+        *point = InternalPixel {
             a: (pass.sums[idx][0] / pass.weights[idx]) as f32,
             r: (pass.sums[idx][1] / pass.weights[idx]) as f32,
             g: (pass.sums[idx][2] / pass.weights[idx]) as f32,
@@ -1629,6 +1630,7 @@ fn apply_remap_feedback(palette_points: &mut [InternalPixel], pass: &PlainRemapP
     }
 }
 
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
 fn remap_image_dithered(
     rgba: &[u8],
     width: usize,
@@ -1737,12 +1739,12 @@ fn remap_image_dithered(
     let remapped_palette = palette_points
         .into_iter()
         .zip(output_palette)
-        .map(|(color, rgba)| (color, rgba))
         .collect::<Vec<_>>();
 
     (remapped_palette, indices, counts)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn remap_image_dithered_rows(
     pixels: &[InternalPixel],
     width: usize,
@@ -1757,7 +1759,7 @@ fn remap_image_dithered_rows(
     indices: &mut [u8],
 ) {
     let num_chunks = effective_dither_chunks(width, height);
-    let chunk_height = (height + num_chunks - 1) / num_chunks;
+    let chunk_height = height.div_ceil(num_chunks);
     indices
         .par_chunks_mut(chunk_height.saturating_mul(width).max(width))
         .enumerate()
@@ -1795,7 +1797,7 @@ fn remap_image_dithered_rows(
                         output_image_is_remapped,
                         &mut curr_errors,
                         &mut next_errors,
-                        row % 2 == 0,
+                        row.is_multiple_of(2),
                     );
                 }
             }
@@ -1807,10 +1809,8 @@ fn remap_image_dithered_rows(
                     .get(row * width..row * width + width)
                     .unwrap_or(&[]);
                 let row_indices = &mut chunk[local_row * width..][..width];
-                if output_image_is_remapped {
-                    if let Some(plain_indices) = plain_indices {
-                        row_indices.copy_from_slice(&plain_indices[row * width..][..width]);
-                    }
+                if output_image_is_remapped && let Some(plain_indices) = plain_indices {
+                    row_indices.copy_from_slice(&plain_indices[row * width..][..width]);
                 }
                 dither_row(
                     row_pixels,
@@ -1823,7 +1823,7 @@ fn remap_image_dithered_rows(
                     output_image_is_remapped,
                     &mut curr_errors,
                     &mut next_errors,
-                    row % 2 == 0,
+                    row.is_multiple_of(2),
                 );
             }
         });
@@ -1840,6 +1840,7 @@ fn effective_dither_chunks(width: usize, height: usize) -> usize {
     suggested.max(1)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn dither_row(
     row_pixels: &[InternalPixel],
     output_row: &mut [u8],
@@ -1911,6 +1912,7 @@ fn dither_row(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn select_dither_map(
     pixels: &[InternalPixel],
     width: usize,
@@ -2031,6 +2033,7 @@ fn build_dither_map(
         let mut last_pixel = row_pixels[0];
         let mut last_col = 0usize;
 
+        #[allow(clippy::needless_range_loop)]
         for col in 1..width {
             let px = row_pixels[col];
             if px != last_pixel || col == width - 1 {
@@ -2134,13 +2137,7 @@ fn min3(src: &[u8], dst: &mut [u8], width: usize, height: usize) {
     op3(src, dst, width, height, |a, b| a.min(b));
 }
 
-fn op3(
-    src: &[u8],
-    dst: &mut [u8],
-    width: usize,
-    height: usize,
-    op: impl Fn(u8, u8) -> u8 + Sync,
-) {
+fn op3(src: &[u8], dst: &mut [u8], width: usize, height: usize, op: impl Fn(u8, u8) -> u8 + Sync) {
     dst.par_chunks_mut(width)
         .enumerate()
         .for_each(|(row, dst_slice)| {

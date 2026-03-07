@@ -38,8 +38,7 @@ impl SpeedSettings {
         let kmeans_iteration_limit = 1.0 / f64::from(1u32 << (23 - u32::from(effective_speed)));
 
         let feedback_loop_trials = (56 - 9 * i32::from(effective_speed)).max(0) as u16;
-        let max_histogram_entries =
-            ((1 << 17) + (1 << 18) * (10 - u32::from(effective_speed))) as u32;
+        let max_histogram_entries = (1 << 17) + (1 << 18) * (10 - u32::from(effective_speed));
         let input_posterize_bits = if effective_speed >= 8 { 1 } else { 0 };
 
         let mut use_dither_map = if effective_speed <= 6 {

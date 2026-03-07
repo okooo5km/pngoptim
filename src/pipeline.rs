@@ -6,9 +6,7 @@ use std::io::Cursor;
 use std::path::Path;
 use std::time::Instant;
 
-use crate::apng::{
-    decode_apng, encode_apng, fold_duplicate_frames, minimize_frame_rects,
-};
+use crate::apng::{decode_apng, encode_apng, fold_duplicate_frames, minimize_frame_rects};
 use crate::cli::QualityRange;
 use crate::error::AppError;
 use crate::palette_quant::{IndexedImage, quantize_indexed, quantizer_settings};
@@ -257,6 +255,7 @@ fn select_palette_candidate(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn evaluate_candidate(
     rgba: &[u8],
     width: usize,
@@ -279,6 +278,7 @@ fn evaluate_candidate(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn evaluate_candidate_once(
     rgba: &[u8],
     width: usize,
@@ -449,6 +449,7 @@ fn encode_indexed_png_raw(
     compression_level: i32,
     mem_level: i32,
 ) -> Result<Vec<u8>, AppError> {
+    #![allow(clippy::too_many_arguments)]
     let row_bytes = row_byte_count(width, bit_depth);
     if packed_indices.len() != row_bytes * height as usize {
         return Err(AppError::Encode(format!(
@@ -475,9 +476,7 @@ fn encode_indexed_png_raw(
     let mut compressed = vec![0u8; bound];
     let (compressed_data, rc) = zlib_rs::compress_slice(&mut compressed, &filtered, config);
     if rc != zlib_rs::ReturnCode::Ok {
-        return Err(AppError::Encode(format!(
-            "zlib compression failed: {rc:?}"
-        )));
+        return Err(AppError::Encode(format!("zlib compression failed: {rc:?}")));
     }
     let compressed_len = compressed_data.len();
 
@@ -498,76 +497,68 @@ fn encode_indexed_png_raw(
     write_png_chunk(&mut out, b"IHDR", &ihdr);
 
     // Metadata chunks (only if not stripped)
-    if !strip {
-        if let Some(meta) = metadata {
-            // pHYs
-            if let Some(pd) = meta.pixel_dims {
-                let mut phys = [0u8; 9];
-                phys[0..4].copy_from_slice(&pd.xppu.to_be_bytes());
-                phys[4..8].copy_from_slice(&pd.yppu.to_be_bytes());
-                phys[8] = match pd.unit {
-                    png::Unit::Meter => 1,
-                    png::Unit::Unspecified => 0,
-                };
-                write_png_chunk(&mut out, b"pHYs", &phys);
-            }
+    if !strip && let Some(meta) = metadata {
+        // pHYs
+        if let Some(pd) = meta.pixel_dims {
+            let mut phys = [0u8; 9];
+            phys[0..4].copy_from_slice(&pd.xppu.to_be_bytes());
+            phys[4..8].copy_from_slice(&pd.yppu.to_be_bytes());
+            phys[8] = match pd.unit {
+                png::Unit::Meter => 1,
+                png::Unit::Unspecified => 0,
+            };
+            write_png_chunk(&mut out, b"pHYs", &phys);
+        }
 
-            // Color space: sRGB takes precedence, otherwise gAMA/cHRM/iCCP
-            if let Some(srgb) = meta.srgb {
-                // sRGB chunk (1 byte: rendering intent)
-                write_png_chunk(&mut out, b"sRGB", &[srgb as u8]);
-                // When sRGB is set, omit gAMA and cHRM — they're implied by sRGB
-                // and pngquant does the same. This saves ~20 bytes.
-            } else {
-                if let Some(gamma) = meta.source_gamma {
-                    write_png_chunk(&mut out, b"gAMA", &gamma.into_value().to_be_bytes());
-                }
-                if let Some(chrm) = meta.source_chromaticities {
-                    let mut data = [0u8; 32];
-                    data[0..4]
-                        .copy_from_slice(&chrm.white.0.into_value().to_be_bytes());
-                    data[4..8]
-                        .copy_from_slice(&chrm.white.1.into_value().to_be_bytes());
-                    data[8..12]
-                        .copy_from_slice(&chrm.red.0.into_value().to_be_bytes());
-                    data[12..16]
-                        .copy_from_slice(&chrm.red.1.into_value().to_be_bytes());
-                    data[16..20]
-                        .copy_from_slice(&chrm.green.0.into_value().to_be_bytes());
-                    data[20..24]
-                        .copy_from_slice(&chrm.green.1.into_value().to_be_bytes());
-                    data[24..28]
-                        .copy_from_slice(&chrm.blue.0.into_value().to_be_bytes());
-                    data[28..32]
-                        .copy_from_slice(&chrm.blue.1.into_value().to_be_bytes());
-                    write_png_chunk(&mut out, b"cHRM", &data);
-                }
-                if let Some(icc) = &meta.icc_profile {
-                    // iCCP: profile_name + null + compression_method(0) + compressed_profile
-                    let name = b"_\0\0"; // name "_", null, compression method 0
-                    let mut iccp_data = Vec::with_capacity(name.len() + icc.len());
-                    iccp_data.extend_from_slice(name);
-                    let mut icc_compressed =
-                        vec![0u8; zlib_rs::compress_bound(icc.len())];
-                    let (icc_out, _) = zlib_rs::compress_slice(
-                        &mut icc_compressed,
-                        icc,
-                        zlib_rs::DeflateConfig::default(),
-                    );
-                    iccp_data.extend_from_slice(icc_out);
-                    write_png_chunk(&mut out, b"iCCP", &iccp_data);
-                }
+        // Color space: sRGB takes precedence, otherwise gAMA/cHRM/iCCP
+        if let Some(srgb) = meta.srgb {
+            // sRGB chunk (1 byte: rendering intent)
+            write_png_chunk(&mut out, b"sRGB", &[srgb as u8]);
+            // When sRGB is set, omit gAMA and cHRM — they're implied by sRGB
+            // and pngquant does the same. This saves ~20 bytes.
+        } else {
+            if let Some(gamma) = meta.source_gamma {
+                write_png_chunk(&mut out, b"gAMA", &gamma.into_value().to_be_bytes());
             }
+            if let Some(chrm) = meta.source_chromaticities {
+                let mut data = [0u8; 32];
+                data[0..4].copy_from_slice(&chrm.white.0.into_value().to_be_bytes());
+                data[4..8].copy_from_slice(&chrm.white.1.into_value().to_be_bytes());
+                data[8..12].copy_from_slice(&chrm.red.0.into_value().to_be_bytes());
+                data[12..16].copy_from_slice(&chrm.red.1.into_value().to_be_bytes());
+                data[16..20].copy_from_slice(&chrm.green.0.into_value().to_be_bytes());
+                data[20..24].copy_from_slice(&chrm.green.1.into_value().to_be_bytes());
+                data[24..28].copy_from_slice(&chrm.blue.0.into_value().to_be_bytes());
+                data[28..32].copy_from_slice(&chrm.blue.1.into_value().to_be_bytes());
+                write_png_chunk(&mut out, b"cHRM", &data);
+            }
+            if let Some(icc) = &meta.icc_profile {
+                // iCCP: profile_name + null + compression_method(0) + compressed_profile
+                let name = b"_\0\0"; // name "_", null, compression method 0
+                let mut iccp_data = Vec::with_capacity(name.len() + icc.len());
+                iccp_data.extend_from_slice(name);
+                let mut icc_compressed = vec![0u8; zlib_rs::compress_bound(icc.len())];
+                let (icc_out, _) = zlib_rs::compress_slice(
+                    &mut icc_compressed,
+                    icc,
+                    zlib_rs::DeflateConfig::default(),
+                );
+                iccp_data.extend_from_slice(icc_out);
+                write_png_chunk(&mut out, b"iCCP", &iccp_data);
+            }
+        }
 
-            // eXIf
-            if let Some(exif) = &meta.exif_metadata {
-                write_png_chunk(&mut out, b"eXIf", exif);
-            }
+        // eXIf
+        if let Some(exif) = &meta.exif_metadata {
+            write_png_chunk(&mut out, b"eXIf", exif);
         }
     }
 
     // PLTE
-    let plte_data: Vec<u8> = palette_rgba.iter().flat_map(|v| [v[0], v[1], v[2]]).collect();
+    let plte_data: Vec<u8> = palette_rgba
+        .iter()
+        .flat_map(|v| [v[0], v[1], v[2]])
+        .collect();
     write_png_chunk(&mut out, b"PLTE", &plte_data);
 
     // tRNS (only if any non-opaque entries)
@@ -581,27 +572,25 @@ fn encode_indexed_png_raw(
     }
 
     // Text chunks (before IDAT, per PNG spec recommendation)
-    if !strip {
-        if let Some(meta) = metadata {
-            use png::text_metadata::EncodableTextChunk;
-            let mut text_buf = Vec::new();
-            for chunk in &meta.uncompressed_latin1_text {
-                text_buf.clear();
-                if chunk.encode(&mut text_buf).is_ok() {
-                    out.extend_from_slice(&text_buf);
-                }
+    if !strip && let Some(meta) = metadata {
+        use png::text_metadata::EncodableTextChunk;
+        let mut text_buf = Vec::new();
+        for chunk in &meta.uncompressed_latin1_text {
+            text_buf.clear();
+            if chunk.encode(&mut text_buf).is_ok() {
+                out.extend_from_slice(&text_buf);
             }
-            for chunk in &meta.compressed_latin1_text {
-                text_buf.clear();
-                if chunk.encode(&mut text_buf).is_ok() {
-                    out.extend_from_slice(&text_buf);
-                }
+        }
+        for chunk in &meta.compressed_latin1_text {
+            text_buf.clear();
+            if chunk.encode(&mut text_buf).is_ok() {
+                out.extend_from_slice(&text_buf);
             }
-            for chunk in &meta.utf8_text {
-                text_buf.clear();
-                if chunk.encode(&mut text_buf).is_ok() {
-                    out.extend_from_slice(&text_buf);
-                }
+        }
+        for chunk in &meta.utf8_text {
+            text_buf.clear();
+            if chunk.encode(&mut text_buf).is_ok() {
+                out.extend_from_slice(&text_buf);
             }
         }
     }

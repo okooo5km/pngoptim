@@ -1016,7 +1016,7 @@ fn run_smoke_command(args: SmokeArgs) -> AppResult<i32> {
         let output = run_command(
             &root,
             &binary,
-            &vec![
+            &[
                 input_path.to_string_lossy().to_string(),
                 "--output".to_string(),
                 output_path.to_string_lossy().to_string(),
@@ -2050,7 +2050,7 @@ fn run_nightly_quality_size(
         let output = run_command(
             root,
             binary,
-            &vec![
+            &[
                 input.to_string_lossy().to_string(),
                 "--quality".to_string(),
                 quality.to_string(),
@@ -2185,7 +2185,7 @@ fn run_nightly_perf(
             let output = run_command(
                 root,
                 binary,
-                &vec![
+                &[
                     input.to_string_lossy().to_string(),
                     "--quality".to_string(),
                     quality.to_string(),
@@ -2413,7 +2413,7 @@ fn run_compat_check(
     let success_res = run_command(
         root,
         binary,
-        &vec![
+        &[
             sample_func.to_string_lossy().to_string(),
             "--output".to_string(),
             tmp_dir
@@ -2424,11 +2424,11 @@ fn run_compat_check(
         ],
         None,
     )?;
-    let param_error_res = run_command(root, binary, &vec!["no-such-input.png".to_string()], None)?;
+    let param_error_res = run_command(root, binary, &["no-such-input.png".to_string()], None)?;
     let quality_low_res = run_command(
         root,
         binary,
-        &vec![
+        &[
             sample_func.to_string_lossy().to_string(),
             "--output".to_string(),
             tmp_dir
@@ -2446,7 +2446,7 @@ fn run_compat_check(
     let size_not_reduced_res = run_command(
         root,
         binary,
-        &vec![
+        &[
             tiny_skip_case.to_string_lossy().to_string(),
             "--output".to_string(),
             tmp_dir.join("exit_size.png").to_string_lossy().to_string(),
@@ -2458,7 +2458,7 @@ fn run_compat_check(
     let io_failure_res = run_command(
         root,
         binary,
-        &vec![
+        &[
             sample_func.to_string_lossy().to_string(),
             "--output".to_string(),
             io_failure_output.to_string_lossy().to_string(),
@@ -2477,7 +2477,7 @@ fn run_compat_check(
     let io_file_res = run_command(
         root,
         binary,
-        &vec![
+        &[
             sample_func.to_string_lossy().to_string(),
             "--output".to_string(),
             io_file_output.to_string_lossy().to_string(),
@@ -2491,7 +2491,7 @@ fn run_compat_check(
     let stdio_res = run_command(
         root,
         binary,
-        &vec!["-".to_string(), "--output".to_string(), "-".to_string()],
+        &["-".to_string(), "--output".to_string(), "-".to_string()],
         Some(&stdin_bytes),
     )?;
     let stdio_ok = stdio_res.code == Some(0) && stdio_res.stdout.starts_with(PNG_SIG);
@@ -2500,7 +2500,7 @@ fn run_compat_check(
     let batch_res = run_command(
         root,
         binary,
-        &vec![
+        &[
             sample_func.to_string_lossy().to_string(),
             sample_meta.to_string_lossy().to_string(),
             format!("--ext={batch_ext}"),
@@ -2537,7 +2537,7 @@ fn run_compat_check(
     let _ = run_command(
         root,
         binary,
-        &vec![
+        &[
             sample_func.to_string_lossy().to_string(),
             "--output".to_string(),
             overwrite_path.to_string_lossy().to_string(),
@@ -2548,7 +2548,7 @@ fn run_compat_check(
     let overwrite_res = run_command(
         root,
         binary,
-        &vec![
+        &[
             sample_func.to_string_lossy().to_string(),
             "--output".to_string(),
             overwrite_path.to_string_lossy().to_string(),
@@ -2562,7 +2562,7 @@ fn run_compat_check(
     let meta_keep_res = run_command(
         root,
         binary,
-        &vec![
+        &[
             sample_meta.to_string_lossy().to_string(),
             "--output".to_string(),
             meta_preserve.to_string_lossy().to_string(),
@@ -2573,7 +2573,7 @@ fn run_compat_check(
     let meta_strip_res = run_command(
         root,
         binary,
-        &vec![
+        &[
             sample_meta.to_string_lossy().to_string(),
             "--output".to_string(),
             meta_strip.to_string_lossy().to_string(),
@@ -2625,7 +2625,7 @@ fn run_stability_check(
         let output = run_command(
             root,
             binary,
-            &vec![
+            &[
                 input_path.to_string_lossy().to_string(),
                 "--quality".to_string(),
                 "55-75".to_string(),
@@ -2693,7 +2693,7 @@ fn run_stability_check(
         let output = run_command(
             root,
             binary,
-            &vec![
+            &[
                 fuzz_path.to_string_lossy().to_string(),
                 "--quality".to_string(),
                 "55-75".to_string(),
@@ -2829,10 +2829,10 @@ fn run_command(
     }
 
     let mut child = cmd.spawn()?;
-    if let Some(input) = stdin_bytes {
-        if let Some(mut stdin) = child.stdin.take() {
-            stdin.write_all(input)?;
-        }
+    if let Some(input) = stdin_bytes
+        && let Some(mut stdin) = child.stdin.take()
+    {
+        stdin.write_all(input)?;
     }
 
     let output = child.wait_with_output()?;
@@ -2852,12 +2852,12 @@ fn resolve_binary_path(root: &Path, raw_path: &str) -> PathBuf {
         return path;
     }
 
-    if path.extension().is_none() {
-        if let Some(name) = path.file_name().and_then(|v| v.to_str()) {
-            let exe = path.with_file_name(format!("{name}.exe"));
-            if exe.exists() {
-                return exe;
-            }
+    if path.extension().is_none()
+        && let Some(name) = path.file_name().and_then(|v| v.to_str())
+    {
+        let exe = path.with_file_name(format!("{name}.exe"));
+        if exe.exists() {
+            return exe;
         }
     }
 
@@ -2909,7 +2909,7 @@ fn median(values: &[f64]) -> f64 {
     let mut sorted = values.to_vec();
     sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     let mid = sorted.len() / 2;
-    if sorted.len() % 2 == 0 {
+    if sorted.len().is_multiple_of(2) {
         (sorted[mid - 1] + sorted[mid]) / 2.0
     } else {
         sorted[mid]
@@ -2980,8 +2980,8 @@ fn mutate_bytes(src: &[u8], seed: u64) -> Vec<u8> {
         2 => {
             let start = (seed as usize) % data.len();
             let block = ((seed as usize % 64) + 1).min(data.len() - start);
-            for i in start..start + block {
-                data[i] = ((seed + i as u64 * 131) % 256) as u8;
+            for (i, byte) in data.iter_mut().enumerate().skip(start).take(block) {
+                *byte = ((seed + i as u64 * 131) % 256) as u8;
             }
             data
         }

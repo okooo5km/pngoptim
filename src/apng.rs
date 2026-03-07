@@ -454,12 +454,15 @@ pub fn minimize_frame_rects(apng: &mut ApngImage) {
     let transparent = vec![0u8; (apng.width as usize) * (apng.height as usize) * 4];
 
     for i in 1..apng.frames.len() {
-        let prev = if i == 0 { &transparent } else { &composited[i - 1] };
+        let prev = if i == 0 {
+            &transparent
+        } else {
+            &composited[i - 1]
+        };
         let curr = &composited[i];
 
         // Find the minimal bounding box of changed pixels
-        let (min_x, min_y, max_x, max_y) =
-            find_changed_rect(prev, curr, apng.width, apng.height);
+        let (min_x, min_y, max_x, max_y) = find_changed_rect(prev, curr, apng.width, apng.height);
 
         if min_x > max_x || min_y > max_y {
             // No change — make it a 1x1 transparent pixel
@@ -495,12 +498,7 @@ pub fn minimize_frame_rects(apng: &mut ApngImage) {
     }
 }
 
-fn find_changed_rect(
-    prev: &[u8],
-    curr: &[u8],
-    width: u32,
-    height: u32,
-) -> (u32, u32, u32, u32) {
+fn find_changed_rect(prev: &[u8], curr: &[u8], width: u32, height: u32) -> (u32, u32, u32, u32) {
     let mut min_x = width;
     let mut min_y = height;
     let mut max_x = 0u32;
@@ -840,9 +838,15 @@ mod tests {
                     dispose_op: DisposeOp::None,
                     blend_op: BlendOp::Source,
                     rgba: rgba(&[
-                        [255, 0, 0, 255], [0, 0, 0, 255], [0, 0, 0, 255],
-                        [0, 0, 0, 255], [0, 0, 0, 255], [0, 0, 0, 255],
-                        [0, 0, 0, 255], [0, 0, 0, 255], [0, 0, 0, 255],
+                        [255, 0, 0, 255],
+                        [0, 0, 0, 255],
+                        [0, 0, 0, 255],
+                        [0, 0, 0, 255],
+                        [0, 0, 0, 255],
+                        [0, 0, 0, 255],
+                        [0, 0, 0, 255],
+                        [0, 0, 0, 255],
+                        [0, 0, 0, 255],
                     ]),
                 },
                 // Frame 2: only pixel (2,2) changes
@@ -856,9 +860,15 @@ mod tests {
                     dispose_op: DisposeOp::None,
                     blend_op: BlendOp::Source,
                     rgba: rgba(&[
-                        [255, 0, 0, 255], [0, 0, 0, 255], [0, 0, 0, 255],
-                        [0, 0, 0, 255], [0, 0, 0, 255], [0, 0, 0, 255],
-                        [0, 0, 0, 255], [0, 0, 0, 255], [0, 255, 0, 255],
+                        [255, 0, 0, 255],
+                        [0, 0, 0, 255],
+                        [0, 0, 0, 255],
+                        [0, 0, 0, 255],
+                        [0, 0, 0, 255],
+                        [0, 0, 0, 255],
+                        [0, 0, 0, 255],
+                        [0, 0, 0, 255],
+                        [0, 255, 0, 255],
                     ]),
                 },
             ],
@@ -910,8 +920,10 @@ mod tests {
                     dispose_op: DisposeOp::None,
                     blend_op: BlendOp::Source,
                     rgba: rgba(&[
-                        [255, 0, 0, 255], [0, 0, 0, 255],
-                        [0, 0, 0, 255], [0, 0, 0, 255],
+                        [255, 0, 0, 255],
+                        [0, 0, 0, 255],
+                        [0, 0, 0, 255],
+                        [0, 0, 0, 255],
                     ]),
                 },
                 ApngFrame {
@@ -924,8 +936,10 @@ mod tests {
                     dispose_op: DisposeOp::None,
                     blend_op: BlendOp::Source,
                     rgba: rgba(&[
-                        [0, 0, 0, 255], [0, 255, 0, 255],
-                        [0, 0, 0, 255], [0, 0, 0, 255],
+                        [0, 0, 0, 255],
+                        [0, 255, 0, 255],
+                        [0, 0, 0, 255],
+                        [0, 0, 0, 255],
                     ]),
                 },
             ],
