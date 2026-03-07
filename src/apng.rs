@@ -940,6 +940,7 @@ mod tests {
             posterize: None,
             strip: true,
             skip_if_larger: false,
+            no_icc: false,
         };
 
         let result = process_png_bytes(&encoded, options).expect("pipeline");

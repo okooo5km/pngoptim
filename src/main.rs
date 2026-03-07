@@ -43,6 +43,7 @@ fn run(cli: Cli) -> Result<(), AppError> {
             posterize: cli.posterize,
             strip: cli.strip,
             skip_if_larger: cli.skip_if_larger,
+            no_icc: cli.no_icc,
         };
 
         let result = if input == "-" {

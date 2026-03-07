@@ -27,6 +27,7 @@ pub struct PipelineOptions {
     pub posterize: Option<u8>,
     pub strip: bool,
     pub skip_if_larger: bool,
+    pub no_icc: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -93,7 +94,13 @@ pub fn process_png_bytes(
     let mut rgba = image::load_from_memory_with_format(input_bytes, ImageFormat::Png)
         .map_err(|e| AppError::Decode(format!("failed to decode PNG: {e}")))?
         .to_rgba8();
-    normalize_rgba_to_srgb_if_needed(rgba.as_mut(), input_metadata.as_ref(), metadata.as_mut())?;
+    if !options.no_icc {
+        normalize_rgba_to_srgb_if_needed(
+            rgba.as_mut(),
+            input_metadata.as_ref(),
+            metadata.as_mut(),
+        )?;
+    }
     let (width, height) = rgba.dimensions();
     let decode_ms = t_decode.elapsed().as_secs_f64() * 1000.0;
 

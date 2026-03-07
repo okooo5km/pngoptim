@@ -75,6 +75,9 @@ pub struct Cli {
 
     #[arg(short = 'q', long = "quiet", default_value_t = false)]
     pub quiet: bool,
+
+    #[arg(long = "no-icc", default_value_t = false)]
+    pub no_icc: bool,
 }
 
 impl Cli {
