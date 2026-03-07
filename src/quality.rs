@@ -163,9 +163,13 @@ impl InternalPixel {
         let white_g = black_g + alpha_diff;
         let white_b = black_b + alpha_diff;
 
-        black_r.mul_add(black_r, 0.0).max(white_r * white_r)
-            + black_g.mul_add(black_g, 0.0).max(white_g * white_g)
-            + black_b.mul_add(black_b, 0.0).max(white_b * white_b)
+        // Addition order matches reference aarch64 NEON: max_r + (max_g + max_b)
+        // via vpaddq_f32 pairwise add. Floating-point addition is non-associative,
+        // so matching the order is important for bit-level parity.
+        let max_r = (black_r * black_r).max(white_r * white_r);
+        let max_g = (black_g * black_g).max(white_g * white_g);
+        let max_b = (black_b * black_b).max(white_b * white_b);
+        max_r + (max_g + max_b)
     }
 
     pub(crate) fn to_rgba(self, gamma: f64) -> [u8; 4] {

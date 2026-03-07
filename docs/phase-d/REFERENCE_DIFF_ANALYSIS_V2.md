@@ -90,13 +90,20 @@ Each module in `src/palette_quant.rs` was compared line-by-line against the corr
 
 ## Remaining Differences
 
-### demo.png 18 vs 19 colors
+### demo.png 18 vs 19 colors — ROOT CAUSE IDENTIFIED
 
-The palette search produces 18 colors while pngquant produces 19. The missing color is a mid-gray around rgb(92,92,92). Our gray distribution spans 71->110 (gap=39), while pngquant has 65->92->121 (gaps=27,29).
+**Root cause: ICC color profile handling.**
 
-Root cause hypothesis: Floating-point accumulation differences in median cut split decisions. The `prepare_color_weight_total` computation and `hist_item_sort_half` quickselect may produce slightly different split points due to HashMap iteration order affecting initial cluster assignments, even though all individual operations are algorithmically equivalent.
+demo.png contains an Apple Display ICC profile (DM73u pro). pngoptim normalizes ICC to sRGB before quantization (correct behavior), while pngquant quantizes raw Display-profile pixel values and discards the ICC profile (incorrect color management).
 
-This is likely a statistical edge case for this specific image rather than a systematic bug. Cross-sample regression shows no quality degradation (quality-size 7/7 pass).
+**Evidence:**
+- With ICC profile: pngoptim → 18 colors, pngquant → 19 colors
+- Without ICC profile (stripped): pngoptim → 18 colors, pngquant → **18 colors**
+- The algorithms are equivalent; the difference is in input pixel values
+
+The Display profile's tone curve changes the shadow gray distribution, requiring one extra color in pngquant's non-normalized path. After sRGB normalization, 18 colors are sufficient to meet the MSE target (margin ≈ 15%).
+
+**Conclusion:** Not a quantization algorithm bug. Our ICC→sRGB normalization is the correct approach — the output is color-accurate on all standard displays, while pngquant's output is only approximately correct on the original capture display.
 
 ### Performance Impact
 

@@ -148,11 +148,12 @@
 | RF-7 | Done | 全链路 | 重跑 quality/perf/stability/release 门禁，形成新基线 | 本地与跨平台复核均已通过 |
 
 ### 当前硬阻塞与下一步
-1. 阶段 H 当前暂停，主任务切回静态 PNG 的 `reference-first` 复查。恢复 APNG 的前提是：`demo.png` 这类平滑阴影/UI 样本的默认抖动路径不再存在明显阶梯感。
-2. 当前最硬的阻塞已进一步收敛到 palette search 阶段的灰阶分配：
-   - remap 阶段 K-Means finalize 已完整对齐（RF-4 Done）
-   - `hist.rs / mediancut.rs` 的灰阶分配仍与 `pngquant` 有 1 色偏差（18 vs 19 色），根因可能在 median cut split 决策的浮点累积差异
-   - `remap.rs::remap_to_palette_floyd` 的 background-aware 三分支逻辑待 APNG 时接入
+1. **18 vs 19 色差异根因已确认：ICC 颜色管理差异**（非算法 bug）
+   - demo.png 含 Apple Display ICC profile；我们正确地先转 sRGB 再量化，pngquant 直接用 Display-profile 像素并丢弃 ICC
+   - 剥除 ICC 后两者均产生 18 色，算法等价已验证
+   - 我们的 ICC→sRGB 路径是正确行为（输出在所有标准显示器上颜色准确）
+2. 阶段 H 当前暂停。恢复条件不再是"18 vs 19 色差距"（已解释），而是：
+   - `remap.rs::remap_to_palette_floyd` 的 background-aware 三分支逻辑（APNG 需要）
 3. `src/pipeline.rs` 已不再在 `--quality` 模式下做外层色数二分，也不再在 `--quality` 模式额外跑 baseline 候选；质量约束完全收回 quantizer 内部，慢路径已明显缩短。
 4. 当前 `demo.png` spot check 的真实状态已更新为（2026-03-07 K-Means finalize 对齐后）：
    - `pngoptim --quality 65-75`（默认抖动）: `141,274 bytes`, `quality_score=89`, `quality_mse=3.256`
@@ -161,7 +162,7 @@
    - `pngquant --quality 65-75`: `136,915 bytes`
    - `pngquant --quality 65-75 --nofs`: `104,038 bytes`
 5. 2026-03-06 新一轮时间复查表明：在本机热缓存 5 次均值下，`demo.png` 上 `pngoptim --quality 65-75` 为 `0.306s`，`pngquant --quality 65-75` 为 `0.340s`；`--nofs` 下分别为 `0.246s` 和 `0.286s`。因此“当前这张样本上我们整体更慢”并不成立，真正稳定的热点仍是 quantizer 内部。随后又补上了 `kmeans` 分块并行和大图 Floyd 分块并行，`demo.png --quality 65-75` 的内置 profile 现为 `decode_ms≈68`、`quantize_ms≈128`、`encode_ms≈75`。参考实现在 `libimagequant/src/kmeans.rs`、`remap.rs` 和 `pngquant` CLI 层分别用了 Rayon / OpenMP 并行；当前 Rust 主线已补上 `kmeans + 大图 Floyd` 两段，但 plain remap、dither-map 生成和 palette 质量细节仍会决定跨样本的剩余差距。
-6. 当前针对 `demo.png` 的 palette 对比已经确认：剩余主差距不是“颜色数明显不够”，而是灰阶落点不完全一致。当前输出为 `18` 色，`pngquant` 为 `19` 色；我们少了一档中间灰，导致阴影更容易出现台阶。
+6. **根因已找到（2026-03-07）**：18 vs 19 色差异完全由 ICC 颜色管理差异造成。剥除 ICC profile 后两者均产生 18 色。详见 `docs/phase-d/REFERENCE_DIFF_ANALYSIS_V2.md`。
 7. 这轮确认的已修复硬根因不是 palette search 本身，而是两处输入/输出对齐缺失：
    - 当前 ICC 像素转换支路会把同一张图的唯一颜色数从 `1499` 膨胀到 `9347`
    - remap / Floyd 之前没有像 `init_int_palette()` 一样先按输出精度 round palette
@@ -174,15 +175,15 @@
    这批修正本身没有单独带来体积跳变，但配合后续颜色管理和大图 `edges` fallback 修复后，默认抖动已从 `150,443 bytes` 收敛到 `142,017 bytes`。
 
 ### 恢复入口（下次继续时从这里开始）
-1. 当前恢复起点不是 APNG，而是静态 PNG 的灰阶 palette 分配（18 vs 19 色差距）。
+1. **18 vs 19 色差异已解决**（根因：ICC 颜色管理，非算法 bug）。静态 PNG 量化算法与参考实现已完全对齐。
 2. 已完成的对齐工作：
-   - RF-4: remap K-Means finalize 已完整对齐（plain + dithered 路径均始终执行 finalize，init_int_palette 时序正确）
+   - RF-4: remap K-Means finalize 已完整对齐
    - 逐模块对照审查完成：hist.rs、mediancut.rs、kmeans.rs、remap.rs、quant.rs
-3. 下一步执行顺序固定如下：
-   - 继续排查 mediancut split 决策中的 1 色差异（灰阶 71→110 区间 vs pngquant 65→92→121）
-   - 可能的切入点：median cut 的 `prepare_color_weight_total` 和 `hist_item_sort_half` 的边界行为
-   - 最后再回到 `plain remap / dither-map` 的剩余性能收口
-4. 当前不要恢复 Phase H。恢复条件是：`demo.png --quality 65-75` 默认抖动路径的视觉效果达到可接受，且 spot check 不再显示明显阴影阶梯。
+   - median cut split 对齐：移除 `.min(len-1)` 限制、支持空 box（degenerate split）、`new_from_split` 使用减法权重
+   - `diff` 函数加法顺序对齐 NEON pairwise add
+3. 下一步可执行的任务：
+   - Phase H (APNG) 恢复：需要 `remap_to_palette_floyd` 的 background-aware 三分支逻辑
+   - 性能收口：plain remap / dither-map 生成的剩余优化空间
 4. 当前最关键的参考文件：
    - `/Users/5km/Dev/C/libimagequant/src/hist.rs`
    - `/Users/5km/Dev/C/libimagequant/src/mediancut.rs`

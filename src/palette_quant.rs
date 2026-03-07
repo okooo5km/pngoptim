@@ -211,9 +211,91 @@ struct ColorBox {
 }
 
 impl ColorBox {
-    fn new(items: &[HistItem], start: usize, end: usize) -> Option<Self> {
-        if start >= end || end > items.len() {
+    /// Create a new box from split with a pre-computed weight sum.
+    /// Matches reference `MBox::from_split` behavior where the right side's
+    /// weight is computed via subtraction (parent_sum - left_sum).
+    fn new_from_split(
+        items: &[HistItem],
+        start: usize,
+        end: usize,
+        adjusted_weight_sum: f64,
+    ) -> Option<Self> {
+        if start > end || end > items.len() {
             return None;
+        }
+        if start == end {
+            return Some(Self {
+                start,
+                end,
+                average: InternalPixel::default(),
+                adjusted_weight_sum: 0.0,
+                variance: [0.0; 4],
+                total_error: Some(0.0),
+                max_error: 0.0,
+            });
+        }
+
+        let mut average = InternalPixel::default();
+        let mut average_weight_sum = 0.0f32;
+
+        for item in &items[start..end] {
+            average_weight_sum += item.adjusted_weight;
+            average.a += item.color.a * item.adjusted_weight;
+            average.r += item.color.r * item.adjusted_weight;
+            average.g += item.color.g * item.adjusted_weight;
+            average.b += item.color.b * item.adjusted_weight;
+        }
+
+        if average_weight_sum != 0.0 {
+            average.a /= average_weight_sum;
+            average.r /= average_weight_sum;
+            average.g /= average_weight_sum;
+            average.b /= average_weight_sum;
+        }
+
+        let mut variance = [0.0f32; 4];
+        let mut max_error = 0.0f32;
+        for item in &items[start..end] {
+            let delta_a = item.color.a - average.a;
+            let delta_r = item.color.r - average.r;
+            let delta_g = item.color.g - average.g;
+            let delta_b = item.color.b - average.b;
+            variance[0] += delta_a * delta_a * item.adjusted_weight;
+            variance[1] += delta_r * delta_r * item.adjusted_weight;
+            variance[2] += delta_g * delta_g * item.adjusted_weight;
+            variance[3] += delta_b * delta_b * item.adjusted_weight;
+            max_error = max_error.max(average.diff(item.color));
+        }
+
+        Some(Self {
+            start,
+            end,
+            average,
+            adjusted_weight_sum,
+            variance,
+            total_error: None,
+            max_error,
+        })
+    }
+
+    fn new(items: &[HistItem], start: usize, end: usize) -> Option<Self> {
+        if start > end || end > items.len() {
+            return None;
+        }
+
+        // Allow empty boxes (start == end). These represent unused palette slots
+        // that K-means will fill with worst-fitting histogram entries via
+        // replace_unused_palette_entries, matching reference behavior.
+        if start == end {
+            return Some(Self {
+                start,
+                end,
+                average: InternalPixel::default(),
+                adjusted_weight_sum: 0.0,
+                variance: [0.0; 4],
+                total_error: Some(0.0),
+                max_error: 0.0,
+            });
         }
 
         let mut adjusted_weight_sum = 0.0f64;
@@ -322,18 +404,24 @@ impl ColorBox {
             return None;
         }
 
+        let parent_weight_sum = self.adjusted_weight_sum;
         self.prepare_sort(items);
         let half_weight = self.prepare_color_weight_total(items) / 2.0;
         let local_split = {
             let slice = &mut items[self.start..self.end];
-            hist_item_sort_half(slice, half_weight)
-                .max(1)
-                .min(slice.len().saturating_sub(1))
+            hist_item_sort_half(slice, half_weight).max(1)
         };
 
         let split = self.start + local_split;
-        let left = Self::new(items, self.start, split)?;
-        let right = Self::new(items, split, self.end)?;
+        // Match reference: left sum is freshly computed, right sum via subtraction.
+        // This affects take_best_splittable_box scoring and thus split order.
+        let left_sum: f64 = items[self.start..split]
+            .iter()
+            .map(|item| f64::from(item.adjusted_weight))
+            .sum();
+        let right_sum = parent_weight_sum - left_sum;
+        let left = Self::new_from_split(items, self.start, split, left_sum)?;
+        let right = Self::new_from_split(items, split, self.end, right_sum)?;
         Some((left, right))
     }
 }
