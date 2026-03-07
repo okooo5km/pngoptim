@@ -4,7 +4,7 @@
 
 PNGOptim is a Rust CLI tool for PNG quantization (lossy compression), aiming to replicate and surpass pngquant/libimagequant. The project follows a "replicate first, optimize later" strategy across phases A-H.
 
-**Current status**: Phases A-G complete. Phase H (APNG) blocked pending shadow-banding fix in default dither path. Active work: Algorithm Replication track (RF-1 through RF-7).
+**Current status**: Phases A-G complete. Phase H (APNG) in progress: H1 (CLI/pipeline integration) done, H2 (lossless structure optimization) done. Algorithm Replication track (RF-1 through RF-7) fully aligned.
 
 ## Build / Test / Run
 
@@ -32,12 +32,12 @@ cargo run --release --bin xtask -- stability --run-id <id>
 | File | Lines | Purpose |
 |------|-------|---------|
 | `src/palette_quant.rs` | ~2462 | Core quantization: histogram, median cut, k-means, VP-tree nearest search, remap (plain + Floyd dithering), dither map, contrast maps |
-| `src/pipeline.rs` | ~700 | Processing pipeline: decode -> color management -> quantize -> encode. Quality gating, metadata preservation, ICC/gAMA normalization |
+| `src/pipeline.rs` | ~750 | Processing pipeline: decode -> color management -> quantize -> encode. APNG detection/routing. Quality gating, metadata preservation, ICC/gAMA normalization |
 | `src/quality.rs` | ~257 | InternalPixel (gamma-weighted ARGB), quality<->MSE mapping, SpeedSettings, quality evaluation |
 | `src/cli.rs` | ~293 | CLI argument parsing (clap), QualityRange, output path logic |
 | `src/main.rs` | ~252 | Entry point, batch processing, exit codes |
 | `src/error.rs` | ~79 | Error types (AppError) |
-| `src/apng.rs` | ~567 | APNG support (Phase H, currently blocked) |
+| `src/apng.rs` | ~900 | APNG support: decode/encode/compose, lossless optimizations (duplicate frame folding, frame rect minimization) |
 | `src/quant.rs` | ~115 | Legacy quantizer bridge (mostly unused) |
 | `src/bin/xtask.rs` | ~3148 | Test harness: smoke, compat, quality-size, perf, stability, cross-platform |
 
@@ -75,13 +75,18 @@ All algorithm work follows reference-first methodology: read the reference imple
 | RF-6 | Done | skip-if-larger heuristics |
 | RF-7 | Done | regression gates |
 
-## Current Blocker
+## APNG Support (Phase H)
 
-`demo.png --quality 65-75` default dither: output has 18 colors vs pngquant's 19 colors, missing one mid-gray that causes visible shadow banding. Root cause: remap-phase k-means finalize not fully aligned with reference `remap_to_palette()` which runs full-image k-means feedback before final remap.
+- **H1 (CLI/pipeline integration)**: APNG auto-detection in `process_png_bytes()`, routes to `process_apng()` for lossless pass-through with optimizations
+- **H2 (lossless structure optimization)**: `fold_duplicate_frames()` merges identical consecutive frames, `minimize_frame_rects()` computes minimal change rectangles
+- **H3 (lossy quantization)**: Not yet started — per-frame quantization with shared palette
+- APNG files are automatically detected; no CLI flag needed
+- Lossless path reports `quality_score=100, quality_mse=0.0`
+- `skip-if-larger` check applies to APNG output
 
 ## Engineering Constraints
 
-1. Rust-only toolchain; no Python in mainline
+1. Rust toolchain + zlib-ng (C) for deflate compression; no Python in mainline
 2. Algorithm alignment with pngquant/libimagequant, not blind invention
 3. MIT license; reference code not directly copied (license policy pending)
 4. Every change must pass regression gates before merging

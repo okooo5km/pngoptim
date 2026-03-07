@@ -7,6 +7,9 @@ use std::io::Cursor;
 use std::path::Path;
 use std::time::Instant;
 
+use crate::apng::{
+    decode_apng, encode_apng, fold_duplicate_frames, minimize_frame_rects,
+};
 use crate::cli::QualityRange;
 use crate::error::AppError;
 use crate::palette_quant::{IndexedImage, quantize_indexed, quantizer_settings};
@@ -71,6 +74,13 @@ pub fn process_png_bytes(
     input_bytes: &[u8],
     options: PipelineOptions,
 ) -> Result<PipelineResult, AppError> {
+    // Try APNG detection first — route animated PNGs to the APNG pipeline
+    match decode_apng(input_bytes) {
+        Ok(Some(apng)) => return process_apng(input_bytes, apng, &options),
+        Ok(None) => {} // static PNG, continue normal flow
+        Err(_) => {}   // decode issue, fall through to static path
+    }
+
     let t_total = Instant::now();
     let input_metadata = extract_metadata(input_bytes);
     let mut metadata = if options.strip {
@@ -141,6 +151,61 @@ pub fn process_png_bytes(
         output_bytes: png_data.len() as u64,
         quality_score: candidate.quality.quality_score,
         quality_mse: candidate.quality.standard_mse,
+        png_data,
+        metrics: PipelineMetrics {
+            decode_ms,
+            quantize_ms,
+            encode_ms,
+            total_ms,
+        },
+    })
+}
+
+fn process_apng(
+    input_bytes: &[u8],
+    mut apng: crate::apng::ApngImage,
+    options: &PipelineOptions,
+) -> Result<PipelineResult, AppError> {
+    let t_total = Instant::now();
+    let width = apng.width;
+    let height = apng.height;
+
+    let t_decode = Instant::now();
+    // Decode is already done (apng is passed in)
+    let decode_ms = t_decode.elapsed().as_secs_f64() * 1000.0;
+
+    let t_quantize = Instant::now();
+    // H2 lossless optimizations
+    fold_duplicate_frames(&mut apng);
+    minimize_frame_rects(&mut apng);
+    let quantize_ms = t_quantize.elapsed().as_secs_f64() * 1000.0;
+
+    let t_encode = Instant::now();
+    let png_data = encode_apng(&apng)?;
+    let encode_ms = t_encode.elapsed().as_secs_f64() * 1000.0;
+
+    // skip-if-larger: compare against original input
+    if options.skip_if_larger {
+        let max_file_size = skip_if_larger_max_file_size(input_bytes.len() as u64, 100);
+        if (png_data.len() as u64) > max_file_size {
+            return Err(AppError::SkipIfLargerRejected {
+                input_bytes: input_bytes.len() as u64,
+                output_bytes: png_data.len() as u64,
+                maximum_file_size: max_file_size,
+                quality_score: 100,
+            });
+        }
+    }
+
+    let total_ms = t_total.elapsed().as_secs_f64() * 1000.0;
+
+    Ok(PipelineResult {
+        width,
+        height,
+        input_bytes: input_bytes.len() as u64,
+        output_bytes: png_data.len() as u64,
+        quality_score: 100, // lossless pass-through
+        quality_mse: 0.0,
         png_data,
         metrics: PipelineMetrics {
             decode_ms,

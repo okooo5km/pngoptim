@@ -829,22 +829,14 @@ fn find_best_palette(
             .max(palette_error.unwrap_or(quality_to_mse(1)))
             .max(quality_to_mse(51))
             * 1.2;
-        let mut new_palette = if few_input_colors {
-            hist.items
-                .iter()
-                .map(|item| PaletteEntry {
-                    color: item.color,
-                    popularity: item.perceptual_weight,
-                })
-                .collect::<Vec<_>>()
-        } else {
-            median_cut_palette(
-                &mut hist,
-                current_max_colors,
-                target_mse * target_mse_overshoot,
-                max_mse_per_color,
-            )
-        };
+        // Reference always runs median cut in the feedback loop, even for few_input_colors.
+        // The few_input_colors early return only applies when target_mse_is_zero (handled above).
+        let mut new_palette = median_cut_palette(
+            &mut hist,
+            current_max_colors,
+            target_mse * target_mse_overshoot,
+            max_mse_per_color,
+        );
 
         if trials_left <= 0 {
             break Some(new_palette);
@@ -876,17 +868,7 @@ fn find_best_palette(
         }
     }
     .unwrap_or_else(|| {
-        if few_input_colors {
-            hist.items
-                .iter()
-                .map(|item| PaletteEntry {
-                    color: item.color,
-                    popularity: item.perceptual_weight,
-                })
-                .collect::<Vec<_>>()
-        } else {
-            median_cut_palette(&mut hist, max_colors, f64::INFINITY, f64::INFINITY)
-        }
+        median_cut_palette(&mut hist, max_colors, f64::INFINITY, f64::INFINITY)
     });
 
     let final_iterations = effective_kmeans_iterations(
@@ -1431,9 +1413,19 @@ fn remap_image(
         )
     };
 
-    let order = (0..palette.len())
+    // Sort used palette entries: transparent first, then by popularity (descending).
+    // This matches pngquant's sort_palette() behavior and improves deflate efficiency
+    // because common indices cluster at low values.
+    let mut order = (0..palette.len())
         .filter(|&idx| counts[idx] > 0)
         .collect::<Vec<_>>();
+    order.sort_by(|&a, &b| {
+        let a_transparent = palette[a].1[3] < 255;
+        let b_transparent = palette[b].1[3] < 255;
+        b_transparent
+            .cmp(&a_transparent)
+            .then_with(|| counts[b].cmp(&counts[a]))
+    });
 
     let mut remap = vec![0u8; palette.len()];
     let mut reordered_palette = Vec::with_capacity(palette.len());
@@ -1613,15 +1605,11 @@ fn remap_image_dithered(
             importance_map,
         ))
     } else if palette_points.len() > 1 {
-        // K-Means finalize even without dither map generation
+        // Reference: remap_to_palette() runs one pass + k-means finalize.
+        // The returned indices (pre-finalize) are used as guess hints for Floyd.
         let feedback = remap_image_plain_pass(width, pixels, &palette_points, importance_map);
         apply_remap_feedback(&mut palette_points, &feedback);
-        Some(remap_image_plain_pass(
-            width,
-            pixels,
-            &palette_points,
-            importance_map,
-        ))
+        Some(feedback)
     } else {
         None
     };
@@ -1653,9 +1641,14 @@ fn remap_image_dithered(
     if !dither_map.is_empty() {
         base_dithering_level *= 1.0 / 255.0;
     }
-    let max_dither_error = plain_pass
-        .as_ref()
-        .map(|pass| pass.palette_error)
+    // Reference: max_dither_error uses dither_map_error (from remap) when dither map
+    // was generated, otherwise falls back to quantization-phase palette_error.
+    let dither_error_source = if generate_dither_map {
+        plain_pass.as_ref().map(|pass| pass.palette_error)
+    } else {
+        None
+    };
+    let max_dither_error = dither_error_source
         .or(palette_error)
         .unwrap_or(quality_to_mse(80))
         .mul_add(2.4, 0.0)
