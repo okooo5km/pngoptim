@@ -113,3 +113,4 @@ All algorithm work follows reference-first methodology: read the reference imple
 3. MIT license; reference code not directly copied (license policy pending)
 4. Every change must pass regression gates before merging
 5. No bit-exact output required; statistical equivalence is the goal
+6. Documentation sync: when adding or modifying CLI options, APNG behavior, pipeline features, or public API, update the corresponding docs in `docs/usage/` and `README.md` accordingly

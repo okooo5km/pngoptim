@@ -8,7 +8,7 @@ A fast, single-binary PNG quantization CLI written in Rust — a modern alternat
 
 - **1.69x faster** than pngquant on average (up to 1.98x on large images)
 - **2–3% smaller** files at equivalent quality settings
-- **APNG support** with lossless structure optimization (duplicate frame folding, frame rect minimization)
+- **APNG support** with lossless structure optimization — safe mode (duplicate frame folding) and aggressive mode (+ frame rect minimization with rollback safety)
 - **ICC color management** with automatic sRGB normalization via lcms2
 
 ## Installation
@@ -56,6 +56,12 @@ pngoptim input.png -o output.png --skip-if-larger
 
 # Strip metadata and force overwrite
 pngoptim input.png -o output.png --strip --force
+
+# APNG animated PNG (auto-detected, no special flag needed)
+pngoptim animated.png -o optimized.png
+
+# APNG with aggressive optimization (frame rect minimization)
+pngoptim animated.png -o optimized.png --apng-mode aggressive
 ```
 
 ### Options
@@ -74,6 +80,7 @@ pngoptim input.png -o output.png --strip --force
 | `--force` | Overwrite existing output files | Off |
 | `--skip-if-larger` | Skip writing if output is larger than input | Off |
 | `--no-icc` | Skip ICC profile normalization | Off |
+| `--apng-mode MODE` | APNG optimization strategy: `safe` or `aggressive` | `safe` |
 | `-q, --quiet` | Suppress non-error output | Off |
 
 ## Benchmark
@@ -113,7 +120,7 @@ pngoptim implements a full quantization pipeline inspired by [libimagequant](htt
 
 Additional features:
 - **ICC Color Management**: Embedded ICC profiles are normalized to sRGB via lcms2 before quantization
-- **APNG Optimization**: Automatic detection with lossless structure optimization (duplicate frame folding, minimal change rectangles)
+- **APNG Optimization**: Automatic detection via `acTL` chunk (no special flag needed). Two modes: **safe** (default) folds duplicate consecutive frames; **aggressive** additionally minimizes frame rectangles with post-verification rollback to prevent size regression. Already-optimized APNG inputs (indexed/sub-rect) are detected and skipped to avoid re-optimization
 - **Parallelism**: Rayon-based parallelism across histogram building, k-means, contrast maps, remap, and encoding
 
 ## Building from Source
