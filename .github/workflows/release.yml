@@ -155,7 +155,9 @@ jobs:
 
           DOWNLOAD_URL="https://github.com/okooo5km/pngoptim/releases/download/v${VERSION}/pngoptim_${VERSION}_darwin_universal.tar.gz"
 
-          cat > homebrew-tap/pngoptim.rb << FORMULA
+          mkdir -p homebrew-tap/Formula
+
+          cat > homebrew-tap/Formula/pngoptim.rb << FORMULA
           class Pngoptim < Formula
             desc "Fast PNG quantization CLI tool — a Rust alternative to pngquant"
             homepage "https://github.com/okooo5km/pngoptim"
@@ -175,8 +177,9 @@ jobs:
           FORMULA
 
           cd homebrew-tap
+          rm -f pngoptim.rb
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add pngoptim.rb
+          git add -A
           git commit -m "pngoptim ${VERSION}"
           git push
