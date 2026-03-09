@@ -83,6 +83,10 @@ All algorithm work follows reference-first methodology: read the reference imple
 - APNG files are automatically detected; no CLI flag needed
 - Lossless path reports `quality_score=100, quality_mse=0.0`
 - `skip-if-larger` check applies to APNG output
+- **APNG mode** (`--apng-mode safe|aggressive`): Safe mode (default) only folds duplicate frames; Aggressive mode also runs `minimize_frame_rects_checked()` with post-verification rollback
+- **Input protection**: `detect_input_characteristics()` scans chunks to detect indexed/sub-rect APNG; already-optimized inputs skip re-optimization to prevent size regression
+- **Test fixtures**: `dataset/apng/generated/` contains 11 synthetic APNG samples covering all DisposeOp×BlendOp combinations, generated via `xtask generate-apng-fixtures`
+- **Regression commands**: `xtask apng-compat`, `apng-quality-size`, `apng-visual-guard` for automated APNG validation
 
 ## CI/CD Workflows
 

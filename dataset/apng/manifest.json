@@ -1,0 +1,38 @@
+{
+  "description": "APNG test fixtures for pngoptim correctness and regression testing",
+  "categories": {
+    "correctness": {
+      "description": "Small synthetic APNG samples covering DisposeOp × BlendOp combinations",
+      "generated": false
+    },
+    "lossless": {
+      "description": "Samples for verifying structural optimization (fold, minimize)",
+      "generated": false
+    },
+    "compatibility": {
+      "description": "Public APNG samples for compatibility protection",
+      "generated": false
+    },
+    "realworld": {
+      "description": "Real-world APNG files for end-to-end validation",
+      "generated": false
+    },
+    "generated": {
+      "description": "Runtime-generated fixtures via xtask generate-apng-fixtures",
+      "generated": true,
+      "fixtures": [
+        "dispose_none_source.png",
+        "dispose_none_over.png",
+        "dispose_bg_source.png",
+        "dispose_bg_over.png",
+        "dispose_prev_source.png",
+        "dispose_prev_over.png",
+        "identical_consecutive.png",
+        "already_subrect.png",
+        "no_change_frame.png",
+        "with_default_image.png",
+        "single_frame.png"
+      ]
+    }
+  }
+}

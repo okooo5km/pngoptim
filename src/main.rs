@@ -37,6 +37,7 @@ fn run(cli: Cli) -> Result<(), AppError> {
             strip: cli.strip,
             skip_if_larger: cli.skip_if_larger,
             no_icc: cli.no_icc,
+            apng_mode: cli.apng_mode.clone(),
         };
 
         let result = if input == "-" {

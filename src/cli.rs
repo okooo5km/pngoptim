@@ -1,8 +1,18 @@
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use std::path::{Path, PathBuf};
 
 use crate::error::AppError;
 use crate::quality::SpeedSettings;
+
+/// APNG optimization mode.
+#[derive(Clone, Debug, Default, PartialEq, Eq, ValueEnum)]
+pub enum ApngMode {
+    /// Only fold duplicate frames (safe, no visual risk)
+    #[default]
+    Safe,
+    /// Also minimize frame rectangles (may alter dispose/blend semantics)
+    Aggressive,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QualityRange {
@@ -78,6 +88,9 @@ pub struct Cli {
 
     #[arg(long = "no-icc", default_value_t = false)]
     pub no_icc: bool,
+
+    #[arg(long = "apng-mode", default_value = "safe", value_enum)]
+    pub apng_mode: ApngMode,
 }
 
 impl Cli {

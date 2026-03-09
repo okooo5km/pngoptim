@@ -55,6 +55,14 @@ enum XtaskCommand {
     Compliance(ComplianceArgs),
     #[command(name = "dataset-seed")]
     DatasetSeed(DatasetSeedArgs),
+    #[command(name = "generate-apng-fixtures")]
+    GenerateApngFixtures(GenerateApngFixturesArgs),
+    #[command(name = "apng-compat")]
+    ApngCompat(ApngCompatArgs),
+    #[command(name = "apng-quality-size")]
+    ApngQualitySize(ApngQualitySizeArgs),
+    #[command(name = "apng-visual-guard")]
+    ApngVisualGuard(ApngVisualGuardArgs),
 }
 
 #[derive(Parser)]
@@ -228,6 +236,48 @@ struct ComplianceArgs {
 #[derive(Args)]
 struct DatasetSeedArgs {}
 
+#[derive(Args)]
+struct GenerateApngFixturesArgs {
+    #[arg(long, default_value = "dataset/apng/generated")]
+    output_dir: String,
+}
+
+#[derive(Args)]
+struct ApngCompatArgs {
+    #[arg(long)]
+    run_id: Option<String>,
+    #[arg(long, default_value = "target/release/pngoptim")]
+    binary: String,
+    #[arg(long, default_value_t = false)]
+    build: bool,
+    #[arg(long, default_value = "dataset/apng")]
+    dataset: String,
+}
+
+#[derive(Args)]
+struct ApngQualitySizeArgs {
+    #[arg(long)]
+    run_id: Option<String>,
+    #[arg(long, default_value = "target/release/pngoptim")]
+    binary: String,
+    #[arg(long, default_value_t = false)]
+    build: bool,
+    #[arg(long, default_value = "dataset/apng")]
+    dataset: String,
+}
+
+#[derive(Args)]
+struct ApngVisualGuardArgs {
+    #[arg(long)]
+    run_id: Option<String>,
+    #[arg(long, default_value = "target/release/pngoptim")]
+    binary: String,
+    #[arg(long, default_value_t = false)]
+    build: bool,
+    #[arg(long, default_value = "dataset/apng")]
+    dataset: String,
+}
+
 #[derive(Debug, Deserialize)]
 struct ManifestEntry {
     id: Option<String>,
@@ -372,6 +422,10 @@ fn run(cli: XtaskCli) -> AppResult<i32> {
         XtaskCommand::CiTrends(args) => run_ci_trends_command(args),
         XtaskCommand::Compliance(args) => run_compliance_command(args),
         XtaskCommand::DatasetSeed(args) => run_dataset_seed_command(args),
+        XtaskCommand::GenerateApngFixtures(args) => run_generate_apng_fixtures(args),
+        XtaskCommand::ApngCompat(args) => run_apng_compat_command(args),
+        XtaskCommand::ApngQualitySize(args) => run_apng_quality_size_command(args),
+        XtaskCommand::ApngVisualGuard(args) => run_apng_visual_guard_command(args),
     }
 }
 
@@ -3003,6 +3057,875 @@ fn mutate_bytes(src: &[u8], seed: u64) -> Vec<u8> {
             data
         }
     }
+}
+
+// ── APNG fixture generation ──
+
+fn run_generate_apng_fixtures(args: GenerateApngFixturesArgs) -> AppResult<i32> {
+    #[allow(unused_imports)]
+    use png::{BlendOp, DisposeOp};
+    use pngoptim::apng::encode_apng;
+
+    let out_dir = PathBuf::from(&args.output_dir);
+    fs::create_dir_all(&out_dir)?;
+
+    let fixtures: Vec<(&str, pngoptim::apng::ApngImage)> = vec![
+        (
+            "dispose_none_source",
+            make_fixture_2frame(2, 2, DisposeOp::None, BlendOp::Source),
+        ),
+        (
+            "dispose_none_over",
+            make_fixture_2frame_semi(2, 2, DisposeOp::None, BlendOp::Over),
+        ),
+        (
+            "dispose_bg_source",
+            make_fixture_2frame(2, 2, DisposeOp::Background, BlendOp::Source),
+        ),
+        (
+            "dispose_bg_over",
+            make_fixture_2frame_semi(2, 2, DisposeOp::Background, BlendOp::Over),
+        ),
+        (
+            "dispose_prev_source",
+            make_fixture_3frame_prev(2, 2, BlendOp::Source),
+        ),
+        (
+            "dispose_prev_over",
+            make_fixture_3frame_prev(2, 2, BlendOp::Over),
+        ),
+        ("identical_consecutive", make_fixture_identical(2, 2)),
+        ("already_subrect", make_fixture_subrect(4, 4)),
+        ("no_change_frame", make_fixture_no_change(2, 2)),
+        ("with_default_image", make_fixture_default_image(2, 2)),
+        ("single_frame", make_fixture_single_frame(2, 2)),
+    ];
+
+    let mut count = 0;
+    for (name, apng) in &fixtures {
+        let data = encode_apng(apng)?;
+        let path = out_dir.join(format!("{name}.png"));
+        fs::write(&path, &data)?;
+        println!("  generated: {} ({} bytes)", path.display(), data.len());
+        count += 1;
+    }
+
+    println!("generated {count} APNG fixtures in {}", out_dir.display());
+    Ok(0)
+}
+
+fn px_rgba(pixels: &[[u8; 4]]) -> Vec<u8> {
+    pixels.iter().flat_map(|p| p.iter().copied()).collect()
+}
+
+fn make_fixture_2frame(
+    w: u32,
+    h: u32,
+    dispose: png::DisposeOp,
+    blend: png::BlendOp,
+) -> pngoptim::apng::ApngImage {
+    use pngoptim::apng::{ApngFrame, ApngImage};
+    let n = (w * h) as usize;
+    let frame1 = vec![[255u8, 0, 0, 255]; n];
+    let mut frame2 = vec![[0u8, 0, 0, 255]; n];
+    if n > 1 {
+        frame2[1] = [0, 255, 0, 255];
+    }
+    ApngImage {
+        width: w,
+        height: h,
+        num_plays: 0,
+        default_image: None,
+        frames: vec![
+            ApngFrame {
+                width: w,
+                height: h,
+                x_offset: 0,
+                y_offset: 0,
+                delay_num: 1,
+                delay_den: 10,
+                dispose_op: dispose,
+                blend_op: png::BlendOp::Source,
+                rgba: px_rgba(&frame1),
+            },
+            ApngFrame {
+                width: w,
+                height: h,
+                x_offset: 0,
+                y_offset: 0,
+                delay_num: 1,
+                delay_den: 10,
+                dispose_op: png::DisposeOp::None,
+                blend_op: blend,
+                rgba: px_rgba(&frame2),
+            },
+        ],
+    }
+}
+
+fn make_fixture_2frame_semi(
+    w: u32,
+    h: u32,
+    dispose: png::DisposeOp,
+    blend: png::BlendOp,
+) -> pngoptim::apng::ApngImage {
+    use pngoptim::apng::{ApngFrame, ApngImage};
+    let n = (w * h) as usize;
+    let frame1: Vec<[u8; 4]> = vec![[255, 0, 0, 255]; n];
+    let frame2: Vec<[u8; 4]> = vec![[0, 255, 0, 128]; n]; // semi-transparent
+    ApngImage {
+        width: w,
+        height: h,
+        num_plays: 0,
+        default_image: None,
+        frames: vec![
+            ApngFrame {
+                width: w,
+                height: h,
+                x_offset: 0,
+                y_offset: 0,
+                delay_num: 1,
+                delay_den: 10,
+                dispose_op: dispose,
+                blend_op: png::BlendOp::Source,
+                rgba: px_rgba(&frame1),
+            },
+            ApngFrame {
+                width: w,
+                height: h,
+                x_offset: 0,
+                y_offset: 0,
+                delay_num: 1,
+                delay_den: 10,
+                dispose_op: png::DisposeOp::None,
+                blend_op: blend,
+                rgba: px_rgba(&frame2),
+            },
+        ],
+    }
+}
+
+fn make_fixture_3frame_prev(w: u32, h: u32, blend: png::BlendOp) -> pngoptim::apng::ApngImage {
+    use pngoptim::apng::{ApngFrame, ApngImage};
+    let n = (w * h) as usize;
+    ApngImage {
+        width: w,
+        height: h,
+        num_plays: 0,
+        default_image: None,
+        frames: vec![
+            ApngFrame {
+                width: w,
+                height: h,
+                x_offset: 0,
+                y_offset: 0,
+                delay_num: 1,
+                delay_den: 10,
+                dispose_op: png::DisposeOp::None,
+                blend_op: png::BlendOp::Source,
+                rgba: px_rgba(&vec![[255, 0, 0, 255]; n]),
+            },
+            ApngFrame {
+                width: w,
+                height: h,
+                x_offset: 0,
+                y_offset: 0,
+                delay_num: 1,
+                delay_den: 10,
+                dispose_op: png::DisposeOp::Previous,
+                blend_op: blend,
+                rgba: px_rgba(&vec![[0, 255, 0, 255]; n]),
+            },
+            ApngFrame {
+                width: w,
+                height: h,
+                x_offset: 0,
+                y_offset: 0,
+                delay_num: 1,
+                delay_den: 10,
+                dispose_op: png::DisposeOp::None,
+                blend_op: blend,
+                rgba: px_rgba(&vec![[0, 0, 255, 255]; n]),
+            },
+        ],
+    }
+}
+
+fn make_fixture_identical(w: u32, h: u32) -> pngoptim::apng::ApngImage {
+    use pngoptim::apng::{ApngFrame, ApngImage};
+    let n = (w * h) as usize;
+    let pixels: Vec<[u8; 4]> = vec![[255, 0, 0, 255]; n];
+    let different: Vec<[u8; 4]> = vec![[0, 255, 0, 255]; n];
+    ApngImage {
+        width: w,
+        height: h,
+        num_plays: 0,
+        default_image: None,
+        frames: vec![
+            ApngFrame {
+                width: w,
+                height: h,
+                x_offset: 0,
+                y_offset: 0,
+                delay_num: 1,
+                delay_den: 10,
+                dispose_op: png::DisposeOp::None,
+                blend_op: png::BlendOp::Source,
+                rgba: px_rgba(&pixels),
+            },
+            ApngFrame {
+                width: w,
+                height: h,
+                x_offset: 0,
+                y_offset: 0,
+                delay_num: 1,
+                delay_den: 10,
+                dispose_op: png::DisposeOp::None,
+                blend_op: png::BlendOp::Source,
+                rgba: px_rgba(&pixels),
+            },
+            ApngFrame {
+                width: w,
+                height: h,
+                x_offset: 0,
+                y_offset: 0,
+                delay_num: 1,
+                delay_den: 10,
+                dispose_op: png::DisposeOp::None,
+                blend_op: png::BlendOp::Source,
+                rgba: px_rgba(&different),
+            },
+            ApngFrame {
+                width: w,
+                height: h,
+                x_offset: 0,
+                y_offset: 0,
+                delay_num: 1,
+                delay_den: 10,
+                dispose_op: png::DisposeOp::None,
+                blend_op: png::BlendOp::Source,
+                rgba: px_rgba(&different),
+            },
+        ],
+    }
+}
+
+fn make_fixture_subrect(w: u32, h: u32) -> pngoptim::apng::ApngImage {
+    use pngoptim::apng::{ApngFrame, ApngImage};
+    let n = (w * h) as usize;
+    ApngImage {
+        width: w,
+        height: h,
+        num_plays: 0,
+        default_image: None,
+        frames: vec![
+            ApngFrame {
+                width: w,
+                height: h,
+                x_offset: 0,
+                y_offset: 0,
+                delay_num: 1,
+                delay_den: 10,
+                dispose_op: png::DisposeOp::None,
+                blend_op: png::BlendOp::Source,
+                rgba: vec![0; n * 4],
+            },
+            // Already a sub-rect
+            ApngFrame {
+                width: 2,
+                height: 2,
+                x_offset: 1,
+                y_offset: 1,
+                delay_num: 1,
+                delay_den: 10,
+                dispose_op: png::DisposeOp::None,
+                blend_op: png::BlendOp::Source,
+                rgba: px_rgba(&[
+                    [255, 0, 0, 255],
+                    [0, 255, 0, 255],
+                    [0, 0, 255, 255],
+                    [255, 255, 0, 255],
+                ]),
+            },
+            ApngFrame {
+                width: 1,
+                height: 1,
+                x_offset: 3,
+                y_offset: 3,
+                delay_num: 1,
+                delay_den: 10,
+                dispose_op: png::DisposeOp::None,
+                blend_op: png::BlendOp::Source,
+                rgba: px_rgba(&[[255, 0, 255, 255]]),
+            },
+        ],
+    }
+}
+
+fn make_fixture_no_change(w: u32, h: u32) -> pngoptim::apng::ApngImage {
+    use pngoptim::apng::{ApngFrame, ApngImage};
+    let n = (w * h) as usize;
+    let pixels: Vec<[u8; 4]> = vec![[128, 64, 32, 255]; n];
+    ApngImage {
+        width: w,
+        height: h,
+        num_plays: 0,
+        default_image: None,
+        frames: vec![
+            ApngFrame {
+                width: w,
+                height: h,
+                x_offset: 0,
+                y_offset: 0,
+                delay_num: 1,
+                delay_den: 10,
+                dispose_op: png::DisposeOp::None,
+                blend_op: png::BlendOp::Source,
+                rgba: px_rgba(&pixels),
+            },
+            // Identical content
+            ApngFrame {
+                width: w,
+                height: h,
+                x_offset: 0,
+                y_offset: 0,
+                delay_num: 2,
+                delay_den: 10,
+                dispose_op: png::DisposeOp::None,
+                blend_op: png::BlendOp::Source,
+                rgba: px_rgba(&pixels),
+            },
+        ],
+    }
+}
+
+fn make_fixture_default_image(w: u32, h: u32) -> pngoptim::apng::ApngImage {
+    use pngoptim::apng::{ApngDefaultImage, ApngFrame, ApngImage};
+    let n = (w * h) as usize;
+    ApngImage {
+        width: w,
+        height: h,
+        num_plays: 0,
+        default_image: Some(ApngDefaultImage {
+            rgba: px_rgba(&vec![[200, 200, 200, 255]; n]),
+        }),
+        frames: vec![
+            ApngFrame {
+                width: w,
+                height: h,
+                x_offset: 0,
+                y_offset: 0,
+                delay_num: 1,
+                delay_den: 10,
+                dispose_op: png::DisposeOp::None,
+                blend_op: png::BlendOp::Source,
+                rgba: px_rgba(&vec![[255, 0, 0, 255]; n]),
+            },
+            ApngFrame {
+                width: w,
+                height: h,
+                x_offset: 0,
+                y_offset: 0,
+                delay_num: 1,
+                delay_den: 10,
+                dispose_op: png::DisposeOp::None,
+                blend_op: png::BlendOp::Source,
+                rgba: px_rgba(&vec![[0, 255, 0, 255]; n]),
+            },
+        ],
+    }
+}
+
+fn make_fixture_single_frame(w: u32, h: u32) -> pngoptim::apng::ApngImage {
+    use pngoptim::apng::{ApngFrame, ApngImage};
+    let n = (w * h) as usize;
+    ApngImage {
+        width: w,
+        height: h,
+        num_plays: 0,
+        default_image: None,
+        frames: vec![ApngFrame {
+            width: w,
+            height: h,
+            x_offset: 0,
+            y_offset: 0,
+            delay_num: 1,
+            delay_den: 10,
+            dispose_op: png::DisposeOp::None,
+            blend_op: png::BlendOp::Source,
+            rgba: px_rgba(&vec![[100, 150, 200, 255]; n]),
+        }],
+    }
+}
+
+// ── APNG compat command ──
+
+fn run_apng_compat_command(args: ApngCompatArgs) -> AppResult<i32> {
+    let root = std::env::current_dir()?;
+    let run_id = args
+        .run_id
+        .unwrap_or_else(|| format!("apng-compat-{}", chrono_run_id()));
+    let reports_dir = root.join("reports").join("apng_compat").join(&run_id);
+    fs::create_dir_all(&reports_dir)?;
+
+    if args.build {
+        build_release()?;
+    }
+
+    let dataset_dir = root.join(&args.dataset);
+    let apng_files = collect_apng_files(&dataset_dir)?;
+    if apng_files.is_empty() {
+        println!("no APNG files found in {}", dataset_dir.display());
+        return Ok(0);
+    }
+
+    let binary = root.join(&args.binary);
+    let mut passed = 0;
+    let mut failed = 0;
+    let mut results = Vec::new();
+
+    for path in &apng_files {
+        let input_bytes = fs::read(path)?;
+        let input_apng = match pngoptim::apng::decode_apng(&input_bytes) {
+            Ok(Some(a)) => a,
+            _ => {
+                println!("  skip (not APNG): {}", path.display());
+                continue;
+            }
+        };
+
+        let composited_input = match pngoptim::apng::compose_frames(&input_apng) {
+            Ok(c) => c,
+            Err(e) => {
+                println!("  FAIL (compose input): {} — {e}", path.display());
+                failed += 1;
+                continue;
+            }
+        };
+
+        // Run pngoptim on the file
+        let tmp_output = reports_dir.join(format!(
+            "output_{}",
+            path.file_name().unwrap_or_default().to_string_lossy()
+        ));
+        let status = Command::new(&binary)
+            .args([
+                path.to_str().unwrap(),
+                "-o",
+                tmp_output.to_str().unwrap(),
+                "--force",
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .status()?;
+
+        if !status.success() {
+            println!(
+                "  FAIL (pngoptim exit={}): {}",
+                status.code().unwrap_or(-1),
+                path.display()
+            );
+            failed += 1;
+            continue;
+        }
+
+        let output_bytes = fs::read(&tmp_output)?;
+        let output_apng = match pngoptim::apng::decode_apng(&output_bytes) {
+            Ok(Some(a)) => a,
+            Ok(None) => {
+                println!("  FAIL (output not APNG): {}", path.display());
+                failed += 1;
+                continue;
+            }
+            Err(e) => {
+                println!("  FAIL (decode output): {} — {e}", path.display());
+                failed += 1;
+                continue;
+            }
+        };
+
+        let composited_output = match pngoptim::apng::compose_frames(&output_apng) {
+            Ok(c) => c,
+            Err(e) => {
+                println!("  FAIL (compose output): {} — {e}", path.display());
+                failed += 1;
+                continue;
+            }
+        };
+
+        if composited_input == composited_output {
+            println!("  OK: {}", path.display());
+            passed += 1;
+        } else {
+            println!(
+                "  FAIL (composited mismatch): {} — input_frames={} output_frames={}",
+                path.display(),
+                composited_input.len(),
+                composited_output.len()
+            );
+            failed += 1;
+        }
+
+        results.push(format!(
+            "{},{},{},{}",
+            path.display(),
+            input_bytes.len(),
+            output_bytes.len(),
+            if composited_input == composited_output {
+                "pass"
+            } else {
+                "fail"
+            }
+        ));
+
+        // Clean up temp output
+        let _ = fs::remove_file(&tmp_output);
+    }
+
+    // Write summary
+    let summary = format!(
+        "# APNG Compat Report\n\n- run_id: {run_id}\n- total: {}\n- passed: {passed}\n- failed: {failed}\n- status: {}\n",
+        passed + failed,
+        if failed == 0 { "pass" } else { "fail" }
+    );
+    fs::write(reports_dir.join("summary.md"), &summary)?;
+
+    // Write CSV
+    let mut csv = String::from("file,input_bytes,output_bytes,result\n");
+    for r in &results {
+        csv.push_str(r);
+        csv.push('\n');
+    }
+    fs::write(reports_dir.join("results.csv"), &csv)?;
+
+    println!("\n{summary}");
+    Ok(if failed > 0 { 1 } else { 0 })
+}
+
+// ── APNG quality-size command ──
+
+fn run_apng_quality_size_command(args: ApngQualitySizeArgs) -> AppResult<i32> {
+    let root = std::env::current_dir()?;
+    let run_id = args
+        .run_id
+        .unwrap_or_else(|| format!("apng-qsize-{}", chrono_run_id()));
+    let reports_dir = root.join("reports").join("apng_quality_size").join(&run_id);
+    fs::create_dir_all(&reports_dir)?;
+
+    if args.build {
+        build_release()?;
+    }
+
+    let dataset_dir = root.join(&args.dataset);
+    let apng_files = collect_apng_files(&dataset_dir)?;
+    if apng_files.is_empty() {
+        println!("no APNG files found in {}", dataset_dir.display());
+        return Ok(0);
+    }
+
+    let binary = root.join(&args.binary);
+    let mut shrink_count = 0;
+    let mut grow_count = 0;
+    let mut same_count = 0;
+    let mut total_input: u64 = 0;
+    let mut total_output: u64 = 0;
+    let mut rows = Vec::new();
+
+    for path in &apng_files {
+        let input_size = fs::metadata(path)?.len();
+        let tmp_output = reports_dir.join(format!(
+            "output_{}",
+            path.file_name().unwrap_or_default().to_string_lossy()
+        ));
+
+        let status = Command::new(&binary)
+            .args([
+                path.to_str().unwrap(),
+                "-o",
+                tmp_output.to_str().unwrap(),
+                "--force",
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .status()?;
+
+        if !status.success() {
+            println!(
+                "  skip (exit={}): {}",
+                status.code().unwrap_or(-1),
+                path.display()
+            );
+            continue;
+        }
+
+        let output_size = fs::metadata(&tmp_output)?.len();
+        total_input += input_size;
+        total_output += output_size;
+
+        let ratio = output_size as f64 / input_size as f64;
+        let label = if output_size < input_size {
+            shrink_count += 1;
+            "shrink"
+        } else if output_size > input_size {
+            grow_count += 1;
+            "grow"
+        } else {
+            same_count += 1;
+            "same"
+        };
+
+        println!(
+            "  {}: {} → {} ({:.1}%) {}",
+            path.display(),
+            input_size,
+            output_size,
+            (ratio - 1.0) * 100.0,
+            label
+        );
+        rows.push(format!(
+            "{},{},{},{:.4},{}",
+            path.display(),
+            input_size,
+            output_size,
+            ratio,
+            label
+        ));
+
+        let _ = fs::remove_file(&tmp_output);
+    }
+
+    let total_ratio = if total_input > 0 {
+        total_output as f64 / total_input as f64
+    } else {
+        1.0
+    };
+
+    let summary = format!(
+        "# APNG Quality-Size Report\n\n\
+         - run_id: {run_id}\n\
+         - total_input: {total_input} bytes\n\
+         - total_output: {total_output} bytes\n\
+         - total_ratio: {total_ratio:.4}\n\
+         - shrink: {shrink_count}\n\
+         - grow: {grow_count}\n\
+         - same: {same_count}\n"
+    );
+    fs::write(reports_dir.join("summary.md"), &summary)?;
+
+    let mut csv = String::from("file,input_bytes,output_bytes,ratio,result\n");
+    for r in &rows {
+        csv.push_str(r);
+        csv.push('\n');
+    }
+    fs::write(reports_dir.join("results.csv"), &csv)?;
+
+    println!("\n{summary}");
+    Ok(if grow_count > 0 { 1 } else { 0 })
+}
+
+// ── APNG visual guard command ──
+
+fn run_apng_visual_guard_command(args: ApngVisualGuardArgs) -> AppResult<i32> {
+    let root = std::env::current_dir()?;
+    let run_id = args
+        .run_id
+        .unwrap_or_else(|| format!("apng-visual-{}", chrono_run_id()));
+    let reports_dir = root.join("reports").join("apng_visual_guard").join(&run_id);
+    fs::create_dir_all(&reports_dir)?;
+
+    if args.build {
+        build_release()?;
+    }
+
+    let dataset_dir = root.join(&args.dataset);
+    let apng_files = collect_apng_files(&dataset_dir)?;
+    if apng_files.is_empty() {
+        println!("no APNG files found in {}", dataset_dir.display());
+        return Ok(0);
+    }
+
+    let binary = root.join(&args.binary);
+    let mut passed = 0;
+    let mut failed = 0;
+    let mut fail_dir_created = false;
+
+    for path in &apng_files {
+        let input_bytes = fs::read(path)?;
+        let input_apng = match pngoptim::apng::decode_apng(&input_bytes) {
+            Ok(Some(a)) => a,
+            _ => continue,
+        };
+
+        let composited_input = match pngoptim::apng::compose_frames(&input_apng) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+
+        let tmp_output = reports_dir.join(format!(
+            "output_{}",
+            path.file_name().unwrap_or_default().to_string_lossy()
+        ));
+
+        let status = Command::new(&binary)
+            .args([
+                path.to_str().unwrap(),
+                "-o",
+                tmp_output.to_str().unwrap(),
+                "--force",
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .status()?;
+
+        if !status.success() {
+            continue;
+        }
+
+        let output_bytes = fs::read(&tmp_output)?;
+        let output_apng = match pngoptim::apng::decode_apng(&output_bytes) {
+            Ok(Some(a)) => a,
+            _ => {
+                failed += 1;
+                continue;
+            }
+        };
+
+        let composited_output = match pngoptim::apng::compose_frames(&output_apng) {
+            Ok(c) => c,
+            Err(_) => {
+                failed += 1;
+                continue;
+            }
+        };
+
+        let frame_count = composited_input.len().min(composited_output.len());
+        let mut frame_mismatches = Vec::new();
+
+        for fi in 0..frame_count {
+            if composited_input[fi] != composited_output[fi] {
+                frame_mismatches.push(fi);
+            }
+        }
+
+        if frame_mismatches.is_empty() && composited_input.len() == composited_output.len() {
+            passed += 1;
+        } else {
+            failed += 1;
+
+            // Export mismatched frames as PNG for inspection
+            if !fail_dir_created {
+                fs::create_dir_all(reports_dir.join("failures"))?;
+                fail_dir_created = true;
+            }
+
+            let stem = path
+                .file_stem()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_string();
+            for &fi in &frame_mismatches {
+                // Export input frame
+                export_rgba_as_png(
+                    &composited_input[fi],
+                    input_apng.width,
+                    input_apng.height,
+                    &reports_dir
+                        .join("failures")
+                        .join(format!("{stem}_frame{fi}_input.png")),
+                )?;
+                // Export output frame
+                export_rgba_as_png(
+                    &composited_output[fi],
+                    output_apng.width,
+                    output_apng.height,
+                    &reports_dir
+                        .join("failures")
+                        .join(format!("{stem}_frame{fi}_output.png")),
+                )?;
+            }
+
+            println!(
+                "  FAIL: {} — {} frame(s) differ: {:?}",
+                path.display(),
+                frame_mismatches.len(),
+                frame_mismatches
+            );
+        }
+
+        let _ = fs::remove_file(&tmp_output);
+    }
+
+    let summary = format!(
+        "# APNG Visual Guard Report\n\n\
+         - run_id: {run_id}\n\
+         - passed: {passed}\n\
+         - failed: {failed}\n\
+         - status: {}\n",
+        if failed == 0 { "pass" } else { "fail" }
+    );
+    fs::write(reports_dir.join("summary.md"), &summary)?;
+
+    println!("\n{summary}");
+    Ok(if failed > 0 { 1 } else { 0 })
+}
+
+fn export_rgba_as_png(rgba: &[u8], width: u32, height: u32, path: &Path) -> AppResult<()> {
+    let file = fs::File::create(path)?;
+    let mut encoder = png::Encoder::new(BufWriter::new(file), width, height);
+    encoder.set_color(png::ColorType::Rgba);
+    encoder.set_depth(png::BitDepth::Eight);
+    let mut writer = encoder.write_header()?;
+    writer.write_image_data(rgba)?;
+    writer.finish()?;
+    Ok(())
+}
+
+fn collect_apng_files(dir: &Path) -> AppResult<Vec<PathBuf>> {
+    let mut files = Vec::new();
+    if !dir.exists() {
+        return Ok(files);
+    }
+    collect_png_recursive(dir, &mut files)?;
+    files.sort();
+    Ok(files)
+}
+
+fn collect_png_recursive(dir: &Path, out: &mut Vec<PathBuf>) -> AppResult<()> {
+    if !dir.is_dir() {
+        return Ok(());
+    }
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.is_dir() {
+            collect_png_recursive(&path, out)?;
+        } else if path
+            .extension()
+            .is_some_and(|e| e.eq_ignore_ascii_case("png") || e.eq_ignore_ascii_case("apng"))
+        {
+            out.push(path);
+        }
+    }
+    Ok(())
+}
+
+fn chrono_run_id() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    format!("{secs}")
+}
+
+fn build_release() -> AppResult<()> {
+    let status = Command::new("cargo")
+        .args(["build", "--release"])
+        .status()?;
+    if !status.success() {
+        return Err("cargo build --release failed".into());
+    }
+    Ok(())
 }
 
 #[cfg(test)]

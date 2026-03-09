@@ -559,11 +559,188 @@ fn gcd(mut a: u32, mut b: u32) -> u32 {
     a
 }
 
+/// Lightweight input characteristics for APNG optimization decisions.
+#[derive(Debug, Clone)]
+pub struct ApngInputInfo {
+    pub is_indexed: bool,
+    pub has_subrect_frames: bool,
+}
+
+/// Scan raw PNG bytes to detect palette mode and sub-rect frames without full decode.
+pub fn detect_input_characteristics(input: &[u8]) -> ApngInputInfo {
+    let mut is_indexed = false;
+    let mut has_subrect_frames = false;
+    let mut canvas_width: u32 = 0;
+    let mut canvas_height: u32 = 0;
+
+    // Parse PNG chunks
+    if input.len() < 8 {
+        return ApngInputInfo {
+            is_indexed: false,
+            has_subrect_frames: false,
+        };
+    }
+
+    let mut pos = 8; // skip PNG signature
+    while pos + 12 <= input.len() {
+        let chunk_len =
+            u32::from_be_bytes([input[pos], input[pos + 1], input[pos + 2], input[pos + 3]])
+                as usize;
+        let chunk_type = &input[pos + 4..pos + 8];
+
+        match chunk_type {
+            b"IHDR" if chunk_len >= 13 => {
+                let data = &input[pos + 8..pos + 8 + chunk_len.min(input.len() - pos - 8)];
+                if data.len() >= 13 {
+                    canvas_width = u32::from_be_bytes([data[0], data[1], data[2], data[3]]);
+                    canvas_height = u32::from_be_bytes([data[4], data[5], data[6], data[7]]);
+                    // color_type == 3 means indexed
+                    is_indexed = data[9] == 3;
+                }
+            }
+            b"PLTE" => {
+                is_indexed = true;
+            }
+            b"fcTL" if chunk_len >= 26 => {
+                let data = &input[pos + 8..pos + 8 + chunk_len.min(input.len() - pos - 8)];
+                if data.len() >= 26 {
+                    let fw = u32::from_be_bytes([data[4], data[5], data[6], data[7]]);
+                    let fh = u32::from_be_bytes([data[8], data[9], data[10], data[11]]);
+                    let fx = u32::from_be_bytes([data[12], data[13], data[14], data[15]]);
+                    let fy = u32::from_be_bytes([data[16], data[17], data[18], data[19]]);
+                    if fw != canvas_width || fh != canvas_height || fx != 0 || fy != 0 {
+                        has_subrect_frames = true;
+                    }
+                }
+            }
+            b"IEND" => break,
+            _ => {}
+        }
+
+        // Move to next chunk: 4(len) + 4(type) + data + 4(crc)
+        pos += 12 + chunk_len;
+    }
+
+    ApngInputInfo {
+        is_indexed,
+        has_subrect_frames,
+    }
+}
+
+/// Minimize frame rectangles with post-verification.
+/// Returns `true` if optimization was applied and verified, `false` if rolled back.
+pub fn minimize_frame_rects_checked(apng: &mut ApngImage) -> bool {
+    if apng.frames.len() < 2 {
+        return false;
+    }
+
+    // Save composited output before optimization
+    let composited_before = match compose_frames(apng) {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+
+    // Save original frames for rollback
+    let original_frames = apng.frames.clone();
+
+    // Apply optimization
+    minimize_frame_rects(apng);
+
+    // Verify composited equivalence
+    let composited_after = match compose_frames(apng) {
+        Ok(c) => c,
+        Err(_) => {
+            apng.frames = original_frames;
+            return false;
+        }
+    };
+
+    if composited_before == composited_after {
+        true
+    } else {
+        // Rollback
+        apng.frames = original_frames;
+        false
+    }
+}
+
+/// Find the bounding box of non-transparent content in an RGBA buffer.
+/// Returns `(content_width, content_height)` — the minimal dimensions
+/// that contain all pixels with alpha > 0, anchored at top-left (0,0).
+fn find_content_bounds(rgba: &[u8], w: u32, h: u32) -> (u32, u32) {
+    let mut max_row: u32 = 0;
+    let mut max_col: u32 = 0;
+    let mut found = false;
+
+    for y in 0..h {
+        for x in 0..w {
+            let idx = ((y * w + x) * 4 + 3) as usize;
+            if rgba[idx] > 0 {
+                if x + 1 > max_col {
+                    max_col = x + 1;
+                }
+                if y + 1 > max_row {
+                    max_row = y + 1;
+                }
+                found = true;
+            }
+        }
+    }
+
+    if !found {
+        (w, h) // fully transparent — return original dimensions
+    } else {
+        (max_col, max_row)
+    }
+}
+
+/// Conservative frame trim for safe mode.
+/// Only trims trailing transparent rows/columns from full-canvas Source frames.
+/// Does NOT change dispose_op or blend_op — only shrinks frame dimensions.
+pub fn cautious_frame_trim(apng: &mut ApngImage) {
+    for frame in &mut apng.frames {
+        // Only trim full-canvas Source frames (safe: no semantic change)
+        if frame.blend_op != BlendOp::Source {
+            continue;
+        }
+        if frame.width != apng.width || frame.height != apng.height {
+            continue;
+        }
+        if frame.x_offset != 0 || frame.y_offset != 0 {
+            continue;
+        }
+
+        // Find content bounds
+        let (trim_w, trim_h) = find_content_bounds(&frame.rgba, frame.width, frame.height);
+
+        if trim_w == frame.width && trim_h == frame.height {
+            continue; // nothing to trim
+        }
+        if trim_w == 0 || trim_h == 0 {
+            continue; // fully transparent — don't collapse to 0x0
+        }
+
+        // Extract top-left sub-rect (0,0 to trim_w×trim_h)
+        let mut trimmed = Vec::with_capacity((trim_w * trim_h * 4) as usize);
+        for y in 0..trim_h {
+            let row_start = (y * frame.width * 4) as usize;
+            let row_end = row_start + (trim_w * 4) as usize;
+            trimmed.extend_from_slice(&frame.rgba[row_start..row_end]);
+        }
+
+        frame.width = trim_w;
+        frame.height = trim_h;
+        frame.rgba = trimmed;
+        // x_offset, y_offset stay 0; blend_op, dispose_op unchanged
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        ApngDefaultImage, ApngFrame, ApngImage, compose_frames, decode_apng, encode_apng,
-        fold_duplicate_frames, merge_delays, minimize_frame_rects,
+        ApngDefaultImage, ApngFrame, ApngImage, cautious_frame_trim, compose_frames, decode_apng,
+        detect_input_characteristics, encode_apng, find_content_bounds, fold_duplicate_frames,
+        merge_delays, minimize_frame_rects, minimize_frame_rects_checked,
     };
     use png::{BlendOp, ColorType, DisposeOp};
 
@@ -947,15 +1124,7 @@ mod tests {
         let composited_orig = compose_frames(&original).expect("compose original");
         let encoded = encode_apng(&original).expect("encode");
 
-        let options = PipelineOptions {
-            quality: None,
-            speed: 4,
-            dither_level: 1.0,
-            posterize: None,
-            strip: true,
-            skip_if_larger: false,
-            no_icc: false,
-        };
+        let options = PipelineOptions::default();
 
         let result = process_png_bytes(&encoded, options).expect("pipeline");
         assert_eq!(result.quality_score, 100);
@@ -967,5 +1136,1340 @@ mod tests {
             .expect("is apng");
         let composited_out = compose_frames(&decoded).expect("compose output");
         assert_eq!(composited_orig, composited_out);
+    }
+
+    // ── compose_frames tests ──
+
+    #[test]
+    fn compose_dispose_background_clears_region() {
+        let apng = ApngImage {
+            width: 2,
+            height: 1,
+            num_plays: 0,
+            default_image: None,
+            frames: vec![
+                ApngFrame {
+                    width: 2,
+                    height: 1,
+                    x_offset: 0,
+                    y_offset: 0,
+                    delay_num: 1,
+                    delay_den: 10,
+                    dispose_op: DisposeOp::Background,
+                    blend_op: BlendOp::Source,
+                    rgba: rgba(&[[255, 0, 0, 255], [0, 255, 0, 255]]),
+                },
+                ApngFrame {
+                    width: 1,
+                    height: 1,
+                    x_offset: 0,
+                    y_offset: 0,
+                    delay_num: 1,
+                    delay_den: 10,
+                    dispose_op: DisposeOp::None,
+                    blend_op: BlendOp::Source,
+                    rgba: rgba(&[[0, 0, 255, 255]]),
+                },
+            ],
+        };
+
+        let composited = compose_frames(&apng).expect("compose");
+        // After frame 0 dispose=background, canvas should be cleared before frame 1
+        // Frame 1 writes blue at (0,0), pixel (1,0) should be transparent (cleared)
+        assert_eq!(composited[1], rgba(&[[0, 0, 255, 255], [0, 0, 0, 0]]));
+    }
+
+    #[test]
+    fn compose_blend_over_partial_alpha() {
+        let apng = ApngImage {
+            width: 1,
+            height: 1,
+            num_plays: 0,
+            default_image: None,
+            frames: vec![
+                ApngFrame {
+                    width: 1,
+                    height: 1,
+                    x_offset: 0,
+                    y_offset: 0,
+                    delay_num: 1,
+                    delay_den: 10,
+                    dispose_op: DisposeOp::None,
+                    blend_op: BlendOp::Source,
+                    rgba: rgba(&[[255, 0, 0, 255]]),
+                },
+                ApngFrame {
+                    width: 1,
+                    height: 1,
+                    x_offset: 0,
+                    y_offset: 0,
+                    delay_num: 1,
+                    delay_den: 10,
+                    dispose_op: DisposeOp::None,
+                    blend_op: BlendOp::Over,
+                    // 50% transparent green over opaque red
+                    rgba: rgba(&[[0, 255, 0, 128]]),
+                },
+            ],
+        };
+        let composited = compose_frames(&apng).expect("compose");
+        // Alpha blending: green over red
+        let result = &composited[1];
+        // Result should be opaque with blended RGB
+        assert_eq!(result[3], 255); // fully opaque output
+        assert!(result[0] < 200); // red reduced
+        assert!(result[1] > 50); // green present
+    }
+
+    #[test]
+    fn compose_dispose_previous_first_frame_degrades_to_background() {
+        // Per APNG spec: DisposeOp::Previous on frame 0 degrades to Background
+        let apng = ApngImage {
+            width: 1,
+            height: 1,
+            num_plays: 0,
+            default_image: None,
+            frames: vec![
+                ApngFrame {
+                    width: 1,
+                    height: 1,
+                    x_offset: 0,
+                    y_offset: 0,
+                    delay_num: 1,
+                    delay_den: 10,
+                    dispose_op: DisposeOp::Previous, // degrades to Background for frame 0
+                    blend_op: BlendOp::Source,
+                    rgba: rgba(&[[255, 0, 0, 255]]),
+                },
+                ApngFrame {
+                    width: 1,
+                    height: 1,
+                    x_offset: 0,
+                    y_offset: 0,
+                    delay_num: 1,
+                    delay_den: 10,
+                    dispose_op: DisposeOp::None,
+                    blend_op: BlendOp::Source,
+                    rgba: rgba(&[[0, 255, 0, 255]]),
+                },
+            ],
+        };
+        let composited = compose_frames(&apng).expect("compose");
+        assert_eq!(composited[0], rgba(&[[255, 0, 0, 255]]));
+        // After frame 0 with Previous->Background, canvas is cleared
+        assert_eq!(composited[1], rgba(&[[0, 255, 0, 255]]));
+    }
+
+    // ── minimize_frame_rects tests ──
+
+    #[test]
+    fn minimize_already_subrect_input() {
+        // Input already has sub-rect frames, minimize should still produce correct composites
+        let mut apng = ApngImage {
+            width: 3,
+            height: 3,
+            num_plays: 0,
+            default_image: None,
+            frames: vec![
+                ApngFrame {
+                    width: 3,
+                    height: 3,
+                    x_offset: 0,
+                    y_offset: 0,
+                    delay_num: 1,
+                    delay_den: 10,
+                    dispose_op: DisposeOp::None,
+                    blend_op: BlendOp::Source,
+                    rgba: vec![0; 3 * 3 * 4],
+                },
+                // Already a sub-rect frame
+                ApngFrame {
+                    width: 2,
+                    height: 2,
+                    x_offset: 1,
+                    y_offset: 1,
+                    delay_num: 1,
+                    delay_den: 10,
+                    dispose_op: DisposeOp::None,
+                    blend_op: BlendOp::Source,
+                    rgba: rgba(&[
+                        [255, 0, 0, 255],
+                        [0, 255, 0, 255],
+                        [0, 0, 255, 255],
+                        [255, 255, 0, 255],
+                    ]),
+                },
+            ],
+        };
+
+        let composited_before = compose_frames(&apng).expect("compose before");
+        minimize_frame_rects(&mut apng);
+        let composited_after = compose_frames(&apng).expect("compose after");
+        assert_eq!(composited_before, composited_after);
+    }
+
+    #[test]
+    fn minimize_no_change_frame_becomes_1x1() {
+        let frame_rgba = rgba(&[
+            [255, 0, 0, 255],
+            [0, 255, 0, 255],
+            [0, 0, 255, 255],
+            [255, 255, 0, 255],
+        ]);
+        let mut apng = ApngImage {
+            width: 2,
+            height: 2,
+            num_plays: 0,
+            default_image: None,
+            frames: vec![
+                ApngFrame {
+                    width: 2,
+                    height: 2,
+                    x_offset: 0,
+                    y_offset: 0,
+                    delay_num: 1,
+                    delay_den: 10,
+                    dispose_op: DisposeOp::None,
+                    blend_op: BlendOp::Source,
+                    rgba: frame_rgba.clone(),
+                },
+                // Identical to frame 0
+                ApngFrame {
+                    width: 2,
+                    height: 2,
+                    x_offset: 0,
+                    y_offset: 0,
+                    delay_num: 1,
+                    delay_den: 10,
+                    dispose_op: DisposeOp::None,
+                    blend_op: BlendOp::Source,
+                    rgba: frame_rgba,
+                },
+            ],
+        };
+
+        minimize_frame_rects(&mut apng);
+        // No-change frame should become 1x1 transparent
+        assert_eq!(apng.frames[1].width, 1);
+        assert_eq!(apng.frames[1].height, 1);
+        assert_eq!(apng.frames[1].rgba, vec![0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn minimize_full_change_stays_full() {
+        let mut apng = ApngImage {
+            width: 2,
+            height: 2,
+            num_plays: 0,
+            default_image: None,
+            frames: vec![
+                ApngFrame {
+                    width: 2,
+                    height: 2,
+                    x_offset: 0,
+                    y_offset: 0,
+                    delay_num: 1,
+                    delay_den: 10,
+                    dispose_op: DisposeOp::None,
+                    blend_op: BlendOp::Source,
+                    rgba: rgba(&[
+                        [255, 0, 0, 255],
+                        [255, 0, 0, 255],
+                        [255, 0, 0, 255],
+                        [255, 0, 0, 255],
+                    ]),
+                },
+                // Every pixel changes
+                ApngFrame {
+                    width: 2,
+                    height: 2,
+                    x_offset: 0,
+                    y_offset: 0,
+                    delay_num: 1,
+                    delay_den: 10,
+                    dispose_op: DisposeOp::None,
+                    blend_op: BlendOp::Source,
+                    rgba: rgba(&[
+                        [0, 255, 0, 255],
+                        [0, 255, 0, 255],
+                        [0, 255, 0, 255],
+                        [0, 255, 0, 255],
+                    ]),
+                },
+            ],
+        };
+
+        minimize_frame_rects(&mut apng);
+        // Full change: should stay 2x2 at (0,0)
+        assert_eq!(apng.frames[1].width, 2);
+        assert_eq!(apng.frames[1].height, 2);
+        assert_eq!(apng.frames[1].x_offset, 0);
+        assert_eq!(apng.frames[1].y_offset, 0);
+    }
+
+    #[test]
+    fn minimize_single_frame_noop() {
+        let mut apng = ApngImage {
+            width: 2,
+            height: 2,
+            num_plays: 0,
+            default_image: None,
+            frames: vec![ApngFrame {
+                width: 2,
+                height: 2,
+                x_offset: 0,
+                y_offset: 0,
+                delay_num: 1,
+                delay_den: 10,
+                dispose_op: DisposeOp::None,
+                blend_op: BlendOp::Source,
+                rgba: rgba(&[
+                    [255, 0, 0, 255],
+                    [0, 255, 0, 255],
+                    [0, 0, 255, 255],
+                    [255, 255, 0, 255],
+                ]),
+            }],
+        };
+        let original = apng.clone();
+        minimize_frame_rects(&mut apng);
+        assert_eq!(apng.frames[0].width, original.frames[0].width);
+        assert_eq!(apng.frames[0].height, original.frames[0].height);
+    }
+
+    #[test]
+    fn minimize_preserves_composited_equivalence() {
+        // Multi-frame with various changes — core property test
+        let mut apng = ApngImage {
+            width: 4,
+            height: 4,
+            num_plays: 0,
+            default_image: None,
+            frames: vec![
+                ApngFrame {
+                    width: 4,
+                    height: 4,
+                    x_offset: 0,
+                    y_offset: 0,
+                    delay_num: 1,
+                    delay_den: 10,
+                    dispose_op: DisposeOp::None,
+                    blend_op: BlendOp::Source,
+                    rgba: vec![128; 4 * 4 * 4],
+                },
+                ApngFrame {
+                    width: 4,
+                    height: 4,
+                    x_offset: 0,
+                    y_offset: 0,
+                    delay_num: 1,
+                    delay_den: 10,
+                    dispose_op: DisposeOp::None,
+                    blend_op: BlendOp::Source,
+                    rgba: {
+                        let mut d = vec![128; 4 * 4 * 4];
+                        // Change only pixels (1,1) and (2,3)
+                        let idx1 = (1 * 4 + 1) * 4;
+                        d[idx1..idx1 + 4].copy_from_slice(&[255, 0, 0, 255]);
+                        let idx2 = (3 * 4 + 2) * 4;
+                        d[idx2..idx2 + 4].copy_from_slice(&[0, 255, 0, 255]);
+                        d
+                    },
+                },
+                ApngFrame {
+                    width: 4,
+                    height: 4,
+                    x_offset: 0,
+                    y_offset: 0,
+                    delay_num: 1,
+                    delay_den: 10,
+                    dispose_op: DisposeOp::None,
+                    blend_op: BlendOp::Source,
+                    rgba: vec![64; 4 * 4 * 4],
+                },
+            ],
+        };
+
+        let composited_before = compose_frames(&apng).expect("compose before");
+        minimize_frame_rects(&mut apng);
+        let composited_after = compose_frames(&apng).expect("compose after");
+        assert_eq!(composited_before, composited_after);
+    }
+
+    // ── minimize_frame_rects_checked tests ──
+
+    #[test]
+    fn minimize_checked_succeeds_on_valid_input() {
+        let mut apng = ApngImage {
+            width: 2,
+            height: 2,
+            num_plays: 0,
+            default_image: None,
+            frames: vec![
+                ApngFrame {
+                    width: 2,
+                    height: 2,
+                    x_offset: 0,
+                    y_offset: 0,
+                    delay_num: 1,
+                    delay_den: 10,
+                    dispose_op: DisposeOp::None,
+                    blend_op: BlendOp::Source,
+                    rgba: rgba(&[
+                        [255, 0, 0, 255],
+                        [0, 0, 0, 255],
+                        [0, 0, 0, 255],
+                        [0, 0, 0, 255],
+                    ]),
+                },
+                ApngFrame {
+                    width: 2,
+                    height: 2,
+                    x_offset: 0,
+                    y_offset: 0,
+                    delay_num: 1,
+                    delay_den: 10,
+                    dispose_op: DisposeOp::None,
+                    blend_op: BlendOp::Source,
+                    rgba: rgba(&[
+                        [255, 0, 0, 255],
+                        [0, 0, 0, 255],
+                        [0, 0, 0, 255],
+                        [0, 255, 0, 255],
+                    ]),
+                },
+            ],
+        };
+        assert!(minimize_frame_rects_checked(&mut apng));
+        // Should have been minimized
+        assert!(apng.frames[1].width < 2 || apng.frames[1].height < 2);
+    }
+
+    #[test]
+    fn minimize_checked_single_frame_returns_false() {
+        let mut apng = ApngImage {
+            width: 1,
+            height: 1,
+            num_plays: 0,
+            default_image: None,
+            frames: vec![ApngFrame {
+                width: 1,
+                height: 1,
+                x_offset: 0,
+                y_offset: 0,
+                delay_num: 1,
+                delay_den: 10,
+                dispose_op: DisposeOp::None,
+                blend_op: BlendOp::Source,
+                rgba: rgba(&[[255, 0, 0, 255]]),
+            }],
+        };
+        assert!(!minimize_frame_rects_checked(&mut apng));
+    }
+
+    // ── fold_duplicate_frames additional tests ──
+
+    #[test]
+    fn fold_non_consecutive_duplicates() {
+        // A, A, B, B -> A, B
+        let mut apng = ApngImage {
+            width: 1,
+            height: 1,
+            num_plays: 0,
+            default_image: None,
+            frames: vec![
+                ApngFrame {
+                    width: 1,
+                    height: 1,
+                    x_offset: 0,
+                    y_offset: 0,
+                    delay_num: 1,
+                    delay_den: 10,
+                    dispose_op: DisposeOp::None,
+                    blend_op: BlendOp::Source,
+                    rgba: rgba(&[[255, 0, 0, 255]]),
+                },
+                ApngFrame {
+                    width: 1,
+                    height: 1,
+                    x_offset: 0,
+                    y_offset: 0,
+                    delay_num: 1,
+                    delay_den: 10,
+                    dispose_op: DisposeOp::None,
+                    blend_op: BlendOp::Source,
+                    rgba: rgba(&[[255, 0, 0, 255]]),
+                },
+                ApngFrame {
+                    width: 1,
+                    height: 1,
+                    x_offset: 0,
+                    y_offset: 0,
+                    delay_num: 1,
+                    delay_den: 10,
+                    dispose_op: DisposeOp::None,
+                    blend_op: BlendOp::Source,
+                    rgba: rgba(&[[0, 255, 0, 255]]),
+                },
+                ApngFrame {
+                    width: 1,
+                    height: 1,
+                    x_offset: 0,
+                    y_offset: 0,
+                    delay_num: 1,
+                    delay_den: 10,
+                    dispose_op: DisposeOp::None,
+                    blend_op: BlendOp::Source,
+                    rgba: rgba(&[[0, 255, 0, 255]]),
+                },
+            ],
+        };
+        fold_duplicate_frames(&mut apng);
+        assert_eq!(apng.frames.len(), 2);
+        assert_eq!(apng.frames[0].delay_num, 2);
+        assert_eq!(apng.frames[1].delay_num, 2);
+    }
+
+    #[test]
+    fn fold_all_identical() {
+        let mut apng = ApngImage {
+            width: 1,
+            height: 1,
+            num_plays: 0,
+            default_image: None,
+            frames: vec![
+                ApngFrame {
+                    width: 1,
+                    height: 1,
+                    x_offset: 0,
+                    y_offset: 0,
+                    delay_num: 1,
+                    delay_den: 10,
+                    dispose_op: DisposeOp::None,
+                    blend_op: BlendOp::Source,
+                    rgba: rgba(&[[255, 0, 0, 255]]),
+                },
+                ApngFrame {
+                    width: 1,
+                    height: 1,
+                    x_offset: 0,
+                    y_offset: 0,
+                    delay_num: 1,
+                    delay_den: 10,
+                    dispose_op: DisposeOp::None,
+                    blend_op: BlendOp::Source,
+                    rgba: rgba(&[[255, 0, 0, 255]]),
+                },
+                ApngFrame {
+                    width: 1,
+                    height: 1,
+                    x_offset: 0,
+                    y_offset: 0,
+                    delay_num: 1,
+                    delay_den: 10,
+                    dispose_op: DisposeOp::None,
+                    blend_op: BlendOp::Source,
+                    rgba: rgba(&[[255, 0, 0, 255]]),
+                },
+            ],
+        };
+        fold_duplicate_frames(&mut apng);
+        assert_eq!(apng.frames.len(), 1);
+        assert_eq!(apng.frames[0].delay_num, 3);
+        assert_eq!(apng.frames[0].delay_den, 10);
+    }
+
+    #[test]
+    fn fold_delay_overflow_uses_millisecond_fallback() {
+        let mut apng = ApngImage {
+            width: 1,
+            height: 1,
+            num_plays: 0,
+            default_image: None,
+            frames: vec![
+                ApngFrame {
+                    width: 1,
+                    height: 1,
+                    x_offset: 0,
+                    y_offset: 0,
+                    delay_num: 60000,
+                    delay_den: 1,
+                    dispose_op: DisposeOp::None,
+                    blend_op: BlendOp::Source,
+                    rgba: rgba(&[[255, 0, 0, 255]]),
+                },
+                ApngFrame {
+                    width: 1,
+                    height: 1,
+                    x_offset: 0,
+                    y_offset: 0,
+                    delay_num: 60000,
+                    delay_den: 1,
+                    dispose_op: DisposeOp::None,
+                    blend_op: BlendOp::Source,
+                    rgba: rgba(&[[255, 0, 0, 255]]),
+                },
+            ],
+        };
+        fold_duplicate_frames(&mut apng);
+        assert_eq!(apng.frames.len(), 1);
+        // Should have used millisecond fallback since 120000 > u16::MAX
+        assert_eq!(apng.frames[0].delay_den, 1000);
+    }
+
+    // ── detect_input_characteristics tests ──
+
+    #[test]
+    fn detect_rgba_apng_not_indexed() {
+        let apng = ApngImage {
+            width: 2,
+            height: 2,
+            num_plays: 0,
+            default_image: None,
+            frames: vec![
+                ApngFrame {
+                    width: 2,
+                    height: 2,
+                    x_offset: 0,
+                    y_offset: 0,
+                    delay_num: 1,
+                    delay_den: 10,
+                    dispose_op: DisposeOp::None,
+                    blend_op: BlendOp::Source,
+                    rgba: vec![255; 2 * 2 * 4],
+                },
+                ApngFrame {
+                    width: 2,
+                    height: 2,
+                    x_offset: 0,
+                    y_offset: 0,
+                    delay_num: 1,
+                    delay_den: 10,
+                    dispose_op: DisposeOp::None,
+                    blend_op: BlendOp::Source,
+                    rgba: vec![128; 2 * 2 * 4],
+                },
+            ],
+        };
+        let encoded = encode_apng(&apng).expect("encode");
+        let info = detect_input_characteristics(&encoded);
+        assert!(!info.is_indexed);
+        assert!(!info.has_subrect_frames);
+    }
+
+    #[test]
+    fn detect_subrect_frames() {
+        let apng = ApngImage {
+            width: 4,
+            height: 4,
+            num_plays: 0,
+            default_image: None,
+            frames: vec![
+                ApngFrame {
+                    width: 4,
+                    height: 4,
+                    x_offset: 0,
+                    y_offset: 0,
+                    delay_num: 1,
+                    delay_den: 10,
+                    dispose_op: DisposeOp::None,
+                    blend_op: BlendOp::Source,
+                    rgba: vec![0; 4 * 4 * 4],
+                },
+                ApngFrame {
+                    width: 2,
+                    height: 2,
+                    x_offset: 1,
+                    y_offset: 1,
+                    delay_num: 1,
+                    delay_den: 10,
+                    dispose_op: DisposeOp::None,
+                    blend_op: BlendOp::Source,
+                    rgba: vec![255; 2 * 2 * 4],
+                },
+            ],
+        };
+        let encoded = encode_apng(&apng).expect("encode");
+        let info = detect_input_characteristics(&encoded);
+        assert!(!info.is_indexed); // RGBA encoded
+        assert!(info.has_subrect_frames);
+    }
+
+    #[test]
+    fn detect_static_indexed_png() {
+        let info = detect_input_characteristics(&encode_static_png(1, 1, &rgba(&[[1, 2, 3, 255]])));
+        // Static PNG encoded as RGBA by encode_static_png
+        assert!(!info.is_indexed);
+    }
+
+    // ── Pipeline integration tests (Step 4) ──
+
+    #[test]
+    fn pipeline_apng_safe_mode_preserves_frames() {
+        use crate::cli::ApngMode;
+        use crate::pipeline::{PipelineOptions, process_png_bytes};
+
+        let original = ApngImage {
+            width: 2,
+            height: 2,
+            num_plays: 0,
+            default_image: None,
+            frames: vec![
+                ApngFrame {
+                    width: 2,
+                    height: 2,
+                    x_offset: 0,
+                    y_offset: 0,
+                    delay_num: 1,
+                    delay_den: 10,
+                    dispose_op: DisposeOp::None,
+                    blend_op: BlendOp::Source,
+                    rgba: rgba(&[
+                        [255, 0, 0, 255],
+                        [0, 0, 0, 255],
+                        [0, 0, 0, 255],
+                        [0, 0, 0, 255],
+                    ]),
+                },
+                ApngFrame {
+                    width: 2,
+                    height: 2,
+                    x_offset: 0,
+                    y_offset: 0,
+                    delay_num: 1,
+                    delay_den: 10,
+                    dispose_op: DisposeOp::None,
+                    blend_op: BlendOp::Source,
+                    rgba: rgba(&[
+                        [0, 0, 0, 255],
+                        [0, 255, 0, 255],
+                        [0, 0, 0, 255],
+                        [0, 0, 0, 255],
+                    ]),
+                },
+            ],
+        };
+        let composited_orig = compose_frames(&original).expect("compose original");
+        let encoded = encode_apng(&original).expect("encode");
+
+        let options = PipelineOptions {
+            apng_mode: ApngMode::Safe,
+            ..PipelineOptions::default()
+        };
+        let result = process_png_bytes(&encoded, options).expect("pipeline safe");
+
+        let decoded = decode_apng(&result.png_data)
+            .expect("decode output")
+            .expect("is apng");
+        let composited_out = compose_frames(&decoded).expect("compose output");
+        assert_eq!(composited_orig, composited_out);
+    }
+
+    #[test]
+    fn pipeline_apng_aggressive_mode_preserves_frames() {
+        use crate::cli::ApngMode;
+        use crate::pipeline::{PipelineOptions, process_png_bytes};
+
+        let original = ApngImage {
+            width: 3,
+            height: 3,
+            num_plays: 0,
+            default_image: None,
+            frames: vec![
+                ApngFrame {
+                    width: 3,
+                    height: 3,
+                    x_offset: 0,
+                    y_offset: 0,
+                    delay_num: 1,
+                    delay_den: 10,
+                    dispose_op: DisposeOp::None,
+                    blend_op: BlendOp::Source,
+                    rgba: vec![128; 3 * 3 * 4],
+                },
+                ApngFrame {
+                    width: 3,
+                    height: 3,
+                    x_offset: 0,
+                    y_offset: 0,
+                    delay_num: 1,
+                    delay_den: 10,
+                    dispose_op: DisposeOp::None,
+                    blend_op: BlendOp::Source,
+                    rgba: {
+                        let mut d = vec![128; 3 * 3 * 4];
+                        // Change pixel (2,2)
+                        let idx = (2 * 3 + 2) * 4;
+                        d[idx..idx + 4].copy_from_slice(&[0, 255, 0, 255]);
+                        d
+                    },
+                },
+            ],
+        };
+        let composited_orig = compose_frames(&original).expect("compose original");
+        let encoded = encode_apng(&original).expect("encode");
+
+        let options = PipelineOptions {
+            apng_mode: ApngMode::Aggressive,
+            ..PipelineOptions::default()
+        };
+        let result = process_png_bytes(&encoded, options).expect("pipeline aggressive");
+
+        let decoded = decode_apng(&result.png_data)
+            .expect("decode output")
+            .expect("is apng");
+        let composited_out = compose_frames(&decoded).expect("compose output");
+        assert_eq!(composited_orig, composited_out);
+    }
+
+    #[test]
+    fn pipeline_apng_skip_if_larger() {
+        use crate::pipeline::{PipelineOptions, process_png_bytes};
+
+        // Create a tiny APNG that will likely grow after re-encoding
+        let original = ApngImage {
+            width: 1,
+            height: 1,
+            num_plays: 0,
+            default_image: None,
+            frames: vec![ApngFrame {
+                width: 1,
+                height: 1,
+                x_offset: 0,
+                y_offset: 0,
+                delay_num: 1,
+                delay_den: 10,
+                dispose_op: DisposeOp::None,
+                blend_op: BlendOp::Source,
+                rgba: rgba(&[[255, 0, 0, 255]]),
+            }],
+        };
+        let encoded = encode_apng(&original).expect("encode");
+
+        let options = PipelineOptions {
+            skip_if_larger: true,
+            ..PipelineOptions::default()
+        };
+        // This may or may not trigger SkipIfLargerRejected depending on sizes
+        let _ = process_png_bytes(&encoded, options);
+    }
+
+    #[test]
+    fn pipeline_apng_fold_reduces_frame_count() {
+        use crate::pipeline::{PipelineOptions, process_png_bytes};
+
+        let original = ApngImage {
+            width: 2,
+            height: 2,
+            num_plays: 0,
+            default_image: None,
+            frames: vec![
+                ApngFrame {
+                    width: 2,
+                    height: 2,
+                    x_offset: 0,
+                    y_offset: 0,
+                    delay_num: 1,
+                    delay_den: 10,
+                    dispose_op: DisposeOp::None,
+                    blend_op: BlendOp::Source,
+                    rgba: rgba(&[
+                        [255, 0, 0, 255],
+                        [0, 0, 0, 255],
+                        [0, 0, 0, 255],
+                        [0, 0, 0, 255],
+                    ]),
+                },
+                // Duplicate frame
+                ApngFrame {
+                    width: 2,
+                    height: 2,
+                    x_offset: 0,
+                    y_offset: 0,
+                    delay_num: 1,
+                    delay_den: 10,
+                    dispose_op: DisposeOp::None,
+                    blend_op: BlendOp::Source,
+                    rgba: rgba(&[
+                        [255, 0, 0, 255],
+                        [0, 0, 0, 255],
+                        [0, 0, 0, 255],
+                        [0, 0, 0, 255],
+                    ]),
+                },
+                ApngFrame {
+                    width: 2,
+                    height: 2,
+                    x_offset: 0,
+                    y_offset: 0,
+                    delay_num: 1,
+                    delay_den: 10,
+                    dispose_op: DisposeOp::None,
+                    blend_op: BlendOp::Source,
+                    rgba: rgba(&[
+                        [0, 255, 0, 255],
+                        [0, 0, 0, 255],
+                        [0, 0, 0, 255],
+                        [0, 0, 0, 255],
+                    ]),
+                },
+            ],
+        };
+        let encoded = encode_apng(&original).expect("encode");
+
+        let options = PipelineOptions::default();
+        let result = process_png_bytes(&encoded, options).expect("pipeline");
+
+        let decoded = decode_apng(&result.png_data)
+            .expect("decode output")
+            .expect("is apng");
+        // Should have folded duplicate: 3 -> 2 frames
+        assert_eq!(decoded.frames.len(), 2);
+    }
+
+    #[test]
+    fn pipeline_apng_safe_mode_no_subrect() {
+        use crate::cli::ApngMode;
+        use crate::pipeline::{PipelineOptions, process_png_bytes};
+
+        let original = ApngImage {
+            width: 3,
+            height: 3,
+            num_plays: 0,
+            default_image: None,
+            frames: vec![
+                ApngFrame {
+                    width: 3,
+                    height: 3,
+                    x_offset: 0,
+                    y_offset: 0,
+                    delay_num: 1,
+                    delay_den: 10,
+                    dispose_op: DisposeOp::None,
+                    blend_op: BlendOp::Source,
+                    rgba: vec![128; 3 * 3 * 4],
+                },
+                ApngFrame {
+                    width: 3,
+                    height: 3,
+                    x_offset: 0,
+                    y_offset: 0,
+                    delay_num: 1,
+                    delay_den: 10,
+                    dispose_op: DisposeOp::None,
+                    blend_op: BlendOp::Source,
+                    rgba: {
+                        let mut d = vec![128; 3 * 3 * 4];
+                        d[0..4].copy_from_slice(&[0, 255, 0, 255]);
+                        d
+                    },
+                },
+            ],
+        };
+        let encoded = encode_apng(&original).expect("encode");
+
+        let options = PipelineOptions {
+            apng_mode: ApngMode::Safe,
+            ..PipelineOptions::default()
+        };
+        let result = process_png_bytes(&encoded, options).expect("pipeline safe");
+
+        let decoded = decode_apng(&result.png_data)
+            .expect("decode output")
+            .expect("is apng");
+        // Safe mode should NOT produce sub-rect frames
+        for frame in &decoded.frames {
+            assert_eq!(frame.width, 3);
+            assert_eq!(frame.height, 3);
+            assert_eq!(frame.x_offset, 0);
+            assert_eq!(frame.y_offset, 0);
+        }
+    }
+
+    // ── Round-trip equivalence for encode/decode ──
+
+    #[test]
+    fn round_trip_dispose_none_source() {
+        round_trip_verify(&make_apng_2x2(DisposeOp::None, BlendOp::Source));
+    }
+
+    #[test]
+    fn round_trip_dispose_bg_source() {
+        round_trip_verify(&make_apng_2x2(DisposeOp::Background, BlendOp::Source));
+    }
+
+    #[test]
+    fn round_trip_dispose_prev_source() {
+        round_trip_verify(&make_apng_3frame_prev(BlendOp::Source));
+    }
+
+    fn round_trip_verify(original: &ApngImage) {
+        let composited_orig = compose_frames(original).expect("compose original");
+        let encoded = encode_apng(original).expect("encode");
+        let decoded = decode_apng(&encoded).expect("decode").expect("is apng");
+        let composited_decoded = compose_frames(&decoded).expect("compose decoded");
+        assert_eq!(composited_orig, composited_decoded);
+    }
+
+    fn make_apng_2x2(dispose: DisposeOp, blend: BlendOp) -> ApngImage {
+        ApngImage {
+            width: 2,
+            height: 2,
+            num_plays: 0,
+            default_image: None,
+            frames: vec![
+                ApngFrame {
+                    width: 2,
+                    height: 2,
+                    x_offset: 0,
+                    y_offset: 0,
+                    delay_num: 1,
+                    delay_den: 10,
+                    dispose_op: dispose,
+                    blend_op: BlendOp::Source,
+                    rgba: rgba(&[
+                        [255, 0, 0, 255],
+                        [0, 0, 0, 255],
+                        [0, 0, 0, 255],
+                        [0, 0, 0, 255],
+                    ]),
+                },
+                ApngFrame {
+                    width: 2,
+                    height: 2,
+                    x_offset: 0,
+                    y_offset: 0,
+                    delay_num: 1,
+                    delay_den: 10,
+                    dispose_op: DisposeOp::None,
+                    blend_op: blend,
+                    rgba: rgba(&[
+                        [0, 0, 0, 255],
+                        [0, 255, 0, 255],
+                        [0, 0, 0, 255],
+                        [0, 0, 255, 255],
+                    ]),
+                },
+            ],
+        }
+    }
+
+    fn make_apng_3frame_prev(blend: BlendOp) -> ApngImage {
+        ApngImage {
+            width: 2,
+            height: 2,
+            num_plays: 0,
+            default_image: None,
+            frames: vec![
+                ApngFrame {
+                    width: 2,
+                    height: 2,
+                    x_offset: 0,
+                    y_offset: 0,
+                    delay_num: 1,
+                    delay_den: 10,
+                    dispose_op: DisposeOp::None,
+                    blend_op: BlendOp::Source,
+                    rgba: rgba(&[
+                        [255, 0, 0, 255],
+                        [0, 0, 0, 255],
+                        [0, 0, 0, 255],
+                        [0, 0, 0, 255],
+                    ]),
+                },
+                ApngFrame {
+                    width: 2,
+                    height: 2,
+                    x_offset: 0,
+                    y_offset: 0,
+                    delay_num: 1,
+                    delay_den: 10,
+                    dispose_op: DisposeOp::Previous,
+                    blend_op: blend,
+                    rgba: rgba(&[
+                        [0, 255, 0, 255],
+                        [0, 255, 0, 255],
+                        [0, 255, 0, 255],
+                        [0, 255, 0, 255],
+                    ]),
+                },
+                ApngFrame {
+                    width: 2,
+                    height: 2,
+                    x_offset: 0,
+                    y_offset: 0,
+                    delay_num: 1,
+                    delay_den: 10,
+                    dispose_op: DisposeOp::None,
+                    blend_op: blend,
+                    rgba: rgba(&[
+                        [0, 0, 255, 255],
+                        [0, 0, 255, 255],
+                        [0, 0, 255, 255],
+                        [0, 0, 255, 255],
+                    ]),
+                },
+            ],
+        }
+    }
+
+    // --- cautious_frame_trim tests ---
+
+    #[test]
+    fn cautious_trim_removes_trailing_transparent_rows() {
+        // 4x4 frame, bottom 2 rows fully transparent -> 4x2
+        let mut apng = ApngImage {
+            width: 4,
+            height: 4,
+            num_plays: 0,
+            default_image: None,
+            frames: vec![ApngFrame {
+                width: 4,
+                height: 4,
+                x_offset: 0,
+                y_offset: 0,
+                delay_num: 1,
+                delay_den: 10,
+                dispose_op: DisposeOp::None,
+                blend_op: BlendOp::Source,
+                rgba: {
+                    let mut d = vec![];
+                    // Row 0-1: opaque red
+                    for _ in 0..8 {
+                        d.extend_from_slice(&[255, 0, 0, 255]);
+                    }
+                    // Row 2-3: transparent
+                    for _ in 0..8 {
+                        d.extend_from_slice(&[0, 0, 0, 0]);
+                    }
+                    d
+                },
+            }],
+        };
+        cautious_frame_trim(&mut apng);
+        assert_eq!(apng.frames[0].width, 4);
+        assert_eq!(apng.frames[0].height, 2);
+        assert_eq!(apng.frames[0].rgba.len(), 4 * 2 * 4);
+    }
+
+    #[test]
+    fn cautious_trim_removes_trailing_transparent_cols() {
+        // 4x4 frame, right 2 columns fully transparent -> 2x4
+        let mut apng = ApngImage {
+            width: 4,
+            height: 4,
+            num_plays: 0,
+            default_image: None,
+            frames: vec![ApngFrame {
+                width: 4,
+                height: 4,
+                x_offset: 0,
+                y_offset: 0,
+                delay_num: 1,
+                delay_den: 10,
+                dispose_op: DisposeOp::None,
+                blend_op: BlendOp::Source,
+                rgba: {
+                    let mut d = vec![];
+                    for _ in 0..4 {
+                        // 2 opaque + 2 transparent per row
+                        d.extend_from_slice(&[255, 0, 0, 255]);
+                        d.extend_from_slice(&[0, 255, 0, 255]);
+                        d.extend_from_slice(&[0, 0, 0, 0]);
+                        d.extend_from_slice(&[0, 0, 0, 0]);
+                    }
+                    d
+                },
+            }],
+        };
+        cautious_frame_trim(&mut apng);
+        assert_eq!(apng.frames[0].width, 2);
+        assert_eq!(apng.frames[0].height, 4);
+        assert_eq!(apng.frames[0].rgba.len(), 2 * 4 * 4);
+    }
+
+    #[test]
+    fn cautious_trim_skips_over_blend_frames() {
+        let mut apng = ApngImage {
+            width: 2,
+            height: 2,
+            num_plays: 0,
+            default_image: None,
+            frames: vec![ApngFrame {
+                width: 2,
+                height: 2,
+                x_offset: 0,
+                y_offset: 0,
+                delay_num: 1,
+                delay_den: 10,
+                dispose_op: DisposeOp::None,
+                blend_op: BlendOp::Over, // Over, not Source
+                rgba: rgba(&[[255, 0, 0, 255], [0, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0]]),
+            }],
+        };
+        let original_len = apng.frames[0].rgba.len();
+        cautious_frame_trim(&mut apng);
+        assert_eq!(apng.frames[0].width, 2);
+        assert_eq!(apng.frames[0].height, 2);
+        assert_eq!(apng.frames[0].rgba.len(), original_len);
+    }
+
+    #[test]
+    fn cautious_trim_skips_subrect_frames() {
+        let mut apng = ApngImage {
+            width: 4,
+            height: 4,
+            num_plays: 0,
+            default_image: None,
+            frames: vec![ApngFrame {
+                width: 2, // sub-rect, not full canvas
+                height: 2,
+                x_offset: 1,
+                y_offset: 1,
+                delay_num: 1,
+                delay_den: 10,
+                dispose_op: DisposeOp::None,
+                blend_op: BlendOp::Source,
+                rgba: rgba(&[[255, 0, 0, 255], [0, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0]]),
+            }],
+        };
+        cautious_frame_trim(&mut apng);
+        assert_eq!(apng.frames[0].width, 2);
+        assert_eq!(apng.frames[0].height, 2);
+    }
+
+    #[test]
+    fn cautious_trim_preserves_composited_equivalence() {
+        // 2-frame APNG: frame 0 has trailing transparent region
+        let mut apng = ApngImage {
+            width: 4,
+            height: 2,
+            num_plays: 0,
+            default_image: None,
+            frames: vec![
+                ApngFrame {
+                    width: 4,
+                    height: 2,
+                    x_offset: 0,
+                    y_offset: 0,
+                    delay_num: 1,
+                    delay_den: 10,
+                    dispose_op: DisposeOp::None,
+                    blend_op: BlendOp::Source,
+                    rgba: rgba(&[
+                        [255, 0, 0, 255],
+                        [0, 255, 0, 255],
+                        [0, 0, 0, 0],
+                        [0, 0, 0, 0],
+                        [0, 0, 255, 255],
+                        [255, 255, 0, 255],
+                        [0, 0, 0, 0],
+                        [0, 0, 0, 0],
+                    ]),
+                },
+                ApngFrame {
+                    width: 4,
+                    height: 2,
+                    x_offset: 0,
+                    y_offset: 0,
+                    delay_num: 1,
+                    delay_den: 10,
+                    dispose_op: DisposeOp::None,
+                    blend_op: BlendOp::Source,
+                    rgba: rgba(&[
+                        [128, 128, 128, 255],
+                        [64, 64, 64, 255],
+                        [32, 32, 32, 255],
+                        [16, 16, 16, 255],
+                        [128, 128, 128, 255],
+                        [64, 64, 64, 255],
+                        [32, 32, 32, 255],
+                        [16, 16, 16, 255],
+                    ]),
+                },
+            ],
+        };
+
+        let composited_before = compose_frames(&apng).unwrap();
+        cautious_frame_trim(&mut apng);
+        let composited_after = compose_frames(&apng).unwrap();
+
+        assert_eq!(composited_before, composited_after);
+        // First frame should be trimmed (right 2 cols transparent)
+        assert_eq!(apng.frames[0].width, 2);
+        // Second frame is fully opaque, no trim
+        assert_eq!(apng.frames[1].width, 4);
+    }
+
+    #[test]
+    fn cautious_trim_noop_when_no_transparent_border() {
+        let mut apng = ApngImage {
+            width: 2,
+            height: 2,
+            num_plays: 0,
+            default_image: None,
+            frames: vec![ApngFrame {
+                width: 2,
+                height: 2,
+                x_offset: 0,
+                y_offset: 0,
+                delay_num: 1,
+                delay_den: 10,
+                dispose_op: DisposeOp::None,
+                blend_op: BlendOp::Source,
+                rgba: rgba(&[
+                    [255, 0, 0, 255],
+                    [0, 255, 0, 255],
+                    [0, 0, 255, 255],
+                    [255, 255, 0, 255],
+                ]),
+            }],
+        };
+        cautious_frame_trim(&mut apng);
+        assert_eq!(apng.frames[0].width, 2);
+        assert_eq!(apng.frames[0].height, 2);
+    }
+
+    #[test]
+    fn cautious_trim_fully_transparent_frame_unchanged() {
+        let mut apng = ApngImage {
+            width: 2,
+            height: 2,
+            num_plays: 0,
+            default_image: None,
+            frames: vec![ApngFrame {
+                width: 2,
+                height: 2,
+                x_offset: 0,
+                y_offset: 0,
+                delay_num: 1,
+                delay_den: 10,
+                dispose_op: DisposeOp::None,
+                blend_op: BlendOp::Source,
+                rgba: rgba(&[[0, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0]]),
+            }],
+        };
+        cautious_frame_trim(&mut apng);
+        // Fully transparent — should NOT collapse to 0x0
+        assert_eq!(apng.frames[0].width, 2);
+        assert_eq!(apng.frames[0].height, 2);
+    }
+
+    #[test]
+    fn find_content_bounds_basic() {
+        // 3x3 image, content in top-left 2x2
+        let data = rgba(&[
+            [255, 0, 0, 255],
+            [0, 255, 0, 255],
+            [0, 0, 0, 0],
+            [0, 0, 255, 255],
+            [255, 255, 0, 128],
+            [0, 0, 0, 0],
+            [0, 0, 0, 0],
+            [0, 0, 0, 0],
+            [0, 0, 0, 0],
+        ]);
+        let (w, h) = find_content_bounds(&data, 3, 3);
+        assert_eq!((w, h), (2, 2));
     }
 }
