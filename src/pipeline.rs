@@ -14,9 +14,9 @@ use crate::apng::{
 use crate::cli::{ApngMode, QualityRange};
 use crate::error::AppError;
 use crate::palette_quant::{
-    IndexedImage, build_histogram_map, find_best_palette, finalize_histogram,
-    merge_histogram_maps, quantize_indexed, quantizer_settings, remap_image,
-    reposterize_histogram_map, sort_palette_entries,
+    IndexedImage, build_histogram_map, finalize_histogram, find_best_palette, merge_histogram_maps,
+    quantize_indexed, quantizer_settings, remap_image, reposterize_histogram_map,
+    sort_palette_entries,
 };
 use crate::quality::{
     InternalPixel, QualityMetrics, SRGB_OUTPUT_GAMMA, SpeedSettings, evaluate_quality_against_rgba,

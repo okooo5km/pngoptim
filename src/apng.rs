@@ -297,12 +297,22 @@ pub fn encode_indexed_apng(image: &IndexedApngImage) -> Result<Vec<u8>, AppError
     }
 
     let palette_len = image.palette.len();
-    let plte: Vec<u8> = image.palette.iter().flat_map(|c| [c[0], c[1], c[2]]).collect();
-    let trns: Vec<u8> = if let Some(last_non_opaque) = image.palette.iter().rposition(|c| c[3] < 255) {
-        image.palette.iter().take(last_non_opaque + 1).map(|c| c[3]).collect()
-    } else {
-        Vec::new()
-    };
+    let plte: Vec<u8> = image
+        .palette
+        .iter()
+        .flat_map(|c| [c[0], c[1], c[2]])
+        .collect();
+    let trns: Vec<u8> =
+        if let Some(last_non_opaque) = image.palette.iter().rposition(|c| c[3] < 255) {
+            image
+                .palette
+                .iter()
+                .take(last_non_opaque + 1)
+                .map(|c| c[3])
+                .collect()
+        } else {
+            Vec::new()
+        };
 
     let mut output = Vec::new();
     let mut encoder = png::Encoder::new(&mut output, image.width, image.height);
@@ -314,11 +324,15 @@ pub fn encode_indexed_apng(image: &IndexedApngImage) -> Result<Vec<u8>, AppError
     }
     encoder
         .set_animated(image.frames.len() as u32, image.num_plays)
-        .map_err(|e| AppError::Encode(format!("failed to configure indexed APNG animation: {e}")))?;
+        .map_err(|e| {
+            AppError::Encode(format!("failed to configure indexed APNG animation: {e}"))
+        })?;
 
     if image.default_image_indices.is_some() {
         encoder.set_sep_def_img(true).map_err(|e| {
-            AppError::Encode(format!("failed to configure indexed APNG default image: {e}"))
+            AppError::Encode(format!(
+                "failed to configure indexed APNG default image: {e}"
+            ))
         })?;
     }
 
@@ -341,9 +355,9 @@ pub fn encode_indexed_apng(image: &IndexedApngImage) -> Result<Vec<u8>, AppError
                 )));
             }
         }
-        writer
-            .write_image_data(default_indices)
-            .map_err(|e| AppError::Encode(format!("failed to write indexed APNG default image: {e}")))?;
+        writer.write_image_data(default_indices).map_err(|e| {
+            AppError::Encode(format!("failed to write indexed APNG default image: {e}"))
+        })?;
     }
 
     for frame in &image.frames {
@@ -354,30 +368,36 @@ pub fn encode_indexed_apng(image: &IndexedApngImage) -> Result<Vec<u8>, AppError
                 frame.indices.len()
             )));
         }
-        writer
-            .reset_frame_position()
-            .map_err(|e| AppError::Encode(format!("failed to reset indexed APNG frame position: {e}")))?;
-        writer
-            .reset_frame_dimension()
-            .map_err(|e| AppError::Encode(format!("failed to reset indexed APNG frame dimension: {e}")))?;
+        writer.reset_frame_position().map_err(|e| {
+            AppError::Encode(format!("failed to reset indexed APNG frame position: {e}"))
+        })?;
+        writer.reset_frame_dimension().map_err(|e| {
+            AppError::Encode(format!("failed to reset indexed APNG frame dimension: {e}"))
+        })?;
         writer
             .set_frame_dimension(frame.width, frame.height)
-            .map_err(|e| AppError::Encode(format!("failed to set indexed APNG frame dimension: {e}")))?;
+            .map_err(|e| {
+                AppError::Encode(format!("failed to set indexed APNG frame dimension: {e}"))
+            })?;
         writer
             .set_frame_position(frame.x_offset, frame.y_offset)
-            .map_err(|e| AppError::Encode(format!("failed to set indexed APNG frame position: {e}")))?;
+            .map_err(|e| {
+                AppError::Encode(format!("failed to set indexed APNG frame position: {e}"))
+            })?;
         writer
             .set_frame_delay(frame.delay_num, frame.delay_den)
-            .map_err(|e| AppError::Encode(format!("failed to set indexed APNG frame delay: {e}")))?;
+            .map_err(|e| {
+                AppError::Encode(format!("failed to set indexed APNG frame delay: {e}"))
+            })?;
         writer
             .set_blend_op(frame.blend_op)
             .map_err(|e| AppError::Encode(format!("failed to set indexed APNG blend op: {e}")))?;
         writer
             .set_dispose_op(frame.dispose_op)
             .map_err(|e| AppError::Encode(format!("failed to set indexed APNG dispose op: {e}")))?;
-        writer
-            .write_image_data(&frame.indices)
-            .map_err(|e| AppError::Encode(format!("failed to write indexed APNG frame data: {e}")))?;
+        writer.write_image_data(&frame.indices).map_err(|e| {
+            AppError::Encode(format!("failed to write indexed APNG frame data: {e}"))
+        })?;
     }
 
     writer
@@ -2269,7 +2289,11 @@ mod tests {
         let encoded = encode_apng(&original).expect("encode");
 
         let options = PipelineOptions {
-            quality: Some(QualityRange { raw: "0-80".to_string(), min: 0, max: 80 }),
+            quality: Some(QualityRange {
+                raw: "0-80".to_string(),
+                min: 0,
+                max: 80,
+            }),
             apng_mode: ApngMode::Safe,
             ..PipelineOptions::default()
         };
@@ -2685,10 +2709,10 @@ mod tests {
     fn encode_indexed_apng_round_trip() {
         // Create a simple 2-frame indexed APNG and verify it decodes back
         let palette = vec![
-            [255, 0, 0, 255],   // red
-            [0, 255, 0, 255],   // green
-            [0, 0, 255, 255],   // blue
-            [0, 0, 0, 0],       // transparent
+            [255, 0, 0, 255], // red
+            [0, 255, 0, 255], // green
+            [0, 0, 255, 255], // blue
+            [0, 0, 0, 0],     // transparent
         ];
         let indexed = IndexedApngImage {
             width: 2,
@@ -2725,7 +2749,9 @@ mod tests {
         let encoded = encode_indexed_apng(&indexed).expect("encode indexed APNG");
 
         // Verify it decodes as APNG
-        let decoded = decode_apng(&encoded).expect("decode").expect("should be APNG");
+        let decoded = decode_apng(&encoded)
+            .expect("decode")
+            .expect("should be APNG");
         assert_eq!(decoded.frames.len(), 2);
         assert_eq!(decoded.width, 2);
         assert_eq!(decoded.height, 2);
