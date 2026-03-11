@@ -15,15 +15,15 @@ pub struct IndexedImage {
 }
 
 #[derive(Debug, Clone)]
-struct ContrastMaps {
-    importance_map: Vec<u8>,
-    edges: Vec<u8>,
+pub(crate) struct ContrastMaps {
+    pub(crate) importance_map: Vec<u8>,
+    pub(crate) edges: Vec<u8>,
 }
 
 #[derive(Debug, Clone, Copy)]
-struct PaletteEntry {
-    color: InternalPixel,
-    popularity: f32,
+pub(crate) struct PaletteEntry {
+    pub(crate) color: InternalPixel,
+    pub(crate) popularity: f32,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -148,15 +148,15 @@ struct HistItem {
 }
 
 #[derive(Default)]
-struct HistAccumulator {
-    importance_sum: u32,
-    representative: [u8; 4],
-    cluster_index: u8,
-    initialized: bool,
+pub(crate) struct HistAccumulator {
+    pub(crate) importance_sum: u32,
+    pub(crate) representative: [u8; 4],
+    pub(crate) cluster_index: u8,
+    pub(crate) initialized: bool,
 }
 
 #[derive(Default)]
-struct U32HashBuilder(u32);
+pub(crate) struct U32HashBuilder(u32);
 
 impl std::hash::BuildHasher for U32HashBuilder {
     type Hasher = Self;
@@ -183,7 +183,7 @@ impl Hasher for U32HashBuilder {
     }
 }
 
-type HistMap = HashMap<u32, HistAccumulator, U32HashBuilder>;
+pub(crate) type HistMap = HashMap<u32, HistAccumulator, U32HashBuilder>;
 
 #[derive(Debug, Clone, Copy, Default)]
 struct Cluster {
@@ -192,7 +192,7 @@ struct Cluster {
 }
 
 #[derive(Debug, Clone, Default)]
-struct HistogramData {
+pub(crate) struct HistogramData {
     items: Vec<HistItem>,
     total_perceptual_weight: f64,
     clusters: [Cluster; MAX_CLUSTERS],
@@ -502,7 +502,7 @@ fn hist_item_sort_half(mut base: &mut [HistItem], mut weight_half_sum: f64) -> u
 
 const MAX_CLUSTERS: usize = 16;
 
-fn build_histogram(
+pub(crate) fn build_histogram(
     rgba: &[u8],
     _width: usize,
     initial_posterize_bits: u8,
@@ -523,7 +523,7 @@ fn build_histogram(
     finalize_histogram(map, gamma)
 }
 
-fn build_histogram_map(rgba: &[u8], importance_map: Option<&[u8]>) -> HistMap {
+pub(crate) fn build_histogram_map(rgba: &[u8], importance_map: Option<&[u8]>) -> HistMap {
     let pixel_count = rgba.len() / 4;
     let num_threads = rayon::current_num_threads().max(1);
     let chunk_pixels = pixel_count.div_ceil(num_threads);
@@ -576,7 +576,20 @@ fn build_histogram_map(rgba: &[u8], importance_map: Option<&[u8]>) -> HistMap {
     map
 }
 
-fn reposterize_histogram_map(map: &mut HistMap, posterize_bits: u8) {
+/// Merge src histogram map into dst, combining importance sums.
+pub(crate) fn merge_histogram_maps(dst: &mut HistMap, src: HistMap) {
+    for (key, acc) in src {
+        let entry = dst.entry(key).or_default();
+        entry.importance_sum = entry.importance_sum.saturating_add(acc.importance_sum);
+        if !entry.initialized {
+            entry.representative = acc.representative;
+            entry.cluster_index = acc.cluster_index;
+            entry.initialized = acc.initialized;
+        }
+    }
+}
+
+pub(crate) fn reposterize_histogram_map(map: &mut HistMap, posterize_bits: u8) {
     if posterize_bits == 0 || map.is_empty() {
         return;
     }
@@ -592,7 +605,7 @@ fn reposterize_histogram_map(map: &mut HistMap, posterize_bits: u8) {
     map.extend(old_map.into_iter().map(|(key, value)| (key & mask, value)));
 }
 
-fn finalize_histogram(map: HistMap, gamma: &[f32; 256]) -> HistogramData {
+pub(crate) fn finalize_histogram(map: HistMap, gamma: &[f32; 256]) -> HistogramData {
     if map.is_empty() {
         return HistogramData::default();
     }
@@ -810,7 +823,7 @@ fn boxes_to_palette(boxes: &mut [ColorBox], items: &mut [HistItem]) -> Vec<Palet
     palette
 }
 
-fn find_best_palette(
+pub(crate) fn find_best_palette(
     histogram: &HistogramData,
     settings: QuantizerSettings,
 ) -> (Vec<PaletteEntry>, Option<f64>) {
@@ -1132,7 +1145,7 @@ fn replace_unused_palette_entries(histogram: &[HistItem], palette: &mut [Palette
     }
 }
 
-fn sort_palette_entries(palette: &mut [PaletteEntry]) {
+pub(crate) fn sort_palette_entries(palette: &mut [PaletteEntry]) {
     palette.sort_by(|left, right| {
         let left_transparent = left.color.to_rgba(SRGB_OUTPUT_GAMMA)[3] < 255;
         let right_transparent = right.color.to_rgba(SRGB_OUTPUT_GAMMA)[3] < 255;
@@ -1407,7 +1420,7 @@ fn search_node(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn remap_image(
+pub(crate) fn remap_image(
     rgba: &[u8],
     width: usize,
     height: usize,
@@ -1996,7 +2009,7 @@ fn clamp_dither_ratio(
     }
 }
 
-fn build_contrast_maps(
+pub(crate) fn build_contrast_maps(
     pixels: &[InternalPixel],
     width: usize,
     height: usize,
@@ -2279,11 +2292,34 @@ mod tests {
     use crate::quality::SpeedSettings;
 
     use super::{
-        InternalPixel, QuantizerSettings, apply_remap_feedback, gamma_lut, quantize_indexed,
-        quantizer_settings, remap_image_dithered, remap_image_plain, remap_image_plain_pass,
-        select_dither_map,
+        InternalPixel, QuantizerSettings, apply_remap_feedback, build_histogram_map, gamma_lut,
+        merge_histogram_maps, quantize_indexed, quantizer_settings, remap_image_dithered,
+        remap_image_plain, remap_image_plain_pass, select_dither_map,
     };
     use crate::quality::{DitherMapMode, SRGB_OUTPUT_GAMMA};
+
+    #[test]
+    fn merge_histogram_maps_combines_importance_sums() {
+        let rgba_a = vec![255u8, 0, 0, 255, 0, 255, 0, 255];
+        let rgba_b = vec![255u8, 0, 0, 255, 0, 0, 255, 255];
+
+        let mut map_a = build_histogram_map(&rgba_a, None);
+        let map_b = build_histogram_map(&rgba_b, None);
+
+        let a_len_before = map_a.len();
+        merge_histogram_maps(&mut map_a, map_b);
+
+        // Red pixel (255,0,0,255) appears in both, so merged map should have it with doubled importance
+        // Green (0,255,0,255) only in A, Blue (0,0,255,255) only in B
+        assert!(map_a.len() >= 2); // at least red + green/blue
+        assert!(map_a.len() <= a_len_before + 1); // at most one new color from B (blue)
+
+        // Verify all entries are initialized
+        for acc in map_a.values() {
+            assert!(acc.initialized);
+            assert!(acc.importance_sum > 0);
+        }
+    }
 
     #[test]
     fn quantize_indexed_runs() {

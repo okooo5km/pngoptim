@@ -252,6 +252,140 @@ pub fn encode_apng(apng: &ApngImage) -> Result<Vec<u8>, AppError> {
     Ok(output)
 }
 
+#[derive(Debug, Clone)]
+pub struct IndexedApngFrame {
+    pub width: u32,
+    pub height: u32,
+    pub x_offset: u32,
+    pub y_offset: u32,
+    pub delay_num: u16,
+    pub delay_den: u16,
+    pub dispose_op: DisposeOp,
+    pub blend_op: BlendOp,
+    pub indices: Vec<u8>,
+}
+
+#[derive(Debug, Clone)]
+pub struct IndexedApngImage {
+    pub width: u32,
+    pub height: u32,
+    pub num_plays: u32,
+    pub palette: Vec<[u8; 4]>,
+    pub default_image_indices: Option<Vec<u8>>,
+    pub frames: Vec<IndexedApngFrame>,
+}
+
+pub fn encode_indexed_apng(image: &IndexedApngImage) -> Result<Vec<u8>, AppError> {
+    if image.frames.is_empty() {
+        return Err(AppError::Encode(
+            "indexed APNG encoding requires at least one animation frame".to_string(),
+        ));
+    }
+
+    if image.default_image_indices.is_none() {
+        let first = &image.frames[0];
+        if first.x_offset != 0
+            || first.y_offset != 0
+            || first.width != image.width
+            || first.height != image.height
+        {
+            return Err(AppError::Encode(
+                "first indexed APNG frame must cover the full canvas when no separate default image is present"
+                    .to_string(),
+            ));
+        }
+    }
+
+    let palette_len = image.palette.len();
+    let plte: Vec<u8> = image.palette.iter().flat_map(|c| [c[0], c[1], c[2]]).collect();
+    let trns: Vec<u8> = if let Some(last_non_opaque) = image.palette.iter().rposition(|c| c[3] < 255) {
+        image.palette.iter().take(last_non_opaque + 1).map(|c| c[3]).collect()
+    } else {
+        Vec::new()
+    };
+
+    let mut output = Vec::new();
+    let mut encoder = png::Encoder::new(&mut output, image.width, image.height);
+    encoder.set_color(ColorType::Indexed);
+    encoder.set_depth(png::BitDepth::Eight);
+    encoder.set_palette(plte);
+    if !trns.is_empty() {
+        encoder.set_trns(trns);
+    }
+    encoder
+        .set_animated(image.frames.len() as u32, image.num_plays)
+        .map_err(|e| AppError::Encode(format!("failed to configure indexed APNG animation: {e}")))?;
+
+    if image.default_image_indices.is_some() {
+        encoder.set_sep_def_img(true).map_err(|e| {
+            AppError::Encode(format!("failed to configure indexed APNG default image: {e}"))
+        })?;
+    }
+
+    let mut writer = encoder
+        .write_header()
+        .map_err(|e| AppError::Encode(format!("failed to write indexed APNG header: {e}")))?;
+
+    if let Some(default_indices) = &image.default_image_indices {
+        let expected = (image.width as usize) * (image.height as usize);
+        if default_indices.len() != expected {
+            return Err(AppError::Encode(format!(
+                "indexed APNG default image length mismatch: expected={expected}, actual={}",
+                default_indices.len()
+            )));
+        }
+        for idx in default_indices {
+            if (*idx as usize) >= palette_len {
+                return Err(AppError::Encode(format!(
+                    "indexed APNG default image palette index out of range: {idx}"
+                )));
+            }
+        }
+        writer
+            .write_image_data(default_indices)
+            .map_err(|e| AppError::Encode(format!("failed to write indexed APNG default image: {e}")))?;
+    }
+
+    for frame in &image.frames {
+        let expected = (frame.width as usize) * (frame.height as usize);
+        if frame.indices.len() != expected {
+            return Err(AppError::Encode(format!(
+                "indexed APNG frame length mismatch: expected={expected}, actual={}",
+                frame.indices.len()
+            )));
+        }
+        writer
+            .reset_frame_position()
+            .map_err(|e| AppError::Encode(format!("failed to reset indexed APNG frame position: {e}")))?;
+        writer
+            .reset_frame_dimension()
+            .map_err(|e| AppError::Encode(format!("failed to reset indexed APNG frame dimension: {e}")))?;
+        writer
+            .set_frame_dimension(frame.width, frame.height)
+            .map_err(|e| AppError::Encode(format!("failed to set indexed APNG frame dimension: {e}")))?;
+        writer
+            .set_frame_position(frame.x_offset, frame.y_offset)
+            .map_err(|e| AppError::Encode(format!("failed to set indexed APNG frame position: {e}")))?;
+        writer
+            .set_frame_delay(frame.delay_num, frame.delay_den)
+            .map_err(|e| AppError::Encode(format!("failed to set indexed APNG frame delay: {e}")))?;
+        writer
+            .set_blend_op(frame.blend_op)
+            .map_err(|e| AppError::Encode(format!("failed to set indexed APNG blend op: {e}")))?;
+        writer
+            .set_dispose_op(frame.dispose_op)
+            .map_err(|e| AppError::Encode(format!("failed to set indexed APNG dispose op: {e}")))?;
+        writer
+            .write_image_data(&frame.indices)
+            .map_err(|e| AppError::Encode(format!("failed to write indexed APNG frame data: {e}")))?;
+    }
+
+    writer
+        .finish()
+        .map_err(|e| AppError::Encode(format!("failed to finish indexed APNG encoding: {e}")))?;
+    Ok(output)
+}
+
 fn validate_rgba8_output(output: &png::OutputInfo) -> Result<(), AppError> {
     if output.color_type != ColorType::Rgba || output.bit_depth != png::BitDepth::Eight {
         return Err(AppError::Decode(format!(
@@ -738,9 +872,10 @@ pub fn cautious_frame_trim(apng: &mut ApngImage) {
 #[cfg(test)]
 mod tests {
     use super::{
-        ApngDefaultImage, ApngFrame, ApngImage, cautious_frame_trim, compose_frames, decode_apng,
-        detect_input_characteristics, encode_apng, find_content_bounds, fold_duplicate_frames,
-        merge_delays, minimize_frame_rects, minimize_frame_rects_checked,
+        ApngDefaultImage, ApngFrame, ApngImage, IndexedApngFrame, IndexedApngImage,
+        cautious_frame_trim, compose_frames, decode_apng, detect_input_characteristics,
+        encode_apng, encode_indexed_apng, find_content_bounds, fold_duplicate_frames, merge_delays,
+        minimize_frame_rects, minimize_frame_rects_checked,
     };
     use png::{BlendOp, ColorType, DisposeOp};
 
@@ -2086,6 +2221,79 @@ mod tests {
         }
     }
 
+    #[test]
+    fn pipeline_apng_lossy_quantization_produces_indexed_output() {
+        use crate::cli::{ApngMode, QualityRange};
+        use crate::pipeline::{PipelineOptions, process_png_bytes};
+
+        // Create a multi-color APNG that will actually get quantized
+        let mut frame1_rgba = Vec::with_capacity(8 * 8 * 4);
+        let mut frame2_rgba = Vec::with_capacity(8 * 8 * 4);
+        for y in 0..8u8 {
+            for x in 0..8u8 {
+                frame1_rgba.extend_from_slice(&[x * 32, y * 32, 128, 255]);
+                frame2_rgba.extend_from_slice(&[128, x * 32, y * 32, 255]);
+            }
+        }
+
+        let original = ApngImage {
+            width: 8,
+            height: 8,
+            num_plays: 0,
+            default_image: None,
+            frames: vec![
+                ApngFrame {
+                    width: 8,
+                    height: 8,
+                    x_offset: 0,
+                    y_offset: 0,
+                    delay_num: 1,
+                    delay_den: 10,
+                    dispose_op: DisposeOp::None,
+                    blend_op: BlendOp::Source,
+                    rgba: frame1_rgba,
+                },
+                ApngFrame {
+                    width: 8,
+                    height: 8,
+                    x_offset: 0,
+                    y_offset: 0,
+                    delay_num: 1,
+                    delay_den: 10,
+                    dispose_op: DisposeOp::None,
+                    blend_op: BlendOp::Source,
+                    rgba: frame2_rgba,
+                },
+            ],
+        };
+        let encoded = encode_apng(&original).expect("encode");
+
+        let options = PipelineOptions {
+            quality: Some(QualityRange { raw: "0-80".to_string(), min: 0, max: 80 }),
+            apng_mode: ApngMode::Safe,
+            ..PipelineOptions::default()
+        };
+        let result = process_png_bytes(&encoded, options).expect("pipeline lossy APNG");
+
+        // Lossy quantization should produce a valid quality_score
+        assert!(
+            result.quality_score <= 100,
+            "quality_score={} should be <= 100",
+            result.quality_score
+        );
+        // quality_mse should be populated (non-negative)
+        assert!(
+            result.quality_mse >= 0.0,
+            "quality_mse should be non-negative"
+        );
+
+        // Verify it's still a valid APNG with 2 frames
+        let decoded = decode_apng(&result.png_data)
+            .expect("decode output")
+            .expect("is apng");
+        assert_eq!(decoded.frames.len(), 2);
+    }
+
     // ── Round-trip equivalence for encode/decode ──
 
     #[test]
@@ -2471,5 +2679,63 @@ mod tests {
         ]);
         let (w, h) = find_content_bounds(&data, 3, 3);
         assert_eq!((w, h), (2, 2));
+    }
+
+    #[test]
+    fn encode_indexed_apng_round_trip() {
+        // Create a simple 2-frame indexed APNG and verify it decodes back
+        let palette = vec![
+            [255, 0, 0, 255],   // red
+            [0, 255, 0, 255],   // green
+            [0, 0, 255, 255],   // blue
+            [0, 0, 0, 0],       // transparent
+        ];
+        let indexed = IndexedApngImage {
+            width: 2,
+            height: 2,
+            num_plays: 0,
+            palette: palette.clone(),
+            default_image_indices: None,
+            frames: vec![
+                IndexedApngFrame {
+                    width: 2,
+                    height: 2,
+                    x_offset: 0,
+                    y_offset: 0,
+                    delay_num: 1,
+                    delay_den: 10,
+                    dispose_op: DisposeOp::None,
+                    blend_op: BlendOp::Source,
+                    indices: vec![0, 1, 2, 3], // red, green, blue, transparent
+                },
+                IndexedApngFrame {
+                    width: 2,
+                    height: 2,
+                    x_offset: 0,
+                    y_offset: 0,
+                    delay_num: 1,
+                    delay_den: 10,
+                    dispose_op: DisposeOp::None,
+                    blend_op: BlendOp::Source,
+                    indices: vec![1, 2, 0, 3], // green, blue, red, transparent
+                },
+            ],
+        };
+
+        let encoded = encode_indexed_apng(&indexed).expect("encode indexed APNG");
+
+        // Verify it decodes as APNG
+        let decoded = decode_apng(&encoded).expect("decode").expect("should be APNG");
+        assert_eq!(decoded.frames.len(), 2);
+        assert_eq!(decoded.width, 2);
+        assert_eq!(decoded.height, 2);
+
+        // Verify composited frame 0 matches expected RGBA
+        let composited = compose_frames(&decoded).expect("compose");
+        // Frame 0: red, green, blue, transparent (expanded to RGBA)
+        assert_eq!(&composited[0][0..4], &[255, 0, 0, 255]);
+        assert_eq!(&composited[0][4..8], &[0, 255, 0, 255]);
+        assert_eq!(&composited[0][8..12], &[0, 0, 255, 255]);
+        assert_eq!(&composited[0][12..16], &[0, 0, 0, 0]);
     }
 }

@@ -1,6 +1,6 @@
 # APNG Support
 
-pngoptim supports APNG (Animated PNG) files with automatic detection and lossless structure optimization.
+pngoptim supports APNG (Animated PNG) files with automatic detection, lossy quantization with a global shared palette, and lossless structure optimization.
 
 ## Auto-Detection
 
@@ -9,6 +9,27 @@ APNG files are automatically detected by scanning for the `acTL` (Animation Cont
 ```bash
 # Just use pngoptim normally — APNG is auto-detected
 pngoptim animated.png -o optimized.png
+```
+
+## Lossy Quantization
+
+APNG files are quantized using a **global shared palette** strategy:
+
+1. **Lossless structure optimization** runs first (duplicate frame folding, optional rect minimization)
+2. Per-frame histograms are built and **merged into a single global histogram**
+3. A single optimal palette (up to 256 colors) is generated from the merged histogram
+4. Each frame is independently **remapped** to the global palette (with optional dithering)
+5. Quality is evaluated per-frame; the **worst frame's score** determines the overall quality
+6. Quality gating applies: if the worst frame falls below `--quality` minimum, the operation fails
+
+This approach ensures all frames share a single `PLTE` chunk (as required by the APNG spec) while preserving per-frame visual quality.
+
+```bash
+# Quantize APNG with quality control
+pngoptim animated.png -o optimized.png --quality 65-75
+
+# Quantize with specific speed/dither settings
+pngoptim animated.png -o optimized.png --quality 60-80 --speed 4 --floyd 0.5
 ```
 
 ## Optimization Modes
@@ -21,7 +42,7 @@ pngoptim animated.png -o optimized.png
 pngoptim animated.png -o optimized.png --apng-mode safe
 ```
 
-Safe mode performs **duplicate frame folding**: consecutive frames with identical pixel content are merged into a single frame with an extended duration. This is completely lossless and risk-free.
+Safe mode performs **duplicate frame folding**: consecutive frames with identical pixel content are merged into a single frame with an extended duration. This runs before quantization.
 
 ### Aggressive Mode
 
@@ -42,31 +63,29 @@ pngoptim detects already-optimized APNG inputs by scanning chunk-level character
 
 When these characteristics are detected, re-optimization is skipped to prevent size regression. This means it's always safe to run pngoptim on APNG files — it won't make them larger.
 
-## Current Limitations
-
-- APNG processing is currently **lossless only** — frames are not quantized. The output preserves the original color depth and reports `quality_score=100`.
-- Lossy APNG quantization (per-frame quantization with shared palette) is planned for a future release (Phase H3).
-
 ## Integration with Other Options
 
 | Option | Behavior with APNG |
 |--------|-------------------|
-| `--skip-if-larger` | Applied after APNG optimization; output is discarded if larger than input |
-| `--strip` | Metadata chunks are stripped from the APNG output |
-| `--quality` | Not applicable to APNG (lossless path); ignored silently |
-| `--speed` | Not applicable to APNG (lossless path); ignored silently |
-| `--floyd` / `--nofs` | Not applicable to APNG; ignored silently |
+| `--quality` | Controls quantization quality range; worst-frame quality is reported |
+| `--speed` | Controls quantization speed/quality tradeoff |
+| `--floyd` / `--nofs` | Controls dithering for per-frame remapping |
+| `--skip-if-larger` | Applied after quantization; output is discarded if larger than input |
+| `--strip` | Not yet applied to APNG metadata (planned) |
 
 ## Examples
 
 ```bash
-# Default safe optimization
-pngoptim animation.png -o animation-opt.png
+# Default safe optimization with lossy quantization
+pngoptim animation.png -o animation-opt.png --quality 65-75
 
-# Aggressive with skip-if-larger safety
-pngoptim animation.png -o animation-opt.png --apng-mode aggressive --skip-if-larger
+# Aggressive structural optimization + quantization
+pngoptim animation.png -o animation-opt.png --apng-mode aggressive --quality 60-80
+
+# With skip-if-larger safety
+pngoptim animation.png -o animation-opt.png --quality 65-75 --skip-if-larger
 
 # Batch process mixed PNG/APNG files
-pngoptim *.png --ext -opt.png
-# Static PNGs are quantized; APNG files are losslessly optimized
+pngoptim *.png --ext -opt.png --quality 65-75
+# Static PNGs and APNG files are both quantized
 ```

@@ -4,7 +4,7 @@
 
 PNGOptim is a Rust CLI tool for PNG quantization (lossy compression), aiming to replicate and surpass pngquant/libimagequant. The project follows a "replicate first, optimize later" strategy across phases A-H.
 
-**Current status**: Phases A-G complete. Phase H (APNG) in progress: H1 (CLI/pipeline integration) done, H2 (lossless structure optimization) done. Algorithm Replication track (RF-1 through RF-7) fully aligned.
+**Current status**: Phases A-G complete. Phase H (APNG) done: H1 (CLI/pipeline integration) done, H2 (lossless structure optimization) done, H3 (lossy quantization) done. Algorithm Replication track (RF-1 through RF-7) fully aligned.
 
 ## Build / Test / Run
 
@@ -79,9 +79,9 @@ All algorithm work follows reference-first methodology: read the reference imple
 
 - **H1 (CLI/pipeline integration)**: APNG auto-detection in `process_png_bytes()`, routes to `process_apng()` for lossless pass-through with optimizations
 - **H2 (lossless structure optimization)**: `fold_duplicate_frames()` merges identical consecutive frames, `minimize_frame_rects()` computes minimal change rectangles
-- **H3 (lossy quantization)**: Not yet started — per-frame quantization with shared palette
+- **H3 (lossy quantization)**: Done — global shared palette from merged per-frame histograms, per-frame independent remap, worst-frame quality gating, indexed APNG output via png crate
 - APNG files are automatically detected; no CLI flag needed
-- Lossless path reports `quality_score=100, quality_mse=0.0`
+- Quality/speed/dither parameters now apply to APNG (previously ignored)
 - `skip-if-larger` check applies to APNG output
 - **APNG mode** (`--apng-mode safe|aggressive`): Safe mode (default) only folds duplicate frames; Aggressive mode also runs `minimize_frame_rects_checked()` with post-verification rollback
 - **Input protection**: `detect_input_characteristics()` scans chunks to detect indexed/sub-rect APNG; already-optimized inputs skip re-optimization to prevent size regression

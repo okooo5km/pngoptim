@@ -7,14 +7,20 @@ use std::path::Path;
 use std::time::Instant;
 
 use crate::apng::{
-    cautious_frame_trim, decode_apng, detect_input_characteristics, encode_apng,
-    fold_duplicate_frames, minimize_frame_rects_checked,
+    IndexedApngFrame, IndexedApngImage, cautious_frame_trim, decode_apng,
+    detect_input_characteristics, encode_apng, encode_indexed_apng, fold_duplicate_frames,
+    minimize_frame_rects_checked,
 };
 use crate::cli::{ApngMode, QualityRange};
 use crate::error::AppError;
-use crate::palette_quant::{IndexedImage, quantize_indexed, quantizer_settings};
+use crate::palette_quant::{
+    IndexedImage, build_histogram_map, find_best_palette, finalize_histogram,
+    merge_histogram_maps, quantize_indexed, quantizer_settings, remap_image,
+    reposterize_histogram_map, sort_palette_entries,
+};
 use crate::quality::{
-    QualityMetrics, SpeedSettings, evaluate_quality_against_rgba, quality_to_mse,
+    InternalPixel, QualityMetrics, SRGB_OUTPUT_GAMMA, SpeedSettings, evaluate_quality_against_rgba,
+    gamma_lut, quality_to_mse,
 };
 
 const DEFAULT_MAX_COLORS: usize = 256;
@@ -248,21 +254,35 @@ fn process_apng(
         // Safe mode: conservative trim only
         cautious_frame_trim(&mut apng);
     }
+
+    // H3: lossy quantization with global shared palette
+    let (indexed_apng, quality) = quantize_apng_frames(&apng, options)?;
     let quantize_ms = t_quantize.elapsed().as_secs_f64() * 1000.0;
 
+    // Quality gating
+    if let Some(range) = options.quality.as_ref()
+        && quality.quality_score < range.min
+    {
+        return Err(AppError::QualityTooLow {
+            minimum: range.min,
+            actual: quality.quality_score,
+        });
+    }
+
     let t_encode = Instant::now();
-    let png_data = encode_apng(&apng)?;
+    let png_data = encode_indexed_apng(&indexed_apng)?;
     let encode_ms = t_encode.elapsed().as_secs_f64() * 1000.0;
 
     // skip-if-larger: compare against original input
     if options.skip_if_larger {
-        let max_file_size = skip_if_larger_max_file_size(input_bytes.len() as u64, 100);
+        let max_file_size =
+            skip_if_larger_max_file_size(input_bytes.len() as u64, quality.quality_score);
         if (png_data.len() as u64) > max_file_size {
             return Err(AppError::SkipIfLargerRejected {
                 input_bytes: input_bytes.len() as u64,
                 output_bytes: png_data.len() as u64,
                 maximum_file_size: max_file_size,
-                quality_score: 100,
+                quality_score: quality.quality_score,
             });
         }
     }
@@ -274,8 +294,8 @@ fn process_apng(
         height,
         input_bytes: input_bytes.len() as u64,
         output_bytes: png_data.len() as u64,
-        quality_score: 100, // lossless pass-through
-        quality_mse: 0.0,
+        quality_score: quality.quality_score,
+        quality_mse: quality.standard_mse,
         png_data,
         metrics: PipelineMetrics {
             decode_ms,
@@ -368,6 +388,198 @@ fn evaluate_candidate_once(
     let remapped_rgba = remapped_rgba_from_indices(&indexed.indices, &indexed.palette);
     let quality = evaluate_quality_against_rgba(rgba, &remapped_rgba);
     QuantizeCandidate { indexed, quality }
+}
+
+fn quantize_apng_frames(
+    apng: &crate::apng::ApngImage,
+    options: &PipelineOptions,
+) -> Result<(IndexedApngImage, QualityMetrics), AppError> {
+    let speed_settings = SpeedSettings::from_speed(options.speed);
+    let output_posterize_bits = options.posterize.unwrap_or(0);
+    let targets = quality_targets(options.quality.as_ref(), output_posterize_bits);
+    let quantizer = quantizer_settings(
+        DEFAULT_MAX_COLORS,
+        speed_settings,
+        targets.target_mse,
+        targets.max_mse,
+        targets.target_mse_is_zero,
+        output_posterize_bits,
+        options.dither_level,
+    );
+    let gamma = gamma_lut(SRGB_OUTPUT_GAMMA);
+
+    // Step 1: Build per-frame histograms and merge into a global one
+    let mut global_map = build_histogram_map(&apng.frames[0].rgba, None);
+    for frame in &apng.frames[1..] {
+        let frame_map = build_histogram_map(&frame.rgba, None);
+        merge_histogram_maps(&mut global_map, frame_map);
+    }
+    if let Some(default_image) = &apng.default_image {
+        let default_map = build_histogram_map(&default_image.rgba, None);
+        merge_histogram_maps(&mut global_map, default_map);
+    }
+
+    // Step 2: Reposterize if needed and finalize histogram
+    let requested_bits = speed_settings.input_posterize_bits.min(3);
+    if requested_bits > 0 {
+        reposterize_histogram_map(&mut global_map, requested_bits);
+    }
+    if global_map.len() > speed_settings.max_histogram_entries as usize {
+        let bits = requested_bits + 1;
+        if bits <= 3 {
+            reposterize_histogram_map(&mut global_map, bits);
+        }
+    }
+    let histogram = finalize_histogram(global_map, &gamma);
+
+    // Step 3: Find best palette and sort
+    let (mut palette, palette_error) = find_best_palette(&histogram, quantizer);
+    if palette.is_empty() {
+        palette = vec![crate::palette_quant::PaletteEntry {
+            color: InternalPixel::default(),
+            popularity: 0.0,
+        }];
+    }
+    sort_palette_entries(&mut palette);
+
+    let global_palette: Vec<(InternalPixel, [u8; 4])> = palette
+        .iter()
+        .map(|entry| (entry.color, entry.color.to_rgba(SRGB_OUTPUT_GAMMA)))
+        .collect();
+    let global_rgba_palette: Vec<[u8; 4]> = global_palette.iter().map(|e| e.1).collect();
+
+    // Step 4: Remap each frame independently using the global palette.
+    // remap_image() may reorder the palette per-frame (by usage count),
+    // so we must map per-frame indices back to the global palette order.
+    let mut indexed_frames = Vec::with_capacity(apng.frames.len());
+    let mut worst_quality = QualityMetrics {
+        internal_mse: 0.0,
+        standard_mse: 0.0,
+        quality_score: 100,
+    };
+
+    for frame in &apng.frames {
+        let fw = frame.width as usize;
+        let fh = frame.height as usize;
+
+        let indexed = remap_image(
+            &frame.rgba,
+            fw,
+            fh,
+            &global_palette,
+            palette_error,
+            quantizer,
+            None,
+            None,
+            None,
+        );
+
+        // Map per-frame palette indices back to global palette indices.
+        // remap_image returns a reordered palette subset; build a mapping
+        // from per-frame index → global index by matching RGBA colors.
+        let global_indices =
+            remap_indices_to_global(&indexed.indices, &indexed.palette, &global_rgba_palette);
+
+        // Quality evaluation
+        let remapped_rgba = remapped_rgba_from_indices(&indexed.indices, &indexed.palette);
+        let frame_quality = if fw > 0 && fh > 0 {
+            evaluate_quality_against_rgba(&frame.rgba, &remapped_rgba)
+        } else {
+            QualityMetrics {
+                internal_mse: 0.0,
+                standard_mse: 0.0,
+                quality_score: 100,
+            }
+        };
+        if frame_quality.quality_score < worst_quality.quality_score {
+            worst_quality = frame_quality;
+        }
+
+        indexed_frames.push(IndexedApngFrame {
+            width: frame.width,
+            height: frame.height,
+            x_offset: frame.x_offset,
+            y_offset: frame.y_offset,
+            delay_num: frame.delay_num,
+            delay_den: frame.delay_den,
+            dispose_op: frame.dispose_op,
+            blend_op: frame.blend_op,
+            indices: global_indices,
+        });
+    }
+
+    // Step 5: Remap default image if present
+    let default_image_indices = if let Some(default_image) = &apng.default_image {
+        let dw = apng.width as usize;
+        let dh = apng.height as usize;
+        let indexed = remap_image(
+            &default_image.rgba,
+            dw,
+            dh,
+            &global_palette,
+            palette_error,
+            quantizer,
+            None,
+            None,
+            None,
+        );
+        Some(remap_indices_to_global(
+            &indexed.indices,
+            &indexed.palette,
+            &global_rgba_palette,
+        ))
+    } else {
+        None
+    };
+
+    let indexed_apng = IndexedApngImage {
+        width: apng.width,
+        height: apng.height,
+        num_plays: apng.num_plays,
+        palette: global_rgba_palette,
+        default_image_indices,
+        frames: indexed_frames,
+    };
+
+    Ok((indexed_apng, worst_quality))
+}
+
+/// Map per-frame palette indices back to global palette indices.
+/// remap_image() reorders the palette per-frame by usage count, so each frame's
+/// indices reference a different ordering. This function builds a mapping table
+/// and translates all indices to reference the global palette.
+fn remap_indices_to_global(
+    indices: &[u8],
+    frame_palette: &[[u8; 4]],
+    global_palette: &[[u8; 4]],
+) -> Vec<u8> {
+    // Build mapping: frame palette index → global palette index
+    let mapping: Vec<u8> = frame_palette
+        .iter()
+        .map(|frame_color| {
+            // Find exact match first, fall back to nearest
+            global_palette
+                .iter()
+                .position(|g| g == frame_color)
+                .unwrap_or_else(|| {
+                    // Nearest color (k-means may have slightly adjusted colors)
+                    global_palette
+                        .iter()
+                        .enumerate()
+                        .min_by_key(|(_, g)| {
+                            let dr = i32::from(frame_color[0]) - i32::from(g[0]);
+                            let dg = i32::from(frame_color[1]) - i32::from(g[1]);
+                            let db = i32::from(frame_color[2]) - i32::from(g[2]);
+                            let da = i32::from(frame_color[3]) - i32::from(g[3]);
+                            dr * dr + dg * dg + db * db + da * da
+                        })
+                        .map(|(i, _)| i)
+                        .unwrap_or(0)
+                }) as u8
+        })
+        .collect();
+
+    indices.iter().map(|&idx| mapping[idx as usize]).collect()
 }
 
 fn quality_targets(quality: Option<&QualityRange>, output_posterize_bits: u8) -> QualityTargets {
