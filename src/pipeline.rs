@@ -15,7 +15,7 @@ use crate::cli::{ApngMode, QualityRange};
 use crate::error::AppError;
 use crate::palette_quant::{
     IndexedImage, build_histogram_map, finalize_histogram, find_best_palette, merge_histogram_maps,
-    quantize_indexed, quantizer_settings, remap_image, reposterize_histogram_map,
+    quantize_indexed, quantizer_settings, remap_to_fixed_palette, reposterize_histogram_map,
     sort_palette_entries,
 };
 use crate::quality::{
@@ -433,7 +433,7 @@ fn quantize_apng_frames(
     let histogram = finalize_histogram(global_map, &gamma);
 
     // Step 3: Find best palette and sort
-    let (mut palette, palette_error) = find_best_palette(&histogram, quantizer);
+    let (mut palette, _palette_error) = find_best_palette(&histogram, quantizer);
     if palette.is_empty() {
         palette = vec![crate::palette_quant::PaletteEntry {
             color: InternalPixel::default(),
@@ -448,9 +448,9 @@ fn quantize_apng_frames(
         .collect();
     let global_rgba_palette: Vec<[u8; 4]> = global_palette.iter().map(|e| e.1).collect();
 
-    // Step 4: Remap each frame independently using the global palette.
-    // remap_image() may reorder the palette per-frame (by usage count),
-    // so we must map per-frame indices back to the global palette order.
+    // Step 4: Remap each frame independently using the fixed global palette.
+    // Uses remap_to_fixed_palette() which does NOT run k-means feedback or
+    // reorder the palette, so indices directly reference the global palette.
     let mut indexed_frames = Vec::with_capacity(apng.frames.len());
     let mut worst_quality = QualityMetrics {
         internal_mse: 0.0,
@@ -462,26 +462,10 @@ fn quantize_apng_frames(
         let fw = frame.width as usize;
         let fh = frame.height as usize;
 
-        let indexed = remap_image(
-            &frame.rgba,
-            fw,
-            fh,
-            &global_palette,
-            palette_error,
-            quantizer,
-            None,
-            None,
-            None,
-        );
+        let indices = remap_to_fixed_palette(&frame.rgba, fw, fh, &global_palette, quantizer);
 
-        // Map per-frame palette indices back to global palette indices.
-        // remap_image returns a reordered palette subset; build a mapping
-        // from per-frame index → global index by matching RGBA colors.
-        let global_indices =
-            remap_indices_to_global(&indexed.indices, &indexed.palette, &global_rgba_palette);
-
-        // Quality evaluation
-        let remapped_rgba = remapped_rgba_from_indices(&indexed.indices, &indexed.palette);
+        // Quality evaluation using global palette (matches actual output)
+        let remapped_rgba = remapped_rgba_from_indices(&indices, &global_rgba_palette);
         let frame_quality = if fw > 0 && fh > 0 {
             evaluate_quality_against_rgba(&frame.rgba, &remapped_rgba)
         } else {
@@ -504,7 +488,7 @@ fn quantize_apng_frames(
             delay_den: frame.delay_den,
             dispose_op: frame.dispose_op,
             blend_op: frame.blend_op,
-            indices: global_indices,
+            indices,
         });
     }
 
@@ -512,21 +496,12 @@ fn quantize_apng_frames(
     let default_image_indices = if let Some(default_image) = &apng.default_image {
         let dw = apng.width as usize;
         let dh = apng.height as usize;
-        let indexed = remap_image(
+        Some(remap_to_fixed_palette(
             &default_image.rgba,
             dw,
             dh,
             &global_palette,
-            palette_error,
             quantizer,
-            None,
-            None,
-            None,
-        );
-        Some(remap_indices_to_global(
-            &indexed.indices,
-            &indexed.palette,
-            &global_rgba_palette,
         ))
     } else {
         None
@@ -542,44 +517,6 @@ fn quantize_apng_frames(
     };
 
     Ok((indexed_apng, worst_quality))
-}
-
-/// Map per-frame palette indices back to global palette indices.
-/// remap_image() reorders the palette per-frame by usage count, so each frame's
-/// indices reference a different ordering. This function builds a mapping table
-/// and translates all indices to reference the global palette.
-fn remap_indices_to_global(
-    indices: &[u8],
-    frame_palette: &[[u8; 4]],
-    global_palette: &[[u8; 4]],
-) -> Vec<u8> {
-    // Build mapping: frame palette index → global palette index
-    let mapping: Vec<u8> = frame_palette
-        .iter()
-        .map(|frame_color| {
-            // Find exact match first, fall back to nearest
-            global_palette
-                .iter()
-                .position(|g| g == frame_color)
-                .unwrap_or_else(|| {
-                    // Nearest color (k-means may have slightly adjusted colors)
-                    global_palette
-                        .iter()
-                        .enumerate()
-                        .min_by_key(|(_, g)| {
-                            let dr = i32::from(frame_color[0]) - i32::from(g[0]);
-                            let dg = i32::from(frame_color[1]) - i32::from(g[1]);
-                            let db = i32::from(frame_color[2]) - i32::from(g[2]);
-                            let da = i32::from(frame_color[3]) - i32::from(g[3]);
-                            dr * dr + dg * dg + db * db + da * da
-                        })
-                        .map(|(i, _)| i)
-                        .unwrap_or(0)
-                }) as u8
-        })
-        .collect();
-
-    indices.iter().map(|&idx| mapping[idx as usize]).collect()
 }
 
 fn quality_targets(quality: Option<&QualityRange>, output_posterize_bits: u8) -> QualityTargets {

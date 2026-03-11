@@ -1484,6 +1484,101 @@ pub(crate) fn remap_image(
     }
 }
 
+/// Remap pixels to a fixed palette without k-means feedback or palette reordering.
+/// Used for APNG frames where all frames must share the exact same global palette.
+/// Supports both plain (nearest-neighbor) and dithered (Floyd-Steinberg) modes.
+pub(crate) fn remap_to_fixed_palette(
+    rgba: &[u8],
+    width: usize,
+    height: usize,
+    palette: &[(InternalPixel, [u8; 4])],
+    settings: QuantizerSettings,
+) -> Vec<u8> {
+    let pixel_count = width.saturating_mul(height);
+    if pixel_count == 0 {
+        return Vec::new();
+    }
+    let gamma = gamma_lut(SRGB_OUTPUT_GAMMA);
+    let pixels: Vec<InternalPixel> = rgba
+        .chunks_exact(4)
+        .map(|px| InternalPixel::from_rgba(&gamma, px))
+        .collect();
+
+    // Round palette for output (posterize), matching the remap_image() flow.
+    let mut palette_points = palette.iter().map(|entry| entry.0).collect::<Vec<_>>();
+    round_palette_for_output_in_place(&mut palette_points, settings.output_posterize_bits);
+
+    if settings.dither {
+        // Dithered path: run a plain remap pass first (for dither map + initial indices),
+        // but do NOT apply k-means feedback — palette stays fixed.
+        let is_image_huge = pixel_count > 2000 * 2000;
+        let generate_dither_map = settings.use_dither_map == DitherMapMode::Always
+            || (!is_image_huge && settings.use_dither_map != DitherMapMode::None);
+
+        let plain_pass = if palette_points.len() > 1 {
+            Some(remap_image_plain_pass(
+                width,
+                &pixels,
+                &palette_points,
+                None,
+            ))
+        } else {
+            None
+        };
+
+        let dither_map = select_dither_map(
+            &pixels,
+            width,
+            height,
+            plain_pass.as_ref().filter(|_| generate_dither_map),
+            &palette_points,
+            settings.use_dither_map,
+            generate_dither_map,
+            None,
+        );
+        let tree = NearestTree::new(&palette_points);
+        let output_image_is_remapped = plain_pass.is_some();
+        let mut indices = plain_pass
+            .as_ref()
+            .filter(|_| output_image_is_remapped)
+            .map(|pass| pass.indices.clone())
+            .unwrap_or_else(|| vec![0u8; pixels.len()]);
+        let mut base_dithering_level = (1.0 - settings.dither_level)
+            .mul_add(-(1.0 - settings.dither_level), 1.0)
+            * (15.0f32 / 16.0f32);
+        if !dither_map.is_empty() {
+            base_dithering_level *= 1.0 / 255.0;
+        }
+        let dither_error_source = if generate_dither_map {
+            plain_pass.as_ref().map(|pass| pass.palette_error)
+        } else {
+            None
+        };
+        let max_dither_error = dither_error_source
+            .unwrap_or(quality_to_mse(80))
+            .mul_add(2.4, 0.0)
+            .max(quality_to_mse(35)) as f32;
+        remap_image_dithered_rows(
+            &pixels,
+            width,
+            height,
+            &tree,
+            &palette_points,
+            &dither_map,
+            base_dithering_level,
+            max_dither_error,
+            output_image_is_remapped,
+            plain_pass.as_ref().map(|pass| pass.indices.as_slice()),
+            &mut indices,
+        );
+        indices
+    } else {
+        // Plain path: single nearest-neighbor pass, no k-means feedback.
+        let pass = remap_image_plain_pass(width, &pixels, &palette_points, None);
+        pass.indices
+    }
+}
+
 #[allow(clippy::type_complexity)]
 fn remap_image_plain(
     rgba: &[u8],
