@@ -25,3 +25,8 @@ __pycache__/
 !/reports/.gitkeep
 !/reports/waivers/
 !/reports/waivers/.gitkeep
+
+# FFI generated artifacts
+ffi/generated/
+PNGOptimCore.xcframework/
+PNGOptimCore.xcframework.zip

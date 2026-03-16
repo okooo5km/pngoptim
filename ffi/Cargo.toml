@@ -1,0 +1,17 @@
+[package]
+name = "pngoptim-ffi"
+version = "0.4.2"
+edition = "2024"
+license = "MIT"
+authors = ["okooo5km(十里)"]
+description = "C FFI bindings for pngoptim PNG quantization engine"
+
+[lib]
+name = "pngoptim_ffi"
+crate-type = ["staticlib"]
+
+[dependencies]
+pngoptim = { path = ".." }
+
+[build-dependencies]
+cbindgen = "0.29"

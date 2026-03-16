@@ -1,6 +1,9 @@
+[workspace]
+members = ["ffi"]
+
 [package]
 name = "pngoptim"
-version = "0.4.1"
+version = "0.4.2"
 edition = "2024"
 license = "MIT"
 
@@ -21,3 +24,13 @@ rayon = "1.11.0"
 flate2 = { version = "1", default-features = false, features = ["zlib-rs"] }
 zlib-rs = "0.6.3"
 crc32fast = "1"
+
+# Workspace-level profile (lto/codegen-units can only be set at this level)
+[profile.release]
+lto = true
+codegen-units = 1
+
+# FFI staticlib: optimize for size
+[profile.release.package.pngoptim-ffi]
+opt-level = "s"
+strip = true

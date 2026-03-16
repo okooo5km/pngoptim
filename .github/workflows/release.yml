@@ -115,9 +115,42 @@ jobs:
           name: windows-x86_64
           path: pngoptim_*.zip*
 
+  build-xcframework:
+    name: XCFramework
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: >-
+            aarch64-apple-darwin,
+            x86_64-apple-darwin,
+            aarch64-apple-ios,
+            aarch64-apple-ios-sim,
+            x86_64-apple-ios
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build XCFramework
+        run: bash scripts/build-xcframework.sh
+
+      - name: Compute checksum
+        id: checksum
+        run: |
+          CHECKSUM=$(swift package compute-checksum PNGOptimCore.xcframework.zip)
+          echo "checksum=$CHECKSUM" >> "$GITHUB_OUTPUT"
+          echo "Checksum: $CHECKSUM"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: xcframework
+          path: PNGOptimCore.xcframework.zip
+
+    outputs:
+      checksum: ${{ steps.checksum.outputs.checksum }}
+
   release:
     name: Create Release
-    needs: [build-macos, build-linux-x86_64, build-linux-arm64, build-windows]
+    needs: [build-macos, build-linux-x86_64, build-linux-arm64, build-windows, build-xcframework]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
@@ -132,7 +165,7 @@ jobs:
             --repo ${{ github.repository }} \
             --title "${{ github.ref_name }}" \
             --generate-notes \
-            pngoptim_*
+            pngoptim_* PNGOptimCore.xcframework.zip
 
   homebrew:
     name: Update Homebrew Tap
@@ -183,3 +216,22 @@ jobs:
           git add -A
           git commit -m "pngoptim ${VERSION}"
           git push
+
+  update-swift-package:
+    name: Update Swift Package
+    needs: [release, build-xcframework]
+    if: "!contains(github.ref_name, '-')"
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger pngoptim-swift update
+        uses: peter-evans/repository-dispatch@v3
+        with:
+          token: ${{ secrets.SWIFT_PACKAGE_TOKEN }}
+          repository: okooo5km/pngoptim-swift
+          event-type: update-xcframework
+          client-payload: |
+            {
+              "version": "${{ github.ref_name }}",
+              "xcframework_url": "https://github.com/okooo5km/pngoptim/releases/download/${{ github.ref_name }}/PNGOptimCore.xcframework.zip",
+              "checksum": "${{ needs.build-xcframework.outputs.checksum }}"
+            }

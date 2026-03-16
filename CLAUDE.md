@@ -12,8 +12,8 @@ PNGOptim is a Rust CLI tool for PNG quantization (lossy compression), aiming to 
 # Build
 cargo build --release
 
-# Run tests
-cargo test
+# Run tests (workspace includes FFI crate)
+cargo test --workspace
 
 # Spot check (primary validation)
 ./target/release/pngoptim /Users/5km/Downloads/demo.png -o /tmp/demo-current.png --quality 65-75 --force
@@ -88,18 +88,51 @@ All algorithm work follows reference-first methodology: read the reference imple
 - **Test fixtures**: `dataset/apng/generated/` contains 11 synthetic APNG samples covering all DisposeOp×BlendOp combinations, generated via `xtask generate-apng-fixtures`
 - **Regression commands**: `xtask apng-compat`, `apng-quality-size`, `apng-visual-guard` for automated APNG validation
 
+## FFI Crate (`ffi/`)
+
+C FFI bindings for downstream Swift/C consumers, packaged as XCFramework.
+
+| File | Purpose |
+|------|---------|
+| `ffi/Cargo.toml` | FFI crate config (staticlib, path dep on root pngoptim) |
+| `ffi/src/lib.rs` | C ABI exports: `pngoptim_default_options`, `pngoptim_process`, `pngoptim_result_free` |
+| `ffi/build.rs` | cbindgen header generation → `ffi/generated/pngoptim.h` |
+| `ffi/cbindgen.toml` | cbindgen config |
+| `scripts/build-xcframework.sh` | Cross-compile 5 Apple targets + package XCFramework |
+
+### XCFramework Build
+
+```bash
+# Local development (native arch only)
+bash scripts/build-xcframework.sh --local-only
+
+# Full 5-architecture build
+bash scripts/build-xcframework.sh
+```
+
+Key details:
+- `LCMS2_NO_PKG_CONFIG=1` forces lcms2 source build (needed for iOS cross-compilation)
+- Native C libs (lcms2) merged into Rust staticlib via `libtool -static`
+- XCFramework module name is `PNGOptimCore` (avoids SPM target name conflict)
+
 ## CI/CD Workflows
 
 | Workflow | Trigger | Purpose |
 |----------|---------|---------|
-| `ci.yml` | push/PR to main | Test (ubuntu + macOS), clippy, fmt |
-| `release.yml` | tag `v*` | Multi-platform build → GitHub Release → Homebrew tap update |
+| `ci.yml` | push/PR to main | Test (ubuntu + macOS), clippy, fmt — `--workspace` scope |
+| `release.yml` | tag `v*` | Multi-platform CLI build + XCFramework build → GitHub Release → Homebrew tap → dispatch to pngoptim-swift |
 
 ### Release Platforms
 - macOS Universal (arm64 + x86_64 via lipo)
 - Linux x86_64 (ubuntu-latest)
 - Linux arm64 (ubuntu-24.04-arm native)
 - Windows x86_64 (windows-latest)
+- XCFramework (5 Apple architectures)
+
+### Swift Package Distribution
+- Release workflow builds XCFramework and dispatches to [pngoptim-swift](https://github.com/okooo5km/pngoptim-swift)
+- Requires `SWIFT_PACKAGE_TOKEN` secret (PAT with contents:write on pngoptim-swift)
+- pngoptim-swift auto-updates Package.swift, Version.swift, header, then commits + tags + releases
 
 ### Homebrew
 - Tap: `okooo5km/homebrew-tap`

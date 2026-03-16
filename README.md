@@ -134,6 +134,18 @@ cargo test
 
 The `lcms2-sys` dependency compiles vendored C sources via the `cc` crate — no system library installation needed.
 
+## Swift Package
+
+Use pngoptim in your macOS/iOS apps via [PNGOptimKit](https://github.com/okooo5km/pngoptim-swift):
+
+```swift
+dependencies: [
+  .package(url: "https://github.com/okooo5km/pngoptim-swift.git", from: "0.4.2")
+]
+```
+
+The XCFramework is automatically built from this repo's releases and distributed through pngoptim-swift.
+
 ## License
 
 MIT — [okooo5km (十里)](https://github.com/okooo5km)
