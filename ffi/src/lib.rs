@@ -178,7 +178,10 @@ pub extern "C" fn pngoptim_result_free(result: *mut PNGOptimResult) {
     // Free output data
     if !result.data.is_null() && result.data_len > 0 {
         unsafe {
-            let _ = Box::from_raw(std::ptr::slice_from_raw_parts_mut(result.data, result.data_len));
+            let _ = Box::from_raw(std::ptr::slice_from_raw_parts_mut(
+                result.data,
+                result.data_len,
+            ));
         }
     }
 
