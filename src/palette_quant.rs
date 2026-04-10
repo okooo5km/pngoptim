@@ -110,6 +110,95 @@ pub fn quantize_indexed(
     )
 }
 
+/// Quantize with an external importance map (e.g. from a temporal denoiser).
+///
+/// If `external_importance_map` is provided, it is merged with the internally
+/// generated contrast-based importance map by taking the element-wise minimum.
+/// This allows the denoiser to reduce importance of stable pixels.
+pub fn quantize_indexed_with_importance(
+    rgba: &[u8],
+    width: usize,
+    height: usize,
+    settings: QuantizerSettings,
+    external_importance_map: Option<&[u8]>,
+) -> IndexedImage {
+    let pixel_count = width.saturating_mul(height);
+    if pixel_count == 0 {
+        return IndexedImage {
+            palette: vec![[0, 0, 0, 0]],
+            indices: Vec::new(),
+        };
+    }
+    let gamma = gamma_lut(SRGB_OUTPUT_GAMMA);
+    let contrast_pixels =
+        if settings.use_contrast_maps || settings.use_dither_map != DitherMapMode::None {
+            Some(
+                rgba.par_chunks_exact(4)
+                    .map(|px| InternalPixel::from_rgba(&gamma, px))
+                    .collect::<Vec<_>>(),
+            )
+        } else {
+            None
+        };
+    let contrast_maps = contrast_pixels
+        .as_deref()
+        .and_then(|pixels| build_contrast_maps(pixels, width, height));
+
+    // Merge internal importance map with external one (element-wise min)
+    let internal_importance = contrast_maps
+        .as_ref()
+        .map(|maps| maps.importance_map.as_slice());
+    let merged_importance_storage = match (internal_importance, external_importance_map) {
+        (Some(internal), Some(external)) => Some(
+            internal
+                .iter()
+                .zip(external.iter())
+                .map(|(&a, &b)| a.min(b))
+                .collect::<Vec<u8>>(),
+        ),
+        _ => None,
+    };
+    let importance_map = match &merged_importance_storage {
+        Some(merged) => Some(merged.as_slice()),
+        None => internal_importance.or(external_importance_map),
+    };
+
+    let edges_map = contrast_maps.as_ref().map(|maps| maps.edges.as_slice());
+    let histogram = build_histogram(
+        rgba,
+        width,
+        settings.input_posterize_bits,
+        settings.max_histogram_entries,
+        &gamma,
+        importance_map,
+    );
+
+    let (mut palette, palette_error) = find_best_palette(&histogram, settings);
+    if palette.is_empty() {
+        palette = vec![PaletteEntry {
+            color: InternalPixel::default(),
+            popularity: 0.0,
+        }];
+    }
+    sort_palette_entries(&mut palette);
+
+    let final_palette = palette
+        .iter()
+        .map(|entry| (entry.color, entry.color.to_rgba(SRGB_OUTPUT_GAMMA)))
+        .collect::<Vec<_>>();
+    remap_image(
+        rgba,
+        width,
+        height,
+        &final_palette,
+        palette_error,
+        settings,
+        importance_map,
+        edges_map,
+        contrast_pixels.as_deref(),
+    )
+}
+
 pub fn quantizer_settings(
     max_colors: usize,
     speed: SpeedSettings,
