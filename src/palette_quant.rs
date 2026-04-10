@@ -279,6 +279,25 @@ pub fn quantize_indexed_with_background(
     }
     sort_palette_entries(&mut palette);
 
+    // Ensure palette contains a transparent entry when background is provided,
+    // so background-aware dithering can assign pixels to transparent.
+    if background_rgba.is_some()
+        && !palette
+            .iter()
+            .any(|e| e.color.is_fully_transparent())
+    {
+        let transparent_entry = PaletteEntry {
+            color: InternalPixel::default(),
+            popularity: 0.0,
+        };
+        if palette.len() < settings.max_colors {
+            palette.push(transparent_entry);
+        } else if !palette.is_empty() {
+            // Replace the least popular entry (last after sort)
+            *palette.last_mut().unwrap() = transparent_entry;
+        }
+    }
+
     // Convert background RGBA to InternalPixel using the same gamma LUT
     let bg_pixels_storage = background_rgba.map(|bg| {
         bg.chunks_exact(4)
@@ -3175,8 +3194,9 @@ mod tests {
     }
 
     #[test]
-    fn background_disabled_without_transparent_entry() {
-        // If palette has no transparent entry, background is silently ignored
+    fn background_ensures_transparent_entry() {
+        // When background is provided but palette has no natural transparent entry,
+        // a transparent entry is injected to guarantee background-aware dithering works.
         let rgba = vec![
             255u8, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 128, 128, 128, 255,
         ];
@@ -3185,10 +3205,16 @@ mod tests {
         // All pixels are fully opaque, so the palette won't naturally contain a transparent entry
         let result =
             super::quantize_indexed_with_background(&rgba, 2, 2, settings, None, Some(&rgba));
-        // Without a transparent palette entry, background should have no effect
-        // (no crash, no panic)
         assert_eq!(result.indices.len(), 4);
         assert!(!result.palette.is_empty());
+        // Verify a transparent entry was injected into the palette
+        assert!(
+            result
+                .palette
+                .iter()
+                .any(|rgba| rgba[3] == 0),
+            "palette should contain a transparent entry when background is provided"
+        );
     }
 
     #[test]

@@ -442,6 +442,22 @@ fn quantize_apng_frames(
     }
     sort_palette_entries(&mut palette);
 
+    // Ensure palette contains a transparent entry for background-aware dithering.
+    // Without this, if all frames are fully opaque the palette won't naturally have
+    // a transparent entry, silently disabling background-aware dithering.
+    if !palette.iter().any(|e| e.color.is_fully_transparent()) {
+        let transparent_entry = crate::palette_quant::PaletteEntry {
+            color: InternalPixel::default(),
+            popularity: 0.0,
+        };
+        if palette.len() < DEFAULT_MAX_COLORS {
+            palette.push(transparent_entry);
+        } else if !palette.is_empty() {
+            // Replace the least popular entry (last after sort)
+            *palette.last_mut().unwrap() = transparent_entry;
+        }
+    }
+
     let global_palette: Vec<(InternalPixel, [u8; 4])> = palette
         .iter()
         .map(|entry| (entry.color, entry.color.to_rgba(SRGB_OUTPUT_GAMMA)))
@@ -517,13 +533,22 @@ fn quantize_apng_frames(
             .map(|px| InternalPixel::from_rgba(&gamma, px))
             .collect();
 
+        // Only pass background for Over-blend frames. With Source blend,
+        // transparent pixels mean "clear to transparent" (not "keep background"),
+        // so background-aware dithering would break the composited output.
+        let bg_ref = if frame.blend_op == png::BlendOp::Over {
+            Some(bg_pixels.as_slice())
+        } else {
+            None
+        };
+
         let indices = remap_to_fixed_palette(
             &frame.rgba,
             fw,
             fh,
             &global_palette,
             quantizer,
-            Some(&bg_pixels),
+            bg_ref,
         );
 
         // Quality evaluation using global palette (matches actual output)
