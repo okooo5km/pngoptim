@@ -451,6 +451,10 @@ fn quantize_apng_frames(
     // Step 4: Remap each frame independently using the fixed global palette.
     // Uses remap_to_fixed_palette() which does NOT run k-means feedback or
     // reorder the palette, so indices directly reference the global palette.
+    //
+    // Background-aware dithering: maintain a canvas tracking the screen state before
+    // each frame is blended. Pixels matching the background are mapped to transparent,
+    // eliminating pixel churn and improving frame differencing in GIF/APNG.
     let mut indexed_frames = Vec::with_capacity(apng.frames.len());
     let mut worst_quality = QualityMetrics {
         internal_mse: 0.0,
@@ -458,11 +462,69 @@ fn quantize_apng_frames(
         quality_score: 100,
     };
 
-    for frame in &apng.frames {
+    let canvas_len = crate::apng::rgba_len(apng.width, apng.height)?;
+    let mut bg_canvas = vec![0u8; canvas_len];
+    let mut saved_before_previous: Option<Vec<u8>> = None;
+
+    for (i, frame) in apng.frames.iter().enumerate() {
         let fw = frame.width as usize;
         let fh = frame.height as usize;
 
-        let indices = remap_to_fixed_palette(&frame.rgba, fw, fh, &global_palette, quantizer);
+        // Apply previous frame's disposal to get screen state before current frame
+        if i > 0 {
+            let prev = &apng.frames[i - 1];
+            match crate::apng::effective_dispose(prev, i - 1) {
+                png::DisposeOp::None => {}
+                png::DisposeOp::Background => {
+                    crate::apng::clear_region(
+                        &mut bg_canvas,
+                        apng.width,
+                        prev.x_offset,
+                        prev.y_offset,
+                        prev.width,
+                        prev.height,
+                    )?;
+                }
+                png::DisposeOp::Previous => {
+                    if let Some(saved) = saved_before_previous.take() {
+                        bg_canvas = saved;
+                    } else {
+                        crate::apng::clear_region(
+                            &mut bg_canvas,
+                            apng.width,
+                            prev.x_offset,
+                            prev.y_offset,
+                            prev.width,
+                            prev.height,
+                        )?;
+                    }
+                }
+            }
+        }
+
+        // bg_canvas is the screen state before current frame is blended.
+        // Extract the sub-rect matching this frame's region as the background.
+        let bg_subrect = crate::apng::extract_subrect_rgba(
+            &bg_canvas,
+            apng.width,
+            frame.x_offset,
+            frame.y_offset,
+            frame.width,
+            frame.height,
+        );
+        let bg_pixels: Vec<InternalPixel> = bg_subrect
+            .chunks_exact(4)
+            .map(|px| InternalPixel::from_rgba(&gamma, px))
+            .collect();
+
+        let indices = remap_to_fixed_palette(
+            &frame.rgba,
+            fw,
+            fh,
+            &global_palette,
+            quantizer,
+            Some(&bg_pixels),
+        );
 
         // Quality evaluation using global palette (matches actual output)
         let remapped_rgba = remapped_rgba_from_indices(&indices, &global_rgba_palette);
@@ -478,6 +540,15 @@ fn quantize_apng_frames(
         if frame_quality.quality_score < worst_quality.quality_score {
             worst_quality = frame_quality;
         }
+
+        // Save canvas state before blending (for DisposeOp::Previous)
+        if crate::apng::effective_dispose(frame, i) == png::DisposeOp::Previous {
+            saved_before_previous = Some(bg_canvas.clone());
+        } else {
+            saved_before_previous = None;
+        }
+        // Blend original (pre-quantization) frame onto canvas for next iteration
+        crate::apng::blend_frame(&mut bg_canvas, apng.width, frame)?;
 
         indexed_frames.push(IndexedApngFrame {
             width: frame.width,
@@ -502,6 +573,7 @@ fn quantize_apng_frames(
             dh,
             &global_palette,
             quantizer,
+            None,
         ))
     } else {
         None

@@ -107,6 +107,7 @@ pub fn quantize_indexed(
         importance_map,
         edges_map,
         contrast_pixels.as_deref(),
+        None,
     )
 }
 
@@ -196,6 +197,111 @@ pub fn quantize_indexed_with_importance(
         importance_map,
         edges_map,
         contrast_pixels.as_deref(),
+        None,
+    )
+}
+
+/// Quantize with an external importance map and optional background for background-aware dithering.
+///
+/// When `background_rgba` is provided (same dimensions as input), the remap phase
+/// compares each pixel against the background. If the background pixel is a closer
+/// match than the best palette entry, the pixel is mapped to a transparent palette
+/// index instead. In GIF/APNG workflows, transparent pixels inherit the previous
+/// frame's content, eliminating pixel churn and improving frame differencing.
+///
+/// Background-aware dithering is automatically disabled if the palette contains no
+/// fully-transparent entry.
+pub fn quantize_indexed_with_background(
+    rgba: &[u8],
+    width: usize,
+    height: usize,
+    settings: QuantizerSettings,
+    external_importance_map: Option<&[u8]>,
+    background_rgba: Option<&[u8]>,
+) -> IndexedImage {
+    let pixel_count = width.saturating_mul(height);
+    if pixel_count == 0 {
+        return IndexedImage {
+            palette: vec![[0, 0, 0, 0]],
+            indices: Vec::new(),
+        };
+    }
+    let gamma = gamma_lut(SRGB_OUTPUT_GAMMA);
+    let contrast_pixels =
+        if settings.use_contrast_maps || settings.use_dither_map != DitherMapMode::None {
+            Some(
+                rgba.par_chunks_exact(4)
+                    .map(|px| InternalPixel::from_rgba(&gamma, px))
+                    .collect::<Vec<_>>(),
+            )
+        } else {
+            None
+        };
+    let contrast_maps = contrast_pixels
+        .as_deref()
+        .and_then(|pixels| build_contrast_maps(pixels, width, height));
+
+    // Merge internal importance map with external one (element-wise min)
+    let internal_importance = contrast_maps
+        .as_ref()
+        .map(|maps| maps.importance_map.as_slice());
+    let merged_importance_storage = match (internal_importance, external_importance_map) {
+        (Some(internal), Some(external)) => Some(
+            internal
+                .iter()
+                .zip(external.iter())
+                .map(|(&a, &b)| a.min(b))
+                .collect::<Vec<u8>>(),
+        ),
+        _ => None,
+    };
+    let importance_map = match &merged_importance_storage {
+        Some(merged) => Some(merged.as_slice()),
+        None => internal_importance.or(external_importance_map),
+    };
+
+    let edges_map = contrast_maps.as_ref().map(|maps| maps.edges.as_slice());
+    let histogram = build_histogram(
+        rgba,
+        width,
+        settings.input_posterize_bits,
+        settings.max_histogram_entries,
+        &gamma,
+        importance_map,
+    );
+
+    let (mut palette, palette_error) = find_best_palette(&histogram, settings);
+    if palette.is_empty() {
+        palette = vec![PaletteEntry {
+            color: InternalPixel::default(),
+            popularity: 0.0,
+        }];
+    }
+    sort_palette_entries(&mut palette);
+
+    // Convert background RGBA to InternalPixel using the same gamma LUT
+    let bg_pixels_storage = background_rgba.map(|bg| {
+        bg.chunks_exact(4)
+            .map(|px| InternalPixel::from_rgba(&gamma, px))
+            .collect::<Vec<_>>()
+    });
+    let bg_pixels = bg_pixels_storage.as_deref();
+
+    let final_palette = palette
+        .iter()
+        .map(|entry| (entry.color, entry.color.to_rgba(SRGB_OUTPUT_GAMMA)))
+        .collect::<Vec<_>>();
+    remap_image(
+        rgba,
+        width,
+        height,
+        &final_palette,
+        palette_error,
+        settings,
+        importance_map,
+        edges_map,
+        contrast_pixels.as_deref(),
+        bg_pixels,
     )
 }
 
@@ -1519,6 +1625,7 @@ pub(crate) fn remap_image(
     importance_map: Option<&[u8]>,
     edges_map: Option<&[u8]>,
     contrast_pixels: Option<&[InternalPixel]>,
+    background_pixels: Option<&[InternalPixel]>,
 ) -> IndexedImage {
     let (palette, mut indices, counts) = if settings.dither {
         remap_image_dithered(
@@ -1531,6 +1638,7 @@ pub(crate) fn remap_image(
             importance_map,
             edges_map,
             contrast_pixels,
+            background_pixels,
         )
     } else {
         remap_image_plain(
@@ -1540,6 +1648,7 @@ pub(crate) fn remap_image(
             settings.output_posterize_bits,
             importance_map,
             contrast_pixels,
+            background_pixels,
         )
     };
 
@@ -1576,12 +1685,16 @@ pub(crate) fn remap_image(
 /// Remap pixels to a fixed palette without k-means feedback or palette reordering.
 /// Used for APNG frames where all frames must share the exact same global palette.
 /// Supports both plain (nearest-neighbor) and dithered (Floyd-Steinberg) modes.
+///
+/// When `background_pixels` is provided, pixels matching the background are mapped
+/// to a transparent palette index, enabling frame differencing optimizations.
 pub(crate) fn remap_to_fixed_palette(
     rgba: &[u8],
     width: usize,
     height: usize,
     palette: &[(InternalPixel, [u8; 4])],
     settings: QuantizerSettings,
+    background_pixels: Option<&[InternalPixel]>,
 ) -> Vec<u8> {
     let pixel_count = width.saturating_mul(height);
     if pixel_count == 0 {
@@ -1597,6 +1710,24 @@ pub(crate) fn remap_to_fixed_palette(
     let mut palette_points = palette.iter().map(|entry| entry.0).collect::<Vec<_>>();
     round_palette_for_output_in_place(&mut palette_points, settings.output_posterize_bits);
 
+    // Find transparent_index for background-aware remap
+    let (effective_bg, transparent_index) = if let Some(bg) = background_pixels {
+        let tree_for_search = NearestTree::new(&palette_points);
+        let (ti, _) = tree_for_search.search(InternalPixel::default(), 0);
+        if palette_points[ti].is_fully_transparent() {
+            (bg, ti as u8)
+        } else {
+            (&[] as &[InternalPixel], 0u8)
+        }
+    } else {
+        (&[] as &[InternalPixel], 0u8)
+    };
+    let bg_for_plain = if !effective_bg.is_empty() {
+        Some((effective_bg, transparent_index))
+    } else {
+        None
+    };
+
     if settings.dither {
         // Dithered path: run a plain remap pass first (for dither map + initial indices),
         // but do NOT apply k-means feedback — palette stays fixed.
@@ -1609,6 +1740,7 @@ pub(crate) fn remap_to_fixed_palette(
                 width,
                 &pixels,
                 &palette_points,
+                None,
                 None,
             ))
         } else {
@@ -1627,6 +1759,8 @@ pub(crate) fn remap_to_fixed_palette(
         );
         let tree = NearestTree::new(&palette_points);
         let output_image_is_remapped = plain_pass.is_some();
+        // When using background, pre-remap hints are unreliable
+        let effective_output_is_remapped = output_image_is_remapped && effective_bg.is_empty();
         let mut indices = plain_pass
             .as_ref()
             .filter(|_| output_image_is_remapped)
@@ -1656,14 +1790,16 @@ pub(crate) fn remap_to_fixed_palette(
             &dither_map,
             base_dithering_level,
             max_dither_error,
-            output_image_is_remapped,
+            effective_output_is_remapped,
             plain_pass.as_ref().map(|pass| pass.indices.as_slice()),
             &mut indices,
+            effective_bg,
+            transparent_index,
         );
         indices
     } else {
         // Plain path: single nearest-neighbor pass, no k-means feedback.
-        let pass = remap_image_plain_pass(width, &pixels, &palette_points, None);
+        let pass = remap_image_plain_pass(width, &pixels, &palette_points, None, bg_for_plain);
         pass.indices
     }
 }
@@ -1676,6 +1812,7 @@ fn remap_image_plain(
     output_posterize_bits: u8,
     importance_map: Option<&[u8]>,
     contrast_pixels: Option<&[InternalPixel]>,
+    background_pixels: Option<&[InternalPixel]>,
 ) -> (Vec<(InternalPixel, [u8; 4])>, Vec<u8>, Vec<usize>) {
     let mut palette_points = palette.iter().map(|entry| entry.0).collect::<Vec<_>>();
     let gamma = gamma_lut(SRGB_OUTPUT_GAMMA);
@@ -1696,7 +1833,27 @@ fn remap_image_plain(
     // The int_palette (output RGBA) is set before finalize, so finalize doesn't affect output.
     let output_palette =
         round_palette_for_output_in_place(&mut palette_points, output_posterize_bits);
-    let final_pass = finalize_plain_remap(width, pixels, &mut palette_points, importance_map);
+
+    // Find transparent_index for background-aware remap
+    let background = if let Some(bg) = background_pixels {
+        let tree = NearestTree::new(&palette_points);
+        let (ti, _) = tree.search(InternalPixel::default(), 0);
+        if palette_points[ti].is_fully_transparent() {
+            Some((bg, ti as u8))
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    let final_pass = finalize_plain_remap(
+        width,
+        pixels,
+        &mut palette_points,
+        importance_map,
+        background.map(|(bg, ti)| (bg as &[InternalPixel], ti)),
+    );
 
     let remapped_palette = palette_points
         .into_iter()
@@ -1719,6 +1876,7 @@ fn remap_image_plain_pass(
     pixels: &[InternalPixel],
     palette_points: &[InternalPixel],
     importance_map: Option<&[u8]>,
+    background: Option<(&[InternalPixel], u8)>,
 ) -> PlainRemapPass {
     let pal_len = palette_points.len();
     let tree = NearestTree::new(palette_points);
@@ -1744,10 +1902,25 @@ fn remap_image_plain_pass(
                     last_idx = 0;
                 }
                 let (idx, diff) = tree.search(color, last_idx);
+                let pixel_idx = row_start + col;
+
+                // Background-aware plain remap: if background pixel is closer, use transparent_index
+                if let Some((bg_pixels, transparent_idx)) = background
+                    && let Some(&bg_pixel) = bg_pixels.get(pixel_idx)
+                {
+                    let bg_diff = bg_pixel.diff(color);
+                    if bg_diff <= diff {
+                        row_indices.push(transparent_idx);
+                        counts[transparent_idx as usize] += 1;
+                        total_error += f64::from(bg_diff);
+                        last_idx = transparent_idx as usize;
+                        continue;
+                    }
+                }
+
                 last_idx = idx;
                 counts[idx] += 1;
                 total_error += f64::from(diff);
-                let pixel_idx = row_start + col;
                 let importance = importance_map
                     .and_then(|map| map.get(pixel_idx))
                     .copied()
@@ -1799,10 +1972,26 @@ fn finalize_plain_remap(
     pixels: &[InternalPixel],
     palette_points: &mut [InternalPixel],
     importance_map: Option<&[u8]>,
+    background: Option<(&[InternalPixel], u8)>,
 ) -> PlainRemapPass {
-    let feedback = remap_image_plain_pass(width, pixels, palette_points, importance_map);
+    let feedback =
+        remap_image_plain_pass(width, pixels, palette_points, importance_map, background);
     if palette_points.len() <= 1 {
         return feedback;
+    }
+
+    // Protect transparent palette entry from k-means drift when using background
+    if let Some((_, transparent_idx)) = background {
+        // Seed a small weight so k-means doesn't remove the transparent entry
+        let ti = transparent_idx as usize;
+        if ti < feedback.weights.len() {
+            // weights/sums are returned from the pass; we can't mutate them directly
+            // since they're inside feedback. Instead, we apply feedback and manually
+            // ensure the transparent entry stays at default (fully transparent).
+            apply_remap_feedback(palette_points, &feedback);
+            palette_points[ti] = InternalPixel::default();
+            return feedback;
+        }
     }
 
     apply_remap_feedback(palette_points, &feedback);
@@ -1838,6 +2027,7 @@ fn remap_image_dithered(
     importance_map: Option<&[u8]>,
     edges_map: Option<&[u8]>,
     contrast_pixels: Option<&[InternalPixel]>,
+    background_pixels: Option<&[InternalPixel]>,
 ) -> (Vec<(InternalPixel, [u8; 4])>, Vec<u8>, Vec<usize>) {
     let mut palette_points = palette.iter().map(|entry| entry.0).collect::<Vec<_>>();
     let gamma = gamma_lut(SRGB_OUTPUT_GAMMA);
@@ -1865,11 +2055,12 @@ fn remap_image_dithered(
             pixels,
             &mut palette_points,
             importance_map,
+            None,
         ))
     } else if palette_points.len() > 1 {
         // Reference: remap_to_palette() runs one pass + k-means finalize.
         // The returned indices (pre-finalize) are used as guess hints for Floyd.
-        let feedback = remap_image_plain_pass(width, pixels, &palette_points, importance_map);
+        let feedback = remap_image_plain_pass(width, pixels, &palette_points, importance_map, None);
         apply_remap_feedback(&mut palette_points, &feedback);
         Some(feedback)
     } else {
@@ -1880,6 +2071,22 @@ fn remap_image_dithered(
     // Output RGBA generated AFTER k-means finalize, matching reference init_int_palette() timing
     let output_palette =
         round_palette_for_output_in_place(&mut palette_points, settings.output_posterize_bits);
+
+    // Find transparent_index for background-aware dithering.
+    // Must be done after round_palette_for_output_in_place so palette_points reflect final colors.
+    let (effective_bg, transparent_index) = if let Some(bg) = background_pixels {
+        let tree_for_search = NearestTree::new(&palette_points);
+        let (ti, _) = tree_for_search.search(InternalPixel::default(), 0);
+        if palette_points[ti].is_fully_transparent() {
+            (bg, ti as u8)
+        } else {
+            (&[] as &[InternalPixel], 0u8)
+        }
+    } else {
+        (&[] as &[InternalPixel], 0u8)
+    };
+    // When using background, lots of pixels become transparent, making pre-remap hints unreliable
+    let effective_output_is_remapped = output_image_is_remapped && effective_bg.is_empty();
 
     let dither_map = select_dither_map(
         pixels,
@@ -1924,9 +2131,11 @@ fn remap_image_dithered(
         &dither_map,
         base_dithering_level,
         max_dither_error,
-        output_image_is_remapped,
+        effective_output_is_remapped,
         plain_pass.as_ref().map(|pass| pass.indices.as_slice()),
         &mut indices,
+        effective_bg,
+        transparent_index,
     );
     let mut counts = vec![0usize; palette.len()];
     for &idx in &indices {
@@ -1954,6 +2163,8 @@ fn remap_image_dithered_rows(
     output_image_is_remapped: bool,
     plain_indices: Option<&[u8]>,
     indices: &mut [u8],
+    background_pixels: &[InternalPixel],
+    transparent_index: u8,
 ) {
     let num_chunks = effective_dither_chunks(width, height);
     let chunk_height = height.div_ceil(num_chunks);
@@ -1976,6 +2187,13 @@ fn remap_image_dithered_rows(
                     let row_map = dither_map
                         .get(row * width..row * width + width)
                         .unwrap_or(&[]);
+                    let bg_row = if !background_pixels.is_empty() {
+                        background_pixels
+                            .get(row * width..row * width + width)
+                            .unwrap_or(&[])
+                    } else {
+                        &[]
+                    };
                     if output_image_is_remapped {
                         if let Some(plain_indices) = plain_indices {
                             discard.copy_from_slice(&plain_indices[row * width..][..width]);
@@ -1995,6 +2213,8 @@ fn remap_image_dithered_rows(
                         &mut curr_errors,
                         &mut next_errors,
                         row.is_multiple_of(2),
+                        bg_row,
+                        transparent_index,
                     );
                 }
             }
@@ -2005,6 +2225,13 @@ fn remap_image_dithered_rows(
                 let row_map = dither_map
                     .get(row * width..row * width + width)
                     .unwrap_or(&[]);
+                let bg_row = if !background_pixels.is_empty() {
+                    background_pixels
+                        .get(row * width..row * width + width)
+                        .unwrap_or(&[])
+                } else {
+                    &[]
+                };
                 let row_indices = &mut chunk[local_row * width..][..width];
                 if output_image_is_remapped && let Some(plain_indices) = plain_indices {
                     row_indices.copy_from_slice(&plain_indices[row * width..][..width]);
@@ -2021,6 +2248,8 @@ fn remap_image_dithered_rows(
                     &mut curr_errors,
                     &mut next_errors,
                     row.is_multiple_of(2),
+                    bg_row,
+                    transparent_index,
                 );
             }
         });
@@ -2050,11 +2279,14 @@ fn dither_row(
     curr_errors: &mut Vec<InternalPixel>,
     next_errors: &mut Vec<InternalPixel>,
     even_row: bool,
+    bg_row: &[InternalPixel],
+    transparent_index: u8,
 ) {
     std::mem::swap(curr_errors, next_errors);
     next_errors.fill(InternalPixel::default());
 
     let width = row_pixels.len();
+    let mut undithered_bg_used = 0u8;
     let mut last_match = 0usize;
     for offset in 0..width {
         let x = if even_row { offset } else { width - 1 - offset };
@@ -2063,7 +2295,7 @@ fn dither_row(
             dither_level *= f32::from(level);
         }
 
-        let color = get_dithered_pixel(
+        let spx = get_dithered_pixel(
             dither_level,
             max_dither_error,
             curr_errors[x + 1],
@@ -2075,16 +2307,44 @@ fn dither_row(
         } else {
             last_match
         };
-        let (pal_idx, _) = tree.search(color, guessed_match);
+        let (pal_idx, dither_diff) = tree.search(spx, guessed_match);
+        let mut matched = pal_idx as u8;
         last_match = pal_idx;
-        output_row[x] = pal_idx as u8;
+        let mut output_px = palette_points[pal_idx];
 
-        let out = palette_points[pal_idx];
+        // Background-aware dithering: 3-stage decision (matches libimagequant remap.rs:275-304)
+        if let Some(&bg_pixel) = bg_row.get(x) {
+            // Stage 1: if background is closer to dithered pixel than palette match, use transparent
+            let bg_for_dither_diff = spx.diff(bg_pixel);
+            if bg_for_dither_diff <= dither_diff {
+                output_px = bg_pixel;
+                matched = transparent_index;
+            } else if undithered_bg_used > 1 {
+                // Stage 2: periodically reset to prevent artifacts from accumulated undithered error
+                undithered_bg_used = 0;
+            } else {
+                // Stage 3: if dithering is worse than natural inter-frame difference,
+                // try undithered color as fallback
+                let max_diff = row_pixels[x].diff(bg_pixel);
+                let dithered_diff = row_pixels[x].diff(output_px);
+                if dithered_diff > max_diff {
+                    let guessed_px = palette_points[guessed_match];
+                    let undithered_diff = row_pixels[x].diff(guessed_px);
+                    if undithered_diff < max_diff {
+                        undithered_bg_used += 1;
+                        output_px = guessed_px;
+                        matched = guessed_match as u8;
+                    }
+                }
+            }
+        }
+        output_row[x] = matched;
+
         let mut diff = InternalPixel {
-            a: color.a - out.a,
-            r: color.r - out.r,
-            g: color.g - out.g,
-            b: color.b - out.b,
+            a: spx.a - output_px.a,
+            r: spx.r - output_px.r,
+            g: spx.g - output_px.g,
+            b: spx.b - output_px.b,
         };
         if diff.r.mul_add(diff.r, diff.g * diff.g) + diff.b.mul_add(diff.b, diff.a * diff.a)
             > max_dither_error
@@ -2475,6 +2735,8 @@ fn posterize_output_channel(channel: u8, bits: u8) -> u8 {
 mod tests {
     use crate::quality::SpeedSettings;
 
+    #[allow(unused_imports)]
+    use super::quantize_indexed_with_importance;
     use super::{
         InternalPixel, QuantizerSettings, apply_remap_feedback, build_histogram_map, gamma_lut,
         merge_histogram_maps, quantize_indexed, quantizer_settings, remap_image_dithered,
@@ -2571,7 +2833,7 @@ mod tests {
             .map(|px| InternalPixel::from_rgba(&gamma, px))
             .collect::<Vec<_>>();
         let mut palette_points = vec![InternalPixel::from_rgba(&gamma, &[0, 0, 0, 255])];
-        let pass = remap_image_plain_pass(2, &pixels, &palette_points, Some(&[255, 1]));
+        let pass = remap_image_plain_pass(2, &pixels, &palette_points, Some(&[255, 1]), None);
         apply_remap_feedback(&mut palette_points, &pass);
 
         assert!(palette_points[0].r > palette_points[0].b);
@@ -2607,7 +2869,7 @@ mod tests {
             .map(|px| InternalPixel::from_rgba(&gamma, px))
             .collect::<Vec<_>>();
         let (plain_palette, _, _) =
-            super::remap_image_plain(&rgba, 2, &palette, 0, Some(&[255, 1]), Some(&pixels));
+            super::remap_image_plain(&rgba, 2, &palette, 0, Some(&[255, 1]), Some(&pixels), None);
         let (palette, indices, counts) = remap_image_dithered(
             &rgba,
             2,
@@ -2616,6 +2878,7 @@ mod tests {
             None,
             settings,
             Some(&[255, 1]),
+            None,
             None,
             None,
         );
@@ -2669,7 +2932,7 @@ mod tests {
             [131u8, 131, 131, 255],
         )];
 
-        let (final_palette, _, _) = remap_image_plain(&rgba, 1, &seed, 2, None, None);
+        let (final_palette, _, _) = remap_image_plain(&rgba, 1, &seed, 2, None, None, None);
         assert_eq!(final_palette[0].1, [130, 130, 130, 255]);
     }
 
@@ -2854,5 +3117,92 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn background_identical_pixels_use_transparent() {
+        // When image == background, all pixels should map to transparent_index
+        let rgba = vec![255u8, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 0, 0, 0, 0];
+        let settings =
+            quantizer_settings(256, SpeedSettings::from_speed(4), 0.0, None, true, 0, 1.0);
+        let result =
+            super::quantize_indexed_with_background(&rgba, 2, 2, settings, None, Some(&rgba));
+        // Every pixel should have been mapped to transparent (matching background)
+        // Find the transparent palette index
+        let transparent_idx = result
+            .palette
+            .iter()
+            .position(|&c| c[3] == 0)
+            .expect("palette should contain a transparent entry");
+        for (i, &idx) in result.indices.iter().enumerate() {
+            assert_eq!(
+                idx as usize, transparent_idx,
+                "pixel {i} should be transparent_index"
+            );
+        }
+    }
+
+    #[test]
+    fn background_different_pixels_unaffected() {
+        // When image is completely different from background, results should be
+        // the same as without background
+        let image_rgba = vec![
+            255u8, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 128, 128, 0, 255,
+        ];
+        let bg_rgba = vec![0u8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]; // all transparent
+        let settings = quantizer_settings(
+            256,
+            SpeedSettings::from_speed(10),
+            0.0,
+            None,
+            true,
+            0,
+            0.0, // no dithering to simplify comparison
+        );
+        let without_bg =
+            super::quantize_indexed_with_background(&image_rgba, 2, 2, settings, None, None);
+        let with_bg = super::quantize_indexed_with_background(
+            &image_rgba,
+            2,
+            2,
+            settings,
+            None,
+            Some(&bg_rgba),
+        );
+        // All pixels are fully opaque and bg is fully transparent → bg_diff will be large
+        // So no pixel should be remapped to transparent. Output should be the same.
+        assert_eq!(without_bg.indices, with_bg.indices);
+    }
+
+    #[test]
+    fn background_disabled_without_transparent_entry() {
+        // If palette has no transparent entry, background is silently ignored
+        let rgba = vec![
+            255u8, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 128, 128, 128, 255,
+        ];
+        let settings =
+            quantizer_settings(4, SpeedSettings::from_speed(10), 0.0, None, true, 0, 0.0);
+        // All pixels are fully opaque, so the palette won't naturally contain a transparent entry
+        let result =
+            super::quantize_indexed_with_background(&rgba, 2, 2, settings, None, Some(&rgba));
+        // Without a transparent palette entry, background should have no effect
+        // (no crash, no panic)
+        assert_eq!(result.indices.len(), 4);
+        assert!(!result.palette.is_empty());
+    }
+
+    #[test]
+    fn background_none_backward_compatible() {
+        // quantize_indexed_with_background(..., None) should produce same result as
+        // quantize_indexed_with_importance(..., None)
+        let rgba = vec![
+            255u8, 0, 0, 255, 250, 0, 0, 255, 0, 255, 0, 255, 0, 250, 0, 255,
+        ];
+        let settings =
+            quantizer_settings(16, SpeedSettings::from_speed(10), 0.0, None, true, 0, 0.0);
+        let without = super::quantize_indexed_with_importance(&rgba, 2, 2, settings, None);
+        let with_bg = super::quantize_indexed_with_background(&rgba, 2, 2, settings, None, None);
+        assert_eq!(without.palette, with_bg.palette);
+        assert_eq!(without.indices, with_bg.indices);
     }
 }

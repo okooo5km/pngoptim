@@ -31,7 +31,7 @@ cargo run --release --bin xtask -- stability --run-id <id>
 
 | File | Lines | Purpose |
 |------|-------|---------|
-| `src/palette_quant.rs` | ~2462 | Core quantization: histogram, median cut, k-means, VP-tree nearest search, remap (plain + Floyd dithering), dither map, contrast maps |
+| `src/palette_quant.rs` | ~3200 | Core quantization: histogram, median cut, k-means, VP-tree nearest search, remap (plain + Floyd dithering), dither map, contrast maps, background-aware dithering |
 | `src/pipeline.rs` | ~850 | Processing pipeline: decode -> color management -> quantize -> encode. Hand-written PNG encoder with zlib-rs (dual mem_level). APNG detection/routing. Quality gating, metadata preservation, ICC/gAMA normalization |
 | `src/quality.rs` | ~257 | InternalPixel (gamma-weighted ARGB), quality<->MSE mapping, SpeedSettings, quality evaluation |
 | `src/cli.rs` | ~293 | CLI argument parsing (clap), QualityRange, output path logic |
@@ -50,6 +50,7 @@ cargo run --release --bin xtask -- stability --run-id <id>
 5. **Plain Remap** (`remap_image_plain`, `finalize_plain_remap`): Row-hint nearest search with importance-weighted feedback
 6. **Floyd Dithering** (`remap_image_dithered`, `dither_row`): Selective Floyd-Steinberg with dither map, serpentine scan, chunked parallelism
 7. **Contrast Maps** (`compute_contrast_maps`, `build_dither_map`): Edge detection + noise estimation for selective dithering
+8. **Background-Aware Dithering** (`quantize_indexed_with_background`, `remap_to_fixed_palette` with bg): Pixels matching background mapped to transparent index, enabling frame differencing optimization for GIF/APNG. 3-stage decision in dithered path (matches libimagequant remap.rs)
 
 ## Reference-First Discipline
 
@@ -79,7 +80,7 @@ All algorithm work follows reference-first methodology: read the reference imple
 
 - **H1 (CLI/pipeline integration)**: APNG auto-detection in `process_png_bytes()`, routes to `process_apng()` for lossless pass-through with optimizations
 - **H2 (lossless structure optimization)**: `fold_duplicate_frames()` merges identical consecutive frames, `minimize_frame_rects()` computes minimal change rectangles
-- **H3 (lossy quantization)**: Done — global shared palette from merged per-frame histograms, per-frame independent remap, worst-frame quality gating, indexed APNG output via png crate
+- **H3 (lossy quantization)**: Done — global shared palette from merged per-frame histograms, per-frame independent remap, worst-frame quality gating, indexed APNG output via png crate, background-aware dithering (canvas tracking per frame)
 - APNG files are automatically detected; no CLI flag needed
 - Quality/speed/dither parameters now apply to APNG (previously ignored)
 - `skip-if-larger` check applies to APNG output

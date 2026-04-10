@@ -464,14 +464,14 @@ fn validate_frame_bounds(
     Ok(())
 }
 
-fn rgba_len(width: u32, height: u32) -> Result<usize, AppError> {
+pub(crate) fn rgba_len(width: u32, height: u32) -> Result<usize, AppError> {
     (width as usize)
         .checked_mul(height as usize)
         .and_then(|pixels| pixels.checked_mul(4))
         .ok_or_else(|| AppError::Decode("APNG dimensions overflow RGBA buffer size".to_string()))
 }
 
-fn effective_dispose(frame: &ApngFrame, frame_index: usize) -> DisposeOp {
+pub(crate) fn effective_dispose(frame: &ApngFrame, frame_index: usize) -> DisposeOp {
     if frame_index == 0 && frame.dispose_op == DisposeOp::Previous {
         DisposeOp::Background
     } else {
@@ -479,7 +479,7 @@ fn effective_dispose(frame: &ApngFrame, frame_index: usize) -> DisposeOp {
     }
 }
 
-fn clear_region(
+pub(crate) fn clear_region(
     canvas: &mut [u8],
     canvas_width: u32,
     x_offset: u32,
@@ -496,7 +496,11 @@ fn clear_region(
     Ok(())
 }
 
-fn blend_frame(canvas: &mut [u8], canvas_width: u32, frame: &ApngFrame) -> Result<(), AppError> {
+pub(crate) fn blend_frame(
+    canvas: &mut [u8],
+    canvas_width: u32,
+    frame: &ApngFrame,
+) -> Result<(), AppError> {
     for local_y in 0..frame.height {
         for local_x in 0..frame.width {
             let src_idx = rgba_index(frame.width, local_x, local_y)?;
@@ -514,6 +518,26 @@ fn blend_frame(canvas: &mut [u8], canvas_width: u32, frame: &ApngFrame) -> Resul
         }
     }
     Ok(())
+}
+
+/// Extract RGBA sub-rect from a full canvas buffer.
+pub(crate) fn extract_subrect_rgba(
+    canvas: &[u8],
+    canvas_width: u32,
+    x_offset: u32,
+    y_offset: u32,
+    width: u32,
+    height: u32,
+) -> Vec<u8> {
+    let mut subrect = Vec::with_capacity((width as usize) * (height as usize) * 4);
+    for y in 0..height {
+        let src_y = (y_offset + y) as usize;
+        let src_x = x_offset as usize;
+        let start = (src_y * canvas_width as usize + src_x) * 4;
+        let end = start + (width as usize * 4);
+        subrect.extend_from_slice(&canvas[start..end]);
+    }
+    subrect
 }
 
 fn rgba_index(width: u32, x: u32, y: u32) -> Result<usize, AppError> {

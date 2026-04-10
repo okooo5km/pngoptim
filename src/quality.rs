@@ -152,6 +152,10 @@ impl InternalPixel {
         }
     }
 
+    pub(crate) fn is_fully_transparent(self) -> bool {
+        self.a < (1.0 / 255.0 * LIQ_WEIGHT_A as f32)
+    }
+
     pub(crate) fn diff(self, other: Self) -> f32 {
         let alpha_diff = other.a - self.a;
         let black_r = self.r - other.r;
