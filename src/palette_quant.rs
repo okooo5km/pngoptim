@@ -270,21 +270,17 @@ pub fn quantize_indexed_with_background(
         importance_map,
     );
 
-    // When background is provided, reserve one palette slot for a transparent
-    // entry by quantizing with max_colors-1. This matches libimagequant's
-    // add_fixed_color approach: the quantizer plans around the constraint
-    // instead of losing a useful color to a post-hoc replacement.
-    let reserve_transparent = background_rgba.is_some() && settings.max_colors > 2;
-    let quant_settings = if reserve_transparent {
-        QuantizerSettings {
-            max_colors: settings.max_colors - 1,
-            ..settings
-        }
-    } else {
-        settings
-    };
+    // When background is provided, inject a transparent color into the
+    // histogram so find_best_palette's mediancut naturally includes it.
+    // This matches libimagequant's add_fixed_color(RGBA(0,0,0,0)) approach:
+    // the palette selector knows about the transparent entry from the start
+    // and can plan around it, producing better color allocation.
+    let mut histogram = histogram;
+    if background_rgba.is_some() {
+        inject_fixed_transparent(&mut histogram);
+    }
 
-    let (mut palette, palette_error) = find_best_palette(&histogram, quant_settings);
+    let (mut palette, palette_error) = find_best_palette(&histogram, settings);
     if palette.is_empty() {
         palette = vec![PaletteEntry {
             color: InternalPixel::default(),
@@ -292,14 +288,6 @@ pub fn quantize_indexed_with_background(
         }];
     }
     sort_palette_entries(&mut palette);
-
-    // Append the reserved transparent entry (no color is lost)
-    if reserve_transparent && !palette.iter().any(|e| e.color.is_fully_transparent()) {
-        palette.push(PaletteEntry {
-            color: InternalPixel::default(),
-            popularity: 0.0,
-        });
-    }
 
     // Convert background RGBA to InternalPixel using the same gamma LUT
     let bg_pixels_storage = background_rgba.map(|bg| {
@@ -820,6 +808,48 @@ pub(crate) fn reposterize_histogram_map(map: &mut HistMap, posterize_bits: u8) {
         HashMap::with_capacity_and_hasher(new_capacity, U32HashBuilder::default()),
     );
     map.extend(old_map.into_iter().map(|(key, value)| (key & mask, value)));
+}
+
+/// Inject a fully-transparent fixed color into the histogram.
+/// This ensures find_best_palette's mediancut includes a transparent entry,
+/// matching libimagequant's `add_fixed_color(RGBA(0,0,0,0))` behavior.
+fn inject_fixed_transparent(histogram: &mut HistogramData) {
+    if histogram.items.is_empty() {
+        return;
+    }
+    // Check if a transparent entry already exists
+    if histogram
+        .items
+        .iter()
+        .any(|item| item.color.is_fully_transparent() && item.perceptual_weight > 0.0)
+    {
+        return;
+    }
+    // Add with minimum weight so it gets a palette slot but doesn't
+    // dominate color selection. Use a weight proportional to the average.
+    let min_weight =
+        (histogram.total_perceptual_weight / histogram.items.len() as f64 * 0.1).max(1e-6) as f32;
+    // Transparent pixel goes into cluster 0 (all high bits zero for RGBA=0,0,0,0)
+    let cluster_idx = 0usize;
+    let insert_pos = histogram.clusters[cluster_idx].end;
+    histogram.items.insert(
+        insert_pos,
+        HistItem {
+            color: InternalPixel::default(),
+            adjusted_weight: min_weight,
+            perceptual_weight: min_weight,
+            mc_color_weight: 0.0,
+            sort_value: 0,
+            likely_palette_index: 0,
+        },
+    );
+    histogram.total_perceptual_weight += f64::from(min_weight);
+    // Update cluster bounds: extend current cluster, shift all later clusters
+    histogram.clusters[cluster_idx].end += 1;
+    for c in (cluster_idx + 1)..MAX_CLUSTERS {
+        histogram.clusters[c].begin += 1;
+        histogram.clusters[c].end += 1;
+    }
 }
 
 pub(crate) fn finalize_histogram(map: HistMap, gamma: &[f32; 256]) -> HistogramData {
