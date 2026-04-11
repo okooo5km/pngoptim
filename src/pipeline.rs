@@ -432,8 +432,24 @@ fn quantize_apng_frames(
     }
     let histogram = finalize_histogram(global_map, &gamma);
 
-    // Step 3: Find best palette and sort
-    let (mut palette, _palette_error) = find_best_palette(&histogram, quantizer);
+    // Step 3: Find best palette and sort.
+    // If any frame uses Over blend, reserve one transparent slot up front so
+    // background-aware dithering can map unchanged pixels to transparency
+    // without evicting a real color after quantization.
+    let reserve_transparent = apng
+        .frames
+        .iter()
+        .any(|frame| frame.blend_op == png::BlendOp::Over)
+        && quantizer.max_colors > 2;
+    let palette_settings = if reserve_transparent {
+        crate::palette_quant::QuantizerSettings {
+            max_colors: quantizer.max_colors - 1,
+            ..quantizer
+        }
+    } else {
+        quantizer
+    };
+    let (mut palette, _palette_error) = find_best_palette(&histogram, palette_settings);
     if palette.is_empty() {
         palette = vec![crate::palette_quant::PaletteEntry {
             color: InternalPixel::default(),
@@ -442,20 +458,13 @@ fn quantize_apng_frames(
     }
     sort_palette_entries(&mut palette);
 
-    // Ensure palette contains a transparent entry for background-aware dithering.
-    // Without this, if all frames are fully opaque the palette won't naturally have
-    // a transparent entry, silently disabling background-aware dithering.
-    if !palette.iter().any(|e| e.color.is_fully_transparent()) {
-        let transparent_entry = crate::palette_quant::PaletteEntry {
+    // Append the reserved transparent entry after sorting so remap can locate it
+    // without sacrificing a real palette color.
+    if reserve_transparent && !palette.iter().any(|e| e.color.is_fully_transparent()) {
+        palette.push(crate::palette_quant::PaletteEntry {
             color: InternalPixel::default(),
             popularity: 0.0,
-        };
-        if palette.len() < DEFAULT_MAX_COLORS {
-            palette.push(transparent_entry);
-        } else if !palette.is_empty() {
-            // Replace the least popular entry (last after sort)
-            *palette.last_mut().unwrap() = transparent_entry;
-        }
+        });
     }
 
     let global_palette: Vec<(InternalPixel, [u8; 4])> = palette
@@ -542,14 +551,8 @@ fn quantize_apng_frames(
             None
         };
 
-        let indices = remap_to_fixed_palette(
-            &frame.rgba,
-            fw,
-            fh,
-            &global_palette,
-            quantizer,
-            bg_ref,
-        );
+        let indices =
+            remap_to_fixed_palette(&frame.rgba, fw, fh, &global_palette, quantizer, bg_ref);
 
         // Quality evaluation using global palette (matches actual output)
         let remapped_rgba = remapped_rgba_from_indices(&indices, &global_rgba_palette);

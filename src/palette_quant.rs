@@ -270,7 +270,21 @@ pub fn quantize_indexed_with_background(
         importance_map,
     );
 
-    let (mut palette, palette_error) = find_best_palette(&histogram, settings);
+    // When background is provided, reserve one palette slot for a transparent
+    // entry by quantizing with max_colors-1. This matches libimagequant's
+    // add_fixed_color approach: the quantizer plans around the constraint
+    // instead of losing a useful color to a post-hoc replacement.
+    let reserve_transparent = background_rgba.is_some() && settings.max_colors > 2;
+    let quant_settings = if reserve_transparent {
+        QuantizerSettings {
+            max_colors: settings.max_colors - 1,
+            ..settings
+        }
+    } else {
+        settings
+    };
+
+    let (mut palette, palette_error) = find_best_palette(&histogram, quant_settings);
     if palette.is_empty() {
         palette = vec![PaletteEntry {
             color: InternalPixel::default(),
@@ -279,23 +293,12 @@ pub fn quantize_indexed_with_background(
     }
     sort_palette_entries(&mut palette);
 
-    // Ensure palette contains a transparent entry when background is provided,
-    // so background-aware dithering can assign pixels to transparent.
-    if background_rgba.is_some()
-        && !palette
-            .iter()
-            .any(|e| e.color.is_fully_transparent())
-    {
-        let transparent_entry = PaletteEntry {
+    // Append the reserved transparent entry (no color is lost)
+    if reserve_transparent && !palette.iter().any(|e| e.color.is_fully_transparent()) {
+        palette.push(PaletteEntry {
             color: InternalPixel::default(),
             popularity: 0.0,
-        };
-        if palette.len() < settings.max_colors {
-            palette.push(transparent_entry);
-        } else if !palette.is_empty() {
-            // Replace the least popular entry (last after sort)
-            *palette.last_mut().unwrap() = transparent_entry;
-        }
+        });
     }
 
     // Convert background RGBA to InternalPixel using the same gamma LUT
@@ -1775,6 +1778,7 @@ pub(crate) fn remap_to_fixed_palette(
             settings.use_dither_map,
             generate_dither_map,
             None,
+            !effective_bg.is_empty(),
         );
         let tree = NearestTree::new(&palette_points);
         let output_image_is_remapped = plain_pass.is_some();
@@ -2116,6 +2120,7 @@ fn remap_image_dithered(
         settings.use_dither_map,
         generate_dither_map,
         edges_map,
+        !effective_bg.is_empty(),
     );
     let tree = NearestTree::new(&palette_points);
     let mut indices = plain_pass
@@ -2398,11 +2403,19 @@ fn select_dither_map(
     use_dither_map: DitherMapMode,
     generate_dither_map: bool,
     edges_map: Option<&[u8]>,
+    uses_background: bool,
 ) -> Vec<u8> {
     if generate_dither_map {
         let generated = plain_pass
             .map(|plain_pass| {
-                build_dither_map(pixels, width, height, &plain_pass.indices, palette_points)
+                build_dither_map(
+                    pixels,
+                    width,
+                    height,
+                    &plain_pass.indices,
+                    palette_points,
+                    uses_background,
+                )
             })
             .unwrap_or_default();
         if !generated.is_empty() {
@@ -2492,7 +2505,8 @@ fn build_dither_map(
     width: usize,
     height: usize,
     remapped_indices: &[u8],
-    _palette: &[InternalPixel],
+    palette: &[InternalPixel],
+    uses_background: bool,
 ) -> Vec<u8> {
     if width < 4 || height < 4 || pixels.len() != width.saturating_mul(height) {
         return Vec::new();
@@ -2512,6 +2526,15 @@ fn build_dither_map(
         #[allow(clippy::needless_range_loop)]
         for col in 1..width {
             let px = row_pixels[col];
+            // When background is set, transparent pixels may or may not
+            // create edges — assume no edge (matches libimagequant behavior).
+            if uses_background
+                && palette
+                    .get(px as usize)
+                    .is_some_and(|c| c.is_fully_transparent())
+            {
+                continue;
+            }
             if px != last_pixel || col == width - 1 {
                 let mut neighbor_count = 10usize * (col - last_col);
                 for i in last_col..col {
@@ -2920,6 +2943,7 @@ mod tests {
             DitherMapMode::Enabled,
             false,
             Some(&edges),
+            false,
         );
 
         assert_eq!(dither_map, edges);
@@ -2937,6 +2961,7 @@ mod tests {
             DitherMapMode::Enabled,
             true,
             Some(&edges),
+            false,
         );
 
         assert_eq!(dither_map, edges);
@@ -3209,10 +3234,7 @@ mod tests {
         assert!(!result.palette.is_empty());
         // Verify a transparent entry was injected into the palette
         assert!(
-            result
-                .palette
-                .iter()
-                .any(|rgba| rgba[3] == 0),
+            result.palette.iter().any(|rgba| rgba[3] == 0),
             "palette should contain a transparent entry when background is provided"
         );
     }
