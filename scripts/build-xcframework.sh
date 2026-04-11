@@ -18,8 +18,8 @@ MERGED_LIB_NAME="libpngoptim_merged.a"
 export MACOSX_DEPLOYMENT_TARGET=10.15
 export IPHONEOS_DEPLOYMENT_TARGET=13.0
 
-# Force lcms2-sys to build from source (needed for iOS cross-compilation)
-export LCMS2_NO_PKG_CONFIG=1
+# lcms2 static linking is now enforced via Cargo.toml features = ["static"],
+# so LCMS2_NO_PKG_CONFIG=1 is no longer needed here.
 
 LOCAL_ONLY=false
 if [[ "${1:-}" == "--local-only" ]]; then
