@@ -43,16 +43,20 @@ jobs:
             target/x86_64-apple-darwin/release/pngoptim \
             -output pngoptim
 
+      # Package into a freshly-wiped dist/ so stale artifacts can never be
+      # uploaded, even if this ever moves to a self-hosted runner that keeps
+      # its workspace between runs.
       - name: Package
         run: |
           VERSION=${GITHUB_REF_NAME#v}
-          tar czf pngoptim_${VERSION}_darwin_universal.tar.gz pngoptim
-          shasum -a 256 pngoptim_${VERSION}_darwin_universal.tar.gz > pngoptim_${VERSION}_darwin_universal.tar.gz.sha256
+          rm -rf dist && mkdir dist
+          tar czf dist/pngoptim_${VERSION}_darwin_universal.tar.gz pngoptim
+          cd dist && shasum -a 256 pngoptim_${VERSION}_darwin_universal.tar.gz > pngoptim_${VERSION}_darwin_universal.tar.gz.sha256
 
       - uses: actions/upload-artifact@v7
         with:
           name: macos-universal
-          path: pngoptim_*.tar.gz*
+          path: dist/pngoptim_*.tar.gz*
 
   build-linux-x86_64:
     name: Linux x86_64
@@ -74,13 +78,14 @@ jobs:
       - name: Package
         run: |
           VERSION=${GITHUB_REF_NAME#v}
-          tar czf pngoptim_${VERSION}_linux_x86_64.tar.gz -C target/release pngoptim
-          sha256sum pngoptim_${VERSION}_linux_x86_64.tar.gz > pngoptim_${VERSION}_linux_x86_64.tar.gz.sha256
+          rm -rf dist && mkdir dist
+          tar czf dist/pngoptim_${VERSION}_linux_x86_64.tar.gz -C target/release pngoptim
+          cd dist && sha256sum pngoptim_${VERSION}_linux_x86_64.tar.gz > pngoptim_${VERSION}_linux_x86_64.tar.gz.sha256
 
       - uses: actions/upload-artifact@v7
         with:
           name: linux-x86_64
-          path: pngoptim_*.tar.gz*
+          path: dist/pngoptim_*.tar.gz*
 
   build-linux-arm64:
     name: Linux arm64
@@ -102,13 +107,14 @@ jobs:
       - name: Package
         run: |
           VERSION=${GITHUB_REF_NAME#v}
-          tar czf pngoptim_${VERSION}_linux_arm64.tar.gz -C target/release pngoptim
-          sha256sum pngoptim_${VERSION}_linux_arm64.tar.gz > pngoptim_${VERSION}_linux_arm64.tar.gz.sha256
+          rm -rf dist && mkdir dist
+          tar czf dist/pngoptim_${VERSION}_linux_arm64.tar.gz -C target/release pngoptim
+          cd dist && sha256sum pngoptim_${VERSION}_linux_arm64.tar.gz > pngoptim_${VERSION}_linux_arm64.tar.gz.sha256
 
       - uses: actions/upload-artifact@v7
         with:
           name: linux-arm64
-          path: pngoptim_*.tar.gz*
+          path: dist/pngoptim_*.tar.gz*
 
   build-windows:
     name: Windows x86_64
@@ -131,13 +137,14 @@ jobs:
         shell: bash
         run: |
           VERSION=${GITHUB_REF_NAME#v}
-          7z a pngoptim_${VERSION}_windows_x86_64.zip ./target/release/pngoptim.exe
-          sha256sum pngoptim_${VERSION}_windows_x86_64.zip > pngoptim_${VERSION}_windows_x86_64.zip.sha256
+          rm -rf dist && mkdir dist
+          7z a dist/pngoptim_${VERSION}_windows_x86_64.zip ./target/release/pngoptim.exe
+          cd dist && sha256sum pngoptim_${VERSION}_windows_x86_64.zip > pngoptim_${VERSION}_windows_x86_64.zip.sha256
 
       - uses: actions/upload-artifact@v7
         with:
           name: windows-x86_64
-          path: pngoptim_*.zip*
+          path: dist/pngoptim_*.zip*
 
   build-xcframework:
     name: XCFramework
@@ -183,9 +190,15 @@ jobs:
     needs: [build-macos, build-linux-x86_64, build-linux-arm64, build-windows, build-xcframework]
     runs-on: ubuntu-latest
     steps:
+      # Wipe the download directory first so leftovers can never reach the
+      # release if this ever moves to a self-hosted runner.
+      - name: Clean workspace
+        run: rm -rf dist
+
       - uses: actions/download-artifact@v8
         with:
           merge-multiple: true
+          path: dist
 
       - name: Create GitHub Release
         env:
@@ -195,7 +208,7 @@ jobs:
             --repo ${{ github.repository }} \
             --title "${{ github.ref_name }}" \
             --generate-notes \
-            pngoptim_* PNGOptimCore.xcframework.zip
+            dist/pngoptim_* dist/PNGOptimCore.xcframework.zip
 
   homebrew:
     name: Update Homebrew Tap
@@ -203,16 +216,20 @@ jobs:
     if: "!contains(github.ref_name, '-')"
     runs-on: ubuntu-latest
     steps:
+      - name: Clean workspace
+        run: rm -rf dist
+
       - uses: actions/download-artifact@v8
         with:
           name: macos-universal
+          path: dist
 
       - name: Update formula
         env:
           HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
         run: |
           VERSION=${GITHUB_REF_NAME#v}
-          SHA256=$(cat pngoptim_${VERSION}_darwin_universal.tar.gz.sha256 | awk '{print $1}')
+          SHA256=$(cat dist/pngoptim_${VERSION}_darwin_universal.tar.gz.sha256 | awk '{print $1}')
 
           git clone "https://x-access-token:${HOMEBREW_TAP_TOKEN}@github.com/okooo5km/homebrew-tap.git" homebrew-tap
 
