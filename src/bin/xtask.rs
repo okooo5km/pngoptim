@@ -3132,6 +3132,7 @@ fn make_fixture_2frame(
         frame2[1] = [0, 255, 0, 255];
     }
     ApngImage {
+        color_metadata: Default::default(),
         width: w,
         height: h,
         num_plays: 0,
@@ -3174,6 +3175,7 @@ fn make_fixture_2frame_semi(
     let frame1: Vec<[u8; 4]> = vec![[255, 0, 0, 255]; n];
     let frame2: Vec<[u8; 4]> = vec![[0, 255, 0, 128]; n]; // semi-transparent
     ApngImage {
+        color_metadata: Default::default(),
         width: w,
         height: h,
         num_plays: 0,
@@ -3209,6 +3211,7 @@ fn make_fixture_3frame_prev(w: u32, h: u32, blend: png::BlendOp) -> pngoptim::ap
     use pngoptim::apng::{ApngFrame, ApngImage};
     let n = (w * h) as usize;
     ApngImage {
+        color_metadata: Default::default(),
         width: w,
         height: h,
         num_plays: 0,
@@ -3257,6 +3260,7 @@ fn make_fixture_identical(w: u32, h: u32) -> pngoptim::apng::ApngImage {
     let pixels: Vec<[u8; 4]> = vec![[255, 0, 0, 255]; n];
     let different: Vec<[u8; 4]> = vec![[0, 255, 0, 255]; n];
     ApngImage {
+        color_metadata: Default::default(),
         width: w,
         height: h,
         num_plays: 0,
@@ -3314,6 +3318,7 @@ fn make_fixture_subrect(w: u32, h: u32) -> pngoptim::apng::ApngImage {
     use pngoptim::apng::{ApngFrame, ApngImage};
     let n = (w * h) as usize;
     ApngImage {
+        color_metadata: Default::default(),
         width: w,
         height: h,
         num_plays: 0,
@@ -3367,6 +3372,7 @@ fn make_fixture_no_change(w: u32, h: u32) -> pngoptim::apng::ApngImage {
     let n = (w * h) as usize;
     let pixels: Vec<[u8; 4]> = vec![[128, 64, 32, 255]; n];
     ApngImage {
+        color_metadata: Default::default(),
         width: w,
         height: h,
         num_plays: 0,
@@ -3403,6 +3409,7 @@ fn make_fixture_default_image(w: u32, h: u32) -> pngoptim::apng::ApngImage {
     use pngoptim::apng::{ApngDefaultImage, ApngFrame, ApngImage};
     let n = (w * h) as usize;
     ApngImage {
+        color_metadata: Default::default(),
         width: w,
         height: h,
         num_plays: 0,
@@ -3440,6 +3447,7 @@ fn make_fixture_single_frame(w: u32, h: u32) -> pngoptim::apng::ApngImage {
     use pngoptim::apng::{ApngFrame, ApngImage};
     let n = (w * h) as usize;
     ApngImage {
+        color_metadata: Default::default(),
         width: w,
         height: h,
         num_plays: 0,

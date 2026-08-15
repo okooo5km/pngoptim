@@ -79,6 +79,11 @@ struct PreservedMetadata {
     srgb: Option<png::SrgbRenderingIntent>,
     pixel_dims: Option<png::PixelDimensions>,
     icc_profile: Option<Vec<u8>>,
+    /// Coding-independent code points (cICP): primaries/transfer/matrix/range.
+    /// Not covered by the ICC/gAMA/cHRM normalization path below — cICP is an
+    /// independent, coexisting signal (e.g. HDR PQ/HLG transfer characteristics)
+    /// that must be preserved verbatim regardless of what happens to ICC/gAMA/cHRM.
+    cicp: Option<png::CodingIndependentCodePoints>,
     exif_metadata: Option<Vec<u8>>,
     uncompressed_latin1_text: Vec<png::text_metadata::TEXtChunk>,
     compressed_latin1_text: Vec<png::text_metadata::ZTXtChunk>,
@@ -116,7 +121,30 @@ pub fn process_png_bytes(
     let mut rgba = image::load_from_memory_with_format(input_bytes, ImageFormat::Png)
         .map_err(|e| AppError::Decode(format!("failed to decode PNG: {e}")))?
         .to_rgba8();
-    if !options.no_icc {
+    // HDR guard: a cICP chunk with a PQ (16) or HLG (18) transfer function marks the
+    // pixel data as HDR. `normalize_rgba_to_srgb_if_needed` assumes an SDR tone
+    // response (it builds an ICC transform straight to sRGB via lcms2), so running
+    // it on HDR samples would silently corrupt them — clipping/misinterpreting the
+    // PQ/HLG-encoded values as if they were gamma-encoded SDR. We skip normalization
+    // whenever cICP says the source is HDR, independent of `--no-icc`, and leave the
+    // original iCCP/gAMA/cHRM/cICP chunks untouched so the pixel data and its
+    // declared color metadata stay consistent. This is a defensive guard for direct
+    // users of pngoptim; Zipic's own pipeline already tone-maps HDR sources upstream
+    // before handing pixels to pngoptim (see P0), so no quantization math changes.
+    //
+    // When cICP is present but declares an SDR transfer function (e.g. sRGB=13,
+    // BT.709=1), normalization still runs as before (existing behavior), and cICP is
+    // still passed through unchanged in `metadata` below. Note this is technically
+    // imprecise if the source's cICP primaries differ from sRGB (rare in practice for
+    // SDR PNGs): the pixels get converted to the sRGB gamut but the passed-through
+    // cICP chunk keeps describing the original primaries. Fixing that fully would
+    // require rewriting cICP to sRGB's code points (1/13/0/1) post-normalization,
+    // which is out of scope here — flagged as a TODO.
+    let is_hdr_cicp = input_metadata
+        .as_ref()
+        .and_then(|m| m.cicp)
+        .is_some_and(|c| matches!(c.transfer_function, 16 | 18));
+    if !options.no_icc && !is_hdr_cicp {
         normalize_rgba_to_srgb_if_needed(
             rgba.as_mut(),
             input_metadata.as_ref(),
@@ -614,6 +642,7 @@ fn quantize_apng_frames(
         palette: global_rgba_palette,
         default_image_indices,
         frames: indexed_frames,
+        color_metadata: apng.color_metadata.clone(),
     };
 
     Ok((indexed_apng, worst_quality))
@@ -743,7 +772,7 @@ fn encode_indexed_png_to_vec(
 
 const PNG_SIGNATURE: [u8; 8] = [137, 80, 78, 71, 13, 10, 26, 10];
 
-fn write_png_chunk(out: &mut Vec<u8>, chunk_type: &[u8; 4], data: &[u8]) {
+pub(crate) fn write_png_chunk(out: &mut Vec<u8>, chunk_type: &[u8; 4], data: &[u8]) {
     out.extend_from_slice(&(data.len() as u32).to_be_bytes());
     out.extend_from_slice(chunk_type);
     out.extend_from_slice(data);
@@ -813,6 +842,19 @@ fn encode_indexed_png_raw(
 
     // Metadata chunks (only if not stripped)
     if !strip && let Some(meta) = metadata {
+        // cICP — must precede PLTE and IDAT (spec-enforced by decoders, including
+        // the `png` crate we use for reading). Written first among metadata chunks
+        // so a future chunk insertion never accidentally lands it after PLTE.
+        if let Some(cicp) = meta.cicp {
+            let data = [
+                cicp.color_primaries,
+                cicp.transfer_function,
+                cicp.matrix_coefficients,
+                cicp.is_video_full_range_image as u8,
+            ];
+            write_png_chunk(&mut out, b"cICP", &data);
+        }
+
         // pHYs
         if let Some(pd) = meta.pixel_dims {
             let mut phys = [0u8; 9];
@@ -1013,11 +1055,26 @@ fn extract_metadata(input_bytes: &[u8]) -> Option<PreservedMetadata> {
     let info = reader.info();
 
     Some(PreservedMetadata {
+        // KNOWN PRE-EXISTING ISSUE (found while implementing P2, left as-is to avoid
+        // scope creep — see final report / flagged follow-up task): `Info::source_gamma`/
+        // `source_chromaticities` are write-only fields the `png` crate's *encoder*
+        // uses to serialize gAMA/cHRM — the decoder never populates them (confirmed
+        // against png 0.18.1's decoder, which only ever writes `gama_chunk`/
+        // `chrm_chunk`). So `info.source_gamma`/`info.source_chromaticities` are
+        // always `None` right after a decode, meaning gAMA/cHRM passthrough for
+        // *static* PNGs without an sRGB chunk or ICC profile has silently never
+        // worked. Not fixed here: switching to `gama_chunk`/`chrm_chunk` would also
+        // make the ICC-less gamma/chroma branch of `normalize_rgba_to_srgb_if_needed`
+        // live for the first time (currently unreachable via real decodes), which is
+        // a real behavior change beyond P2's scope (cICP + HDR guard + APNG
+        // passthrough) and needs its own regression pass. The APNG color-metadata
+        // path added in P2 (see `apng::decode_apng`) reads the correct fields.
         source_gamma: info.source_gamma,
         source_chromaticities: info.source_chromaticities,
         srgb: info.srgb,
         pixel_dims: info.pixel_dims,
         icc_profile: info.icc_profile.as_ref().map(|v| v.as_ref().to_vec()),
+        cicp: info.coding_independent_code_points,
         exif_metadata: info.exif_metadata.as_ref().map(|v| v.as_ref().to_vec()),
         uncompressed_latin1_text: info.uncompressed_latin1_text.clone(),
         compressed_latin1_text: info.compressed_latin1_text.clone(),
@@ -1147,9 +1204,9 @@ mod tests {
     use lcms2::Profile;
 
     use super::{
-        PreservedMetadata, apply_posterize_palette, indexed_bit_depth,
-        normalize_rgba_to_srgb_if_needed, pack_indices_by_bit_depth, remapped_rgba_from_indices,
-        skip_if_larger_max_file_size,
+        PipelineOptions, PreservedMetadata, apply_posterize_palette, indexed_bit_depth,
+        normalize_rgba_to_srgb_if_needed, pack_indices_by_bit_depth, process_png_bytes,
+        remapped_rgba_from_indices, skip_if_larger_max_file_size,
     };
 
     #[test]
@@ -1241,5 +1298,182 @@ mod tests {
         assert_eq!(output.srgb, Some(png::SrgbRenderingIntent::Perceptual));
         assert_eq!(output.source_gamma, None);
         assert_eq!(output.source_chromaticities, None);
+    }
+
+    /// Builds a minimal RGBA PNG carrying an optional cICP chunk and/or ICC profile,
+    /// for exercising the static-PNG cICP passthrough / HDR-guard path end to end.
+    /// RGBA has no PLTE chunk, so writing cICP right after `write_header()` (before
+    /// `write_image_data`) is a valid position (still before IDAT).
+    fn encode_test_rgba_png(
+        width: u32,
+        height: u32,
+        rgba: &[u8],
+        icc_profile: Option<Vec<u8>>,
+        cicp: Option<png::CodingIndependentCodePoints>,
+    ) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut info = png::Info::default();
+        info.width = width;
+        info.height = height;
+        info.color_type = png::ColorType::Rgba;
+        info.bit_depth = png::BitDepth::Eight;
+        if let Some(icc) = icc_profile {
+            info.icc_profile = Some(std::borrow::Cow::Owned(icc));
+        }
+        let encoder = png::Encoder::with_info(&mut out, info).expect("with_info");
+        let mut writer = encoder.write_header().expect("write header");
+        if let Some(cicp) = cicp {
+            let data = [
+                cicp.color_primaries,
+                cicp.transfer_function,
+                cicp.matrix_coefficients,
+                cicp.is_video_full_range_image as u8,
+            ];
+            writer
+                .write_chunk(png::chunk::cICP, &data)
+                .expect("write cICP chunk");
+        }
+        writer.write_image_data(rgba).expect("write image data");
+        drop(writer);
+        out
+    }
+
+    /// Parse the top-level chunk type sequence of an encoded PNG, for asserting
+    /// chunk ordering (e.g. "cICP comes before PLTE").
+    fn chunk_types(png_bytes: &[u8]) -> Vec<[u8; 4]> {
+        let mut types = Vec::new();
+        let mut pos = 8usize; // skip signature
+        while pos + 8 <= png_bytes.len() {
+            let len = u32::from_be_bytes(png_bytes[pos..pos + 4].try_into().unwrap()) as usize;
+            let mut t = [0u8; 4];
+            t.copy_from_slice(&png_bytes[pos + 4..pos + 8]);
+            let is_iend = &t == b"IEND";
+            types.push(t);
+            pos += 8 + len + 4;
+            if is_iend {
+                break;
+            }
+        }
+        types
+    }
+
+    fn hdr_pq_cicp() -> png::CodingIndependentCodePoints {
+        png::CodingIndependentCodePoints {
+            color_primaries: 9,     // BT.2020
+            transfer_function: 16,  // PQ (SMPTE ST 2084)
+            matrix_coefficients: 0, // RGB
+            is_video_full_range_image: true,
+        }
+    }
+
+    fn sdr_srgb_cicp() -> png::CodingIndependentCodePoints {
+        png::CodingIndependentCodePoints {
+            color_primaries: 1,     // BT.709
+            transfer_function: 13,  // sRGB
+            matrix_coefficients: 0, // RGB
+            is_video_full_range_image: true,
+        }
+    }
+
+    #[test]
+    fn cicp_round_trips_through_static_pipeline_and_precedes_plte() {
+        let rgba = vec![
+            10u8, 20, 30, 255, // px0
+            200, 210, 220, 255, // px1
+            5, 6, 7, 255, // px2
+            250, 240, 230, 255, // px3
+        ];
+        let input = encode_test_rgba_png(2, 2, &rgba, None, Some(hdr_pq_cicp()));
+
+        let result = process_png_bytes(&input, PipelineOptions::default()).expect("process PNG");
+
+        let types = chunk_types(&result.png_data);
+        let cicp_pos = types
+            .iter()
+            .position(|t| t == b"cICP")
+            .expect("cICP present in output");
+        let plte_pos = types
+            .iter()
+            .position(|t| t == b"PLTE")
+            .expect("PLTE present in output");
+        assert!(cicp_pos < plte_pos, "cICP must precede PLTE: {types:?}");
+
+        // Verify the cICP payload survived byte-for-byte by decoding the output.
+        let decoder = png::Decoder::new(std::io::Cursor::new(&result.png_data));
+        let reader = decoder.read_info().expect("read output info");
+        assert_eq!(
+            reader.info().coding_independent_code_points,
+            Some(hdr_pq_cicp())
+        );
+    }
+
+    #[test]
+    fn stripped_output_omits_cicp() {
+        let rgba = vec![10u8, 20, 30, 255, 200, 210, 220, 255, 5, 6, 7, 255, 250, 240, 230, 255];
+        let input = encode_test_rgba_png(2, 2, &rgba, None, Some(hdr_pq_cicp()));
+
+        let result = process_png_bytes(
+            &input,
+            PipelineOptions {
+                strip: true,
+                ..PipelineOptions::default()
+            },
+        )
+        .expect("process PNG");
+
+        assert!(!chunk_types(&result.png_data).contains(b"cICP"));
+    }
+
+    #[test]
+    fn pq_cicp_skips_srgb_normalization_and_keeps_iccp() {
+        let rgba = vec![10u8, 20, 30, 255, 200, 210, 220, 255, 5, 6, 7, 255, 250, 240, 230, 255];
+        let icc = Profile::new_srgb().icc().expect("serialize sRGB ICC");
+        let input = encode_test_rgba_png(2, 2, &rgba, Some(icc), Some(hdr_pq_cicp()));
+
+        let result = process_png_bytes(&input, PipelineOptions::default()).expect("process PNG");
+
+        let types = chunk_types(&result.png_data);
+        assert!(
+            types.contains(b"iCCP"),
+            "HDR (PQ cICP) input must keep its iCCP chunk untouched: {types:?}"
+        );
+        assert!(
+            !types.contains(b"sRGB"),
+            "HDR (PQ cICP) input must not be normalized into an sRGB chunk: {types:?}"
+        );
+
+        // Same check with --no-icc: behavior must be identical (guard is unconditional).
+        let result_no_icc = process_png_bytes(
+            &input,
+            PipelineOptions {
+                no_icc: true,
+                ..PipelineOptions::default()
+            },
+        )
+        .expect("process PNG with --no-icc");
+        let types_no_icc = chunk_types(&result_no_icc.png_data);
+        assert!(types_no_icc.contains(b"iCCP"));
+        assert!(!types_no_icc.contains(b"sRGB"));
+    }
+
+    #[test]
+    fn sdr_cicp_still_normalizes_icc_but_keeps_cicp_passthrough() {
+        let rgba = vec![10u8, 20, 30, 255, 200, 210, 220, 255, 5, 6, 7, 255, 250, 240, 230, 255];
+        let icc = Profile::new_srgb().icc().expect("serialize sRGB ICC");
+        let input = encode_test_rgba_png(2, 2, &rgba, Some(icc), Some(sdr_srgb_cicp()));
+
+        let result = process_png_bytes(&input, PipelineOptions::default()).expect("process PNG");
+
+        let types = chunk_types(&result.png_data);
+        // SDR cICP: normalization still runs as before (iCCP -> sRGB chunk)...
+        assert!(types.contains(b"sRGB"));
+        assert!(!types.contains(b"iCCP"));
+        // ...but cICP itself is still passed through unchanged.
+        let decoder = png::Decoder::new(std::io::Cursor::new(&result.png_data));
+        let reader = decoder.read_info().expect("read output info");
+        assert_eq!(
+            reader.info().coding_independent_code_points,
+            Some(sdr_srgb_cicp())
+        );
     }
 }

@@ -1,8 +1,23 @@
+use std::borrow::Cow;
 use std::io::Cursor;
 
 use png::{BlendOp, ColorType, DisposeOp, Transformations};
 
 use crate::error::AppError;
+use crate::pipeline::write_png_chunk;
+
+/// Color-space metadata carried alongside APNG pixel data, extracted from the
+/// input's PNG chunks and passed through to the encoded output untouched (P2:
+/// APNG never performs ICC normalization, so this is pure passthrough — no new
+/// color conversions are introduced here).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ApngColorMetadata {
+    pub icc_profile: Option<Vec<u8>>,
+    pub source_gamma: Option<png::ScaledFloat>,
+    pub source_chromaticities: Option<png::SourceChromaticities>,
+    pub srgb: Option<png::SrgbRenderingIntent>,
+    pub cicp: Option<png::CodingIndependentCodePoints>,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ApngDefaultImage {
@@ -29,6 +44,7 @@ pub struct ApngImage {
     pub num_plays: u32,
     pub default_image: Option<ApngDefaultImage>,
     pub frames: Vec<ApngFrame>,
+    pub color_metadata: ApngColorMetadata,
 }
 
 pub fn decode_apng(input: &[u8]) -> Result<Option<ApngImage>, AppError> {
@@ -45,6 +61,18 @@ pub fn decode_apng(input: &[u8]) -> Result<Option<ApngImage>, AppError> {
     let height = info.height;
     let Some(animation) = animation else {
         return Ok(None);
+    };
+    let color_metadata = ApngColorMetadata {
+        icc_profile: info.icc_profile.as_ref().map(|v| v.as_ref().to_vec()),
+        // NOTE: `Info::source_gamma`/`source_chromaticities` are write-only fields the
+        // `png` crate's *encoder* uses to serialize gAMA/cHRM — the decoder never
+        // populates them. On decode, the parsed chunk values live in `gama_chunk`/
+        // `chrm_chunk` instead. We read those here and feed them back into the
+        // encoder-facing `source_gamma`/`source_chromaticities` fields on write.
+        source_gamma: info.gama_chunk,
+        source_chromaticities: info.chrm_chunk,
+        srgb: info.srgb,
+        cicp: info.coding_independent_code_points,
     };
     let num_plays = animation.num_plays;
     let has_separate_default_image = first_frame_control.is_none();
@@ -111,6 +139,7 @@ pub fn decode_apng(input: &[u8]) -> Result<Option<ApngImage>, AppError> {
         num_plays,
         default_image,
         frames,
+        color_metadata,
     }))
 }
 
@@ -188,7 +217,8 @@ pub fn encode_apng(apng: &ApngImage) -> Result<Vec<u8>, AppError> {
     }
 
     let mut output = Vec::new();
-    let mut encoder = png::Encoder::new(&mut output, apng.width, apng.height);
+    let mut encoder =
+        new_encoder_with_color_metadata(&mut output, apng.width, apng.height, &apng.color_metadata)?;
     encoder.set_color(ColorType::Rgba);
     encoder.set_depth(png::BitDepth::Eight);
     encoder
@@ -249,7 +279,7 @@ pub fn encode_apng(apng: &ApngImage) -> Result<Vec<u8>, AppError> {
     writer
         .finish()
         .map_err(|e| AppError::Encode(format!("failed to finish APNG encoding: {e}")))?;
-    Ok(output)
+    Ok(splice_cicp_after_ihdr(output, apng.color_metadata.cicp))
 }
 
 #[derive(Debug, Clone)]
@@ -273,6 +303,7 @@ pub struct IndexedApngImage {
     pub palette: Vec<[u8; 4]>,
     pub default_image_indices: Option<Vec<u8>>,
     pub frames: Vec<IndexedApngFrame>,
+    pub color_metadata: ApngColorMetadata,
 }
 
 pub fn encode_indexed_apng(image: &IndexedApngImage) -> Result<Vec<u8>, AppError> {
@@ -315,7 +346,12 @@ pub fn encode_indexed_apng(image: &IndexedApngImage) -> Result<Vec<u8>, AppError
         };
 
     let mut output = Vec::new();
-    let mut encoder = png::Encoder::new(&mut output, image.width, image.height);
+    let mut encoder = new_encoder_with_color_metadata(
+        &mut output,
+        image.width,
+        image.height,
+        &image.color_metadata,
+    )?;
     encoder.set_color(ColorType::Indexed);
     encoder.set_depth(png::BitDepth::Eight);
     encoder.set_palette(plte);
@@ -403,7 +439,82 @@ pub fn encode_indexed_apng(image: &IndexedApngImage) -> Result<Vec<u8>, AppError
     writer
         .finish()
         .map_err(|e| AppError::Encode(format!("failed to finish indexed APNG encoding: {e}")))?;
-    Ok(output)
+    Ok(splice_cicp_after_ihdr(output, image.color_metadata.cicp))
+}
+
+/// Build a `png::Encoder` pre-populated with color-space metadata (iCCP/gAMA/cHRM/sRGB)
+/// so it gets serialized as part of the normal header-writing path (`Encoder::write_header`).
+///
+/// cICP is intentionally *not* set here: the `png` crate's `Info`/`Encoder` machinery
+/// has no code path that serializes `coding_independent_code_points` at all (confirmed
+/// against png 0.18.1's `encode_header`), so it must be spliced into the finished byte
+/// stream afterwards — see `splice_cicp_after_ihdr`.
+fn new_encoder_with_color_metadata<W: std::io::Write>(
+    w: W,
+    width: u32,
+    height: u32,
+    color_metadata: &ApngColorMetadata,
+) -> Result<png::Encoder<'static, W>, AppError> {
+    let mut info = png::Info::default();
+    info.width = width;
+    info.height = height;
+
+    // sRGB and iCCP are mutually exclusive per the PNG spec (an sRGB chunk asserts
+    // the image already conforms to sRGB, making a simultaneous ICC profile
+    // contradictory/redundant). When the source carries both, prefer iCCP: it can
+    // encode any profile the sRGB flag can plus profiles it can't, so it's strictly
+    // more information — dropping it in favor of sRGB would be a silent downgrade.
+    if let Some(icc) = &color_metadata.icc_profile {
+        info.icc_profile = Some(Cow::Owned(icc.clone()));
+    } else if let Some(srgb) = color_metadata.srgb {
+        info.srgb = Some(srgb);
+    }
+    if color_metadata.icc_profile.is_none() {
+        info.source_gamma = color_metadata.source_gamma;
+        info.source_chromaticities = color_metadata.source_chromaticities;
+    }
+
+    png::Encoder::with_info(w, info)
+        .map_err(|e| AppError::Encode(format!("failed to configure APNG color metadata: {e}")))
+}
+
+/// Insert a raw `cICP` chunk immediately after `IHDR` in an already-encoded PNG byte
+/// stream. This satisfies the spec/decoder requirement that cICP precede both PLTE
+/// and IDAT/fdAT, without needing the `png` crate to support writing it (it doesn't).
+///
+/// IHDR is always the very first chunk, with a fixed 13-byte payload, so its total
+/// on-disk size is deterministic; we still read the length field defensively instead
+/// of hardcoding it.
+fn splice_cicp_after_ihdr(
+    png_bytes: Vec<u8>,
+    cicp: Option<png::CodingIndependentCodePoints>,
+) -> Vec<u8> {
+    let Some(cicp) = cicp else {
+        return png_bytes;
+    };
+    const SIGNATURE_LEN: usize = 8;
+    let Some(len_bytes) = png_bytes.get(SIGNATURE_LEN..SIGNATURE_LEN + 4) else {
+        return png_bytes; // malformed, defensively skip
+    };
+    let ihdr_data_len = u32::from_be_bytes(len_bytes.try_into().unwrap()) as usize;
+    // length(4) + type(4) + data(ihdr_data_len) + crc(4)
+    let ihdr_chunk_len = 12 + ihdr_data_len;
+    let insert_at = SIGNATURE_LEN + ihdr_chunk_len;
+    if insert_at > png_bytes.len() {
+        return png_bytes; // malformed, defensively skip
+    }
+
+    let data = [
+        cicp.color_primaries,
+        cicp.transfer_function,
+        cicp.matrix_coefficients,
+        cicp.is_video_full_range_image as u8,
+    ];
+    let mut out = Vec::with_capacity(png_bytes.len() + 12 + data.len());
+    out.extend_from_slice(&png_bytes[..insert_at]);
+    write_png_chunk(&mut out, b"cICP", &data);
+    out.extend_from_slice(&png_bytes[insert_at..]);
+    out
 }
 
 fn validate_rgba8_output(output: &png::OutputInfo) -> Result<(), AppError> {
@@ -916,12 +1027,31 @@ pub fn cautious_frame_trim(apng: &mut ApngImage) {
 #[cfg(test)]
 mod tests {
     use super::{
-        ApngDefaultImage, ApngFrame, ApngImage, IndexedApngFrame, IndexedApngImage,
-        cautious_frame_trim, compose_frames, decode_apng, detect_input_characteristics,
-        encode_apng, encode_indexed_apng, find_content_bounds, fold_duplicate_frames, merge_delays,
-        minimize_frame_rects, minimize_frame_rects_checked,
+        ApngColorMetadata, ApngDefaultImage, ApngFrame, ApngImage, IndexedApngFrame,
+        IndexedApngImage, cautious_frame_trim, compose_frames, decode_apng,
+        detect_input_characteristics, encode_apng, encode_indexed_apng, find_content_bounds,
+        fold_duplicate_frames, merge_delays, minimize_frame_rects, minimize_frame_rects_checked,
     };
-    use png::{BlendOp, ColorType, DisposeOp};
+    use png::{BlendOp, ColorType, CodingIndependentCodePoints, DisposeOp};
+
+    /// Parse the top-level chunk type sequence of an encoded PNG, for asserting
+    /// chunk ordering (e.g. "cICP comes before PLTE").
+    fn chunk_types(png_bytes: &[u8]) -> Vec<[u8; 4]> {
+        let mut types = Vec::new();
+        let mut pos = 8usize; // skip signature
+        while pos + 8 <= png_bytes.len() {
+            let len = u32::from_be_bytes(png_bytes[pos..pos + 4].try_into().unwrap()) as usize;
+            let mut t = [0u8; 4];
+            t.copy_from_slice(&png_bytes[pos + 4..pos + 8]);
+            let is_iend = &t == b"IEND";
+            types.push(t);
+            pos += 8 + len + 4;
+            if is_iend {
+                break;
+            }
+        }
+        types
+    }
 
     fn rgba(px: &[[u8; 4]]) -> Vec<u8> {
         px.iter().flat_map(|px| px.iter().copied()).collect()
@@ -995,6 +1125,7 @@ mod tests {
     #[test]
     fn compose_frames_respects_blend_and_dispose_previous() {
         let apng = ApngImage {
+            color_metadata: Default::default(),
             width: 2,
             height: 1,
             num_plays: 0,
@@ -1046,6 +1177,7 @@ mod tests {
     #[test]
     fn encode_decode_round_trip_preserves_composited_outputs() {
         let original = ApngImage {
+            color_metadata: Default::default(),
             width: 2,
             height: 2,
             num_plays: 0,
@@ -1093,6 +1225,7 @@ mod tests {
     #[test]
     fn fold_duplicate_frames_merges_identical_consecutive() {
         let mut apng = ApngImage {
+            color_metadata: Default::default(),
             width: 1,
             height: 1,
             num_plays: 0,
@@ -1143,6 +1276,7 @@ mod tests {
     #[test]
     fn fold_duplicate_frames_no_duplicates_is_noop() {
         let mut apng = ApngImage {
+            color_metadata: Default::default(),
             width: 1,
             height: 1,
             num_plays: 0,
@@ -1179,6 +1313,7 @@ mod tests {
     #[test]
     fn minimize_frame_rects_shrinks_unchanged_regions() {
         let mut apng = ApngImage {
+            color_metadata: Default::default(),
             width: 3,
             height: 3,
             num_plays: 0,
@@ -1261,6 +1396,7 @@ mod tests {
         use crate::pipeline::{PipelineOptions, process_png_bytes};
 
         let original = ApngImage {
+            color_metadata: Default::default(),
             width: 2,
             height: 2,
             num_plays: 0,
@@ -1322,6 +1458,7 @@ mod tests {
     #[test]
     fn compose_dispose_background_clears_region() {
         let apng = ApngImage {
+            color_metadata: Default::default(),
             width: 2,
             height: 1,
             num_plays: 0,
@@ -1361,6 +1498,7 @@ mod tests {
     #[test]
     fn compose_blend_over_partial_alpha() {
         let apng = ApngImage {
+            color_metadata: Default::default(),
             width: 1,
             height: 1,
             num_plays: 0,
@@ -1404,6 +1542,7 @@ mod tests {
     fn compose_dispose_previous_first_frame_degrades_to_background() {
         // Per APNG spec: DisposeOp::Previous on frame 0 degrades to Background
         let apng = ApngImage {
+            color_metadata: Default::default(),
             width: 1,
             height: 1,
             num_plays: 0,
@@ -1445,6 +1584,7 @@ mod tests {
     fn minimize_already_subrect_input() {
         // Input already has sub-rect frames, minimize should still produce correct composites
         let mut apng = ApngImage {
+            color_metadata: Default::default(),
             width: 3,
             height: 3,
             num_plays: 0,
@@ -1496,6 +1636,7 @@ mod tests {
             [255, 255, 0, 255],
         ]);
         let mut apng = ApngImage {
+            color_metadata: Default::default(),
             width: 2,
             height: 2,
             num_plays: 0,
@@ -1537,6 +1678,7 @@ mod tests {
     #[test]
     fn minimize_full_change_stays_full() {
         let mut apng = ApngImage {
+            color_metadata: Default::default(),
             width: 2,
             height: 2,
             num_plays: 0,
@@ -1589,6 +1731,7 @@ mod tests {
     #[test]
     fn minimize_single_frame_noop() {
         let mut apng = ApngImage {
+            color_metadata: Default::default(),
             width: 2,
             height: 2,
             num_plays: 0,
@@ -1620,6 +1763,7 @@ mod tests {
     fn minimize_preserves_composited_equivalence() {
         // Multi-frame with various changes — core property test
         let mut apng = ApngImage {
+            color_metadata: Default::default(),
             width: 4,
             height: 4,
             num_plays: 0,
@@ -1680,6 +1824,7 @@ mod tests {
     #[test]
     fn minimize_checked_succeeds_on_valid_input() {
         let mut apng = ApngImage {
+            color_metadata: Default::default(),
             width: 2,
             height: 2,
             num_plays: 0,
@@ -1727,6 +1872,7 @@ mod tests {
     #[test]
     fn minimize_checked_single_frame_returns_false() {
         let mut apng = ApngImage {
+            color_metadata: Default::default(),
             width: 1,
             height: 1,
             num_plays: 0,
@@ -1752,6 +1898,7 @@ mod tests {
     fn fold_non_consecutive_duplicates() {
         // A, A, B, B -> A, B
         let mut apng = ApngImage {
+            color_metadata: Default::default(),
             width: 1,
             height: 1,
             num_plays: 0,
@@ -1812,6 +1959,7 @@ mod tests {
     #[test]
     fn fold_all_identical() {
         let mut apng = ApngImage {
+            color_metadata: Default::default(),
             width: 1,
             height: 1,
             num_plays: 0,
@@ -1861,6 +2009,7 @@ mod tests {
     #[test]
     fn fold_delay_overflow_uses_millisecond_fallback() {
         let mut apng = ApngImage {
+            color_metadata: Default::default(),
             width: 1,
             height: 1,
             num_plays: 0,
@@ -1901,6 +2050,7 @@ mod tests {
     #[test]
     fn detect_rgba_apng_not_indexed() {
         let apng = ApngImage {
+            color_metadata: Default::default(),
             width: 2,
             height: 2,
             num_plays: 0,
@@ -1939,6 +2089,7 @@ mod tests {
     #[test]
     fn detect_subrect_frames() {
         let apng = ApngImage {
+            color_metadata: Default::default(),
             width: 4,
             height: 4,
             num_plays: 0,
@@ -1989,6 +2140,7 @@ mod tests {
         use crate::pipeline::{PipelineOptions, process_png_bytes};
 
         let original = ApngImage {
+            color_metadata: Default::default(),
             width: 2,
             height: 2,
             num_plays: 0,
@@ -2050,6 +2202,7 @@ mod tests {
         use crate::pipeline::{PipelineOptions, process_png_bytes};
 
         let original = ApngImage {
+            color_metadata: Default::default(),
             width: 3,
             height: 3,
             num_plays: 0,
@@ -2107,6 +2260,7 @@ mod tests {
 
         // Create a tiny APNG that will likely grow after re-encoding
         let original = ApngImage {
+            color_metadata: Default::default(),
             width: 1,
             height: 1,
             num_plays: 0,
@@ -2138,6 +2292,7 @@ mod tests {
         use crate::pipeline::{PipelineOptions, process_png_bytes};
 
         let original = ApngImage {
+            color_metadata: Default::default(),
             width: 2,
             height: 2,
             num_plays: 0,
@@ -2212,6 +2367,7 @@ mod tests {
         use crate::pipeline::{PipelineOptions, process_png_bytes};
 
         let original = ApngImage {
+            color_metadata: Default::default(),
             width: 3,
             height: 3,
             num_plays: 0,
@@ -2281,6 +2437,7 @@ mod tests {
         }
 
         let original = ApngImage {
+            color_metadata: Default::default(),
             width: 8,
             height: 8,
             num_plays: 0,
@@ -2369,6 +2526,7 @@ mod tests {
 
     fn make_apng_2x2(dispose: DisposeOp, blend: BlendOp) -> ApngImage {
         ApngImage {
+            color_metadata: Default::default(),
             width: 2,
             height: 2,
             num_plays: 0,
@@ -2412,6 +2570,7 @@ mod tests {
 
     fn make_apng_3frame_prev(blend: BlendOp) -> ApngImage {
         ApngImage {
+            color_metadata: Default::default(),
             width: 2,
             height: 2,
             num_plays: 0,
@@ -2475,6 +2634,7 @@ mod tests {
     fn cautious_trim_removes_trailing_transparent_rows() {
         // 4x4 frame, bottom 2 rows fully transparent -> 4x2
         let mut apng = ApngImage {
+            color_metadata: Default::default(),
             width: 4,
             height: 4,
             num_plays: 0,
@@ -2512,6 +2672,7 @@ mod tests {
     fn cautious_trim_removes_trailing_transparent_cols() {
         // 4x4 frame, right 2 columns fully transparent -> 2x4
         let mut apng = ApngImage {
+            color_metadata: Default::default(),
             width: 4,
             height: 4,
             num_plays: 0,
@@ -2547,6 +2708,7 @@ mod tests {
     #[test]
     fn cautious_trim_skips_over_blend_frames() {
         let mut apng = ApngImage {
+            color_metadata: Default::default(),
             width: 2,
             height: 2,
             num_plays: 0,
@@ -2573,6 +2735,7 @@ mod tests {
     #[test]
     fn cautious_trim_skips_subrect_frames() {
         let mut apng = ApngImage {
+            color_metadata: Default::default(),
             width: 4,
             height: 4,
             num_plays: 0,
@@ -2598,6 +2761,7 @@ mod tests {
     fn cautious_trim_preserves_composited_equivalence() {
         // 2-frame APNG: frame 0 has trailing transparent region
         let mut apng = ApngImage {
+            color_metadata: Default::default(),
             width: 4,
             height: 2,
             num_plays: 0,
@@ -2660,6 +2824,7 @@ mod tests {
     #[test]
     fn cautious_trim_noop_when_no_transparent_border() {
         let mut apng = ApngImage {
+            color_metadata: Default::default(),
             width: 2,
             height: 2,
             num_plays: 0,
@@ -2689,6 +2854,7 @@ mod tests {
     #[test]
     fn cautious_trim_fully_transparent_frame_unchanged() {
         let mut apng = ApngImage {
+            color_metadata: Default::default(),
             width: 2,
             height: 2,
             num_plays: 0,
@@ -2739,6 +2905,7 @@ mod tests {
             [0, 0, 0, 0],     // transparent
         ];
         let indexed = IndexedApngImage {
+            color_metadata: Default::default(),
             width: 2,
             height: 2,
             num_plays: 0,
@@ -2787,5 +2954,161 @@ mod tests {
         assert_eq!(&composited[0][4..8], &[0, 255, 0, 255]);
         assert_eq!(&composited[0][8..12], &[0, 0, 255, 255]);
         assert_eq!(&composited[0][12..16], &[0, 0, 0, 0]);
+    }
+
+    fn sample_cicp() -> CodingIndependentCodePoints {
+        CodingIndependentCodePoints {
+            color_primaries: 9,       // BT.2020
+            transfer_function: 16,    // PQ
+            matrix_coefficients: 0,   // RGB
+            is_video_full_range_image: true,
+        }
+    }
+
+    #[test]
+    fn encode_apng_preserves_cicp_and_orders_it_before_idat() {
+        let mut apng = make_apng_2x2(DisposeOp::None, BlendOp::Source);
+        apng.color_metadata.cicp = Some(sample_cicp());
+
+        let encoded = encode_apng(&apng).expect("encode APNG with cICP");
+
+        let types = chunk_types(&encoded);
+        let cicp_pos = types.iter().position(|t| t == b"cICP").expect("cICP present");
+        let idat_pos = types
+            .iter()
+            .position(|t| t == b"IDAT")
+            .expect("IDAT present");
+        assert!(cicp_pos < idat_pos, "cICP must precede IDAT: {types:?}");
+
+        let decoded = decode_apng(&encoded)
+            .expect("decode")
+            .expect("is apng");
+        assert_eq!(decoded.color_metadata.cicp, Some(sample_cicp()));
+    }
+
+    #[test]
+    fn encode_indexed_apng_preserves_cicp_before_plte() {
+        let palette = vec![[255, 0, 0, 255], [0, 255, 0, 255]];
+        let mut indexed = IndexedApngImage {
+            color_metadata: ApngColorMetadata {
+                cicp: Some(sample_cicp()),
+                ..Default::default()
+            },
+            width: 2,
+            height: 2,
+            num_plays: 0,
+            palette,
+            default_image_indices: None,
+            frames: vec![IndexedApngFrame {
+                width: 2,
+                height: 2,
+                x_offset: 0,
+                y_offset: 0,
+                delay_num: 1,
+                delay_den: 10,
+                dispose_op: DisposeOp::None,
+                blend_op: BlendOp::Source,
+                indices: vec![0, 1, 0, 1],
+            }],
+        };
+        indexed.frames.push(indexed.frames[0].clone());
+
+        let encoded = encode_indexed_apng(&indexed).expect("encode indexed APNG with cICP");
+
+        let types = chunk_types(&encoded);
+        let cicp_pos = types.iter().position(|t| t == b"cICP").expect("cICP present");
+        let plte_pos = types
+            .iter()
+            .position(|t| t == b"PLTE")
+            .expect("PLTE present");
+        assert!(cicp_pos < plte_pos, "cICP must precede PLTE: {types:?}");
+
+        let decoded = decode_apng(&encoded)
+            .expect("decode")
+            .expect("is apng");
+        assert_eq!(decoded.color_metadata.cicp, Some(sample_cicp()));
+    }
+
+    #[test]
+    fn apng_round_trip_preserves_gamma_and_chromaticities() {
+        let mut apng = make_apng_2x2(DisposeOp::None, BlendOp::Source);
+        let gamma = png::ScaledFloat::new(1.0f32 / 2.2f32);
+        let chroma = png::SourceChromaticities::new(
+            (0.3127f32, 0.3290f32),
+            (0.6400f32, 0.3300f32),
+            (0.3000f32, 0.6000f32),
+            (0.1500f32, 0.0600f32),
+        );
+        apng.color_metadata.source_gamma = Some(gamma);
+        apng.color_metadata.source_chromaticities = Some(chroma);
+
+        let encoded = encode_apng(&apng).expect("encode APNG with gAMA/cHRM");
+        let types = chunk_types(&encoded);
+        assert!(types.contains(b"gAMA"));
+        assert!(types.contains(b"cHRM"));
+
+        let decoded = decode_apng(&encoded)
+            .expect("decode")
+            .expect("is apng");
+        assert_eq!(decoded.color_metadata.source_gamma, Some(gamma));
+        assert_eq!(decoded.color_metadata.source_chromaticities, Some(chroma));
+    }
+
+    #[test]
+    fn apng_round_trip_preserves_iccp() {
+        let mut apng = make_apng_2x2(DisposeOp::None, BlendOp::Source);
+        let icc = lcms2::Profile::new_srgb()
+            .icc()
+            .expect("serialize sRGB ICC");
+        apng.color_metadata.icc_profile = Some(icc.clone());
+
+        let encoded = encode_apng(&apng).expect("encode APNG with iCCP");
+        let types = chunk_types(&encoded);
+        assert!(types.contains(b"iCCP"));
+        assert!(!types.contains(b"sRGB"));
+
+        let decoded = decode_apng(&encoded)
+            .expect("decode")
+            .expect("is apng");
+        assert_eq!(decoded.color_metadata.icc_profile, Some(icc));
+    }
+
+    #[test]
+    fn indexed_apng_prefers_iccp_over_srgb_when_both_present() {
+        let icc = lcms2::Profile::new_srgb()
+            .icc()
+            .expect("serialize sRGB ICC");
+        let palette = vec![[255, 0, 0, 255], [0, 255, 0, 255]];
+        let indexed = IndexedApngImage {
+            color_metadata: ApngColorMetadata {
+                icc_profile: Some(icc.clone()),
+                srgb: Some(png::SrgbRenderingIntent::Perceptual),
+                ..Default::default()
+            },
+            width: 2,
+            height: 2,
+            num_plays: 0,
+            palette,
+            default_image_indices: None,
+            frames: vec![IndexedApngFrame {
+                width: 2,
+                height: 2,
+                x_offset: 0,
+                y_offset: 0,
+                delay_num: 1,
+                delay_den: 10,
+                dispose_op: DisposeOp::None,
+                blend_op: BlendOp::Source,
+                indices: vec![0, 1, 0, 1],
+            }],
+        };
+
+        let encoded = encode_indexed_apng(&indexed).expect("encode indexed APNG");
+        let types = chunk_types(&encoded);
+        assert!(types.contains(b"iCCP"), "expected iCCP to win: {types:?}");
+        assert!(
+            !types.contains(b"sRGB"),
+            "sRGB should be dropped when iCCP is also present: {types:?}"
+        );
     }
 }
