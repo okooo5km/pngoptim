@@ -875,18 +875,24 @@ fn encode_indexed_png_raw(
             // and pngquant does the same. This saves ~20 bytes.
         } else {
             if let Some(gamma) = meta.source_gamma {
-                write_png_chunk(&mut out, b"gAMA", &gamma.into_value().to_be_bytes());
+                // PNG spec: gAMA is a 4-byte big-endian *unsigned integer*, the gamma
+                // value scaled by 100000 (`ScaledFloat::into_scaled`) — not the raw
+                // IEEE754 float bit pattern (`into_value().to_be_bytes()`, which was
+                // the bug here: dead code until gAMA/cHRM passthrough started working,
+                // since `source_gamma`/`source_chromaticities` used to always be
+                // `None` after a decode).
+                write_png_chunk(&mut out, b"gAMA", &gamma.into_scaled().to_be_bytes());
             }
             if let Some(chrm) = meta.source_chromaticities {
                 let mut data = [0u8; 32];
-                data[0..4].copy_from_slice(&chrm.white.0.into_value().to_be_bytes());
-                data[4..8].copy_from_slice(&chrm.white.1.into_value().to_be_bytes());
-                data[8..12].copy_from_slice(&chrm.red.0.into_value().to_be_bytes());
-                data[12..16].copy_from_slice(&chrm.red.1.into_value().to_be_bytes());
-                data[16..20].copy_from_slice(&chrm.green.0.into_value().to_be_bytes());
-                data[20..24].copy_from_slice(&chrm.green.1.into_value().to_be_bytes());
-                data[24..28].copy_from_slice(&chrm.blue.0.into_value().to_be_bytes());
-                data[28..32].copy_from_slice(&chrm.blue.1.into_value().to_be_bytes());
+                data[0..4].copy_from_slice(&chrm.white.0.into_scaled().to_be_bytes());
+                data[4..8].copy_from_slice(&chrm.white.1.into_scaled().to_be_bytes());
+                data[8..12].copy_from_slice(&chrm.red.0.into_scaled().to_be_bytes());
+                data[12..16].copy_from_slice(&chrm.red.1.into_scaled().to_be_bytes());
+                data[16..20].copy_from_slice(&chrm.green.0.into_scaled().to_be_bytes());
+                data[20..24].copy_from_slice(&chrm.green.1.into_scaled().to_be_bytes());
+                data[24..28].copy_from_slice(&chrm.blue.0.into_scaled().to_be_bytes());
+                data[28..32].copy_from_slice(&chrm.blue.1.into_scaled().to_be_bytes());
                 write_png_chunk(&mut out, b"cHRM", &data);
             }
             if let Some(icc) = &meta.icc_profile {
@@ -1055,22 +1061,14 @@ fn extract_metadata(input_bytes: &[u8]) -> Option<PreservedMetadata> {
     let info = reader.info();
 
     Some(PreservedMetadata {
-        // KNOWN PRE-EXISTING ISSUE (found while implementing P2, left as-is to avoid
-        // scope creep — see final report / flagged follow-up task): `Info::source_gamma`/
-        // `source_chromaticities` are write-only fields the `png` crate's *encoder*
-        // uses to serialize gAMA/cHRM — the decoder never populates them (confirmed
-        // against png 0.18.1's decoder, which only ever writes `gama_chunk`/
-        // `chrm_chunk`). So `info.source_gamma`/`info.source_chromaticities` are
-        // always `None` right after a decode, meaning gAMA/cHRM passthrough for
-        // *static* PNGs without an sRGB chunk or ICC profile has silently never
-        // worked. Not fixed here: switching to `gama_chunk`/`chrm_chunk` would also
-        // make the ICC-less gamma/chroma branch of `normalize_rgba_to_srgb_if_needed`
-        // live for the first time (currently unreachable via real decodes), which is
-        // a real behavior change beyond P2's scope (cICP + HDR guard + APNG
-        // passthrough) and needs its own regression pass. The APNG color-metadata
-        // path added in P2 (see `apng::decode_apng`) reads the correct fields.
-        source_gamma: info.source_gamma,
-        source_chromaticities: info.source_chromaticities,
+        // `Info::source_gamma`/`source_chromaticities` are write-only fields the `png`
+        // crate's *encoder* uses to serialize gAMA/cHRM — the decoder never populates
+        // them (confirmed against png 0.18.1's decoder). On decode, the parsed chunk
+        // values live in `gama_chunk`/`chrm_chunk` instead; we read those here and
+        // feed them back into the encoder-facing `source_gamma`/`source_chromaticities`
+        // fields on write, mirroring `apng::decode_apng`.
+        source_gamma: info.gama_chunk,
+        source_chromaticities: info.chrm_chunk,
         srgb: info.srgb,
         pixel_dims: info.pixel_dims,
         icc_profile: info.icc_profile.as_ref().map(|v| v.as_ref().to_vec()),
@@ -1311,6 +1309,21 @@ mod tests {
         icc_profile: Option<Vec<u8>>,
         cicp: Option<png::CodingIndependentCodePoints>,
     ) -> Vec<u8> {
+        encode_test_rgba_png_with_gama_chrm(width, height, rgba, icc_profile, cicp, None, None)
+    }
+
+    /// Same as [`encode_test_rgba_png`] but also allows setting gAMA/cHRM (as they
+    /// would be parsed from a real-world PNG without an sRGB chunk or ICC profile).
+    #[allow(clippy::too_many_arguments)]
+    fn encode_test_rgba_png_with_gama_chrm(
+        width: u32,
+        height: u32,
+        rgba: &[u8],
+        icc_profile: Option<Vec<u8>>,
+        cicp: Option<png::CodingIndependentCodePoints>,
+        gamma: Option<png::ScaledFloat>,
+        chromaticities: Option<png::SourceChromaticities>,
+    ) -> Vec<u8> {
         let mut out = Vec::new();
         let mut info = png::Info::default();
         info.width = width;
@@ -1319,6 +1332,12 @@ mod tests {
         info.bit_depth = png::BitDepth::Eight;
         if let Some(icc) = icc_profile {
             info.icc_profile = Some(std::borrow::Cow::Owned(icc));
+        }
+        if let Some(gamma) = gamma {
+            info.source_gamma = Some(gamma);
+        }
+        if let Some(chromaticities) = chromaticities {
+            info.source_chromaticities = Some(chromaticities);
         }
         let encoder = png::Encoder::with_info(&mut out, info).expect("with_info");
         let mut writer = encoder.write_header().expect("write header");
@@ -1475,5 +1494,194 @@ mod tests {
             reader.info().coding_independent_code_points,
             Some(sdr_srgb_cicp())
         );
+    }
+
+    /// Standard sRGB primaries/white point, as would appear in a real-world PNG's
+    /// cHRM chunk when it carries explicit (redundant) sRGB chromaticities instead
+    /// of an sRGB chunk or ICC profile.
+    fn srgb_chromaticities() -> png::SourceChromaticities {
+        png::SourceChromaticities::new(
+            (0.3127, 0.3290),
+            (0.6400, 0.3300),
+            (0.3000, 0.6000),
+            (0.1500, 0.0600),
+        )
+    }
+
+    #[test]
+    fn gama_chrm_are_read_from_decoder_chunk_fields_not_encoder_only_fields() {
+        // Regression test for the pre-existing bug: `extract_metadata` used to read
+        // `info.source_gamma`/`info.source_chromaticities` (encoder-only fields,
+        // always `None` after a decode) instead of `info.gama_chunk`/`info.chrm_chunk`
+        // (what the decoder actually populates). Verify a round trip through the
+        // real `png` decoder yields non-`None` values for a PNG carrying gAMA/cHRM.
+        let decoder = png::Decoder::new(std::io::Cursor::new(encode_test_rgba_png_with_gama_chrm(
+            1,
+            1,
+            &[128, 128, 128, 255],
+            None,
+            None,
+            Some(png::ScaledFloat::new(1.0 / 2.2)),
+            Some(srgb_chromaticities()),
+        )));
+        let reader = decoder.read_info().expect("read info");
+        let info = reader.info();
+        assert!(info.source_gamma.is_none(), "encoder-only field stays None on decode");
+        assert!(info.gama_chunk.is_some(), "decoder populates gama_chunk");
+        assert!(info.chrm_chunk.is_some(), "decoder populates chrm_chunk");
+    }
+
+    #[test]
+    fn srgb_like_gama_chrm_normalizes_to_near_identity_and_writes_srgb_chunk() {
+        // gAMA ~= 1/2.2 with sRGB-standard chromaticities: the synthesized RGB
+        // profile is approximately sRGB itself, so the lcms2 round trip should be
+        // a near-identity transform. Output should carry an sRGB chunk (and drop
+        // gAMA/cHRM), matching the iCCP-branch's normalization contract.
+        //
+        // Pixel values are kept away from near-black (>= 0x50): a pure gamma-2.2
+        // power curve (what `build_rgb_profile_from_png_chromaticities` synthesizes)
+        // legitimately diverges from real sRGB's TRC in its linear toe segment below
+        // ~0.0031 linear light, so very dark pixels see a real several-ULP shift
+        // there (e.g. 10 -> 3) that is not a bug — just where a plain 1/2.2 gamma
+        // stops being a good approximation of sRGB. Mid-to-high tones (used here)
+        // are where the "near-identity" claim actually holds.
+        let rgba = vec![
+            100u8, 150, 200, 255, // px0
+            220, 230, 240, 255, // px1
+            90, 110, 130, 255, // px2
+            245, 235, 225, 128, // px3 (also exercises alpha passthrough)
+        ];
+        let input = encode_test_rgba_png_with_gama_chrm(
+            2,
+            2,
+            &rgba,
+            None,
+            None,
+            Some(png::ScaledFloat::new(1.0 / 2.2)),
+            Some(srgb_chromaticities()),
+        );
+
+        let result = process_png_bytes(&input, PipelineOptions::default()).expect("process PNG");
+
+        let types = chunk_types(&result.png_data);
+        assert!(types.contains(b"sRGB"), "expected sRGB chunk: {types:?}");
+        assert!(!types.contains(b"gAMA"), "gAMA should be dropped: {types:?}");
+        assert!(!types.contains(b"cHRM"), "cHRM should be dropped: {types:?}");
+
+        let decoded = image::load_from_memory_with_format(&result.png_data, image::ImageFormat::Png)
+            .expect("decode output PNG")
+            .to_rgba8();
+        let out_rgba = decoded.into_raw();
+        assert_eq!(out_rgba.len(), rgba.len());
+        let max_diff = rgba
+            .iter()
+            .zip(out_rgba.iter())
+            .map(|(a, b)| (*a as i16 - *b as i16).unsigned_abs())
+            .max()
+            .unwrap_or(0);
+        assert!(
+            max_diff <= 2,
+            "near-identity sRGB-like gAMA/cHRM normalization should barely move pixels, \
+             got max_diff={max_diff}: input={rgba:?} output={out_rgba:?}"
+        );
+    }
+
+    #[test]
+    fn linear_gama_brightens_mid_gray_toward_srgb_encoding() {
+        // gAMA=1.0 (linear light, no encoding gamma) with sRGB chromaticities: a raw
+        // sample of 128 (~0.502) represents *linear* light of ~0.502, which the sRGB
+        // transfer function encodes to ~0.735 (~187/255) — brighter, not darker.
+        // This pins down the conversion direction for non-sRGB-equivalent gAMA/cHRM.
+        let rgba = vec![128u8, 128, 128, 255];
+        let input = encode_test_rgba_png_with_gama_chrm(
+            1,
+            1,
+            &rgba,
+            None,
+            None,
+            Some(png::ScaledFloat::new(1.0)),
+            Some(srgb_chromaticities()),
+        );
+
+        let result = process_png_bytes(&input, PipelineOptions::default()).expect("process PNG");
+
+        let types = chunk_types(&result.png_data);
+        assert!(types.contains(b"sRGB"), "expected sRGB chunk: {types:?}");
+
+        let decoded = image::load_from_memory_with_format(&result.png_data, image::ImageFormat::Png)
+            .expect("decode output PNG")
+            .to_rgba8();
+        let out = decoded.into_raw();
+        assert_eq!(out[3], 255, "alpha untouched");
+        for channel in &out[0..3] {
+            assert!(
+                (183..=192).contains(channel),
+                "expected mid-gray to brighten to ~187/255, got {channel} (full={out:?})"
+            );
+            assert!(
+                *channel > rgba[0],
+                "linear-to-sRGB normalization must brighten, not darken: {channel} <= {}",
+                rgba[0]
+            );
+        }
+    }
+
+    #[test]
+    fn no_icc_flag_passes_through_gama_chrm_unchanged() {
+        let rgba = vec![128u8, 128, 128, 255];
+        let gamma = png::ScaledFloat::new(1.0);
+        let chroma = srgb_chromaticities();
+        let input =
+            encode_test_rgba_png_with_gama_chrm(1, 1, &rgba, None, None, Some(gamma), Some(chroma));
+
+        let result = process_png_bytes(
+            &input,
+            PipelineOptions {
+                no_icc: true,
+                ..PipelineOptions::default()
+            },
+        )
+        .expect("process PNG with --no-icc");
+
+        let types = chunk_types(&result.png_data);
+        assert!(types.contains(b"gAMA"), "gAMA must pass through: {types:?}");
+        assert!(types.contains(b"cHRM"), "cHRM must pass through: {types:?}");
+        assert!(!types.contains(b"sRGB"), "no normalization under --no-icc: {types:?}");
+
+        // Pixels must be byte-identical (decoding treats them as literal 8-bit
+        // samples regardless of the declared gAMA/cHRM; only the chunk passthrough
+        // matters here).
+        let decoded = image::load_from_memory_with_format(&result.png_data, image::ImageFormat::Png)
+            .expect("decode output PNG")
+            .to_rgba8();
+        assert_eq!(decoded.into_raw(), rgba);
+
+        let decoder = png::Decoder::new(std::io::Cursor::new(&result.png_data));
+        let reader = decoder.read_info().expect("read output info");
+        assert_eq!(reader.info().gama_chunk, Some(gamma));
+        assert_eq!(reader.info().chrm_chunk, Some(chroma));
+    }
+
+    #[test]
+    fn plain_png_without_color_chunks_is_unaffected_by_gama_chrm_fix() {
+        // No gAMA/cHRM/sRGB/iCCP at all: normalization must stay a no-op (both
+        // before and after the fix), and no color chunks should appear in the output.
+        let rgba = vec![
+            10u8, 20, 30, 255, 200, 210, 220, 255, 5, 6, 7, 255, 250, 240, 230, 255,
+        ];
+        let input = encode_test_rgba_png(2, 2, &rgba, None, None);
+
+        let result = process_png_bytes(&input, PipelineOptions::default()).expect("process PNG");
+
+        let types = chunk_types(&result.png_data);
+        assert!(!types.contains(b"gAMA"));
+        assert!(!types.contains(b"cHRM"));
+        assert!(!types.contains(b"sRGB"));
+        assert!(!types.contains(b"iCCP"));
+
+        let decoded = image::load_from_memory_with_format(&result.png_data, image::ImageFormat::Png)
+            .expect("decode output PNG")
+            .to_rgba8();
+        assert_eq!(decoded.into_raw(), rgba);
     }
 }
