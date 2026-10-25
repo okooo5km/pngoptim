@@ -311,7 +311,9 @@ pub fn quantize_indexed_with_background(
 
     // Convert background RGBA to InternalPixel using the same gamma LUT
     let bg_pixels_storage = background_rgba.map(|bg| {
-        bg.chunks_exact(4)
+        bg.as_chunks::<4>()
+            .0
+            .iter()
             .map(|px| InternalPixel::from_rgba(&gamma, px))
             .collect::<Vec<_>>()
     });
@@ -769,7 +771,7 @@ fn build_histogram_map_boosted(
         .map(|(chunk_idx, chunk)| {
             let base_pixel = chunk_idx * chunk_pixels;
             let mut map: HistMap = HashMap::with_hasher(U32HashBuilder::default());
-            for (local_idx, px) in chunk.chunks_exact(4).enumerate() {
+            for (local_idx, px) in chunk.as_chunks::<4>().0.iter().enumerate() {
                 let representative = [px[0], px[1], px[2], px[3]];
                 let key = pack_rgba_key(&representative, 0);
                 let entry = map.entry(key).or_default();
@@ -1788,7 +1790,9 @@ pub(crate) fn remap_to_fixed_palette(
     }
     let gamma = gamma_lut(SRGB_OUTPUT_GAMMA);
     let pixels: Vec<InternalPixel> = rgba
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .map(|px| InternalPixel::from_rgba(&gamma, px))
         .collect();
 
@@ -1908,7 +1912,9 @@ fn remap_image_plain(
         pixels
     } else {
         owned_pixels = rgba
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .map(|px| InternalPixel::from_rgba(&gamma, px))
             .collect::<Vec<_>>();
         &owned_pixels
@@ -2123,7 +2129,9 @@ fn remap_image_dithered(
         pixels
     } else {
         owned_pixels = rgba
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .map(|px| InternalPixel::from_rgba(&gamma, px))
             .collect::<Vec<_>>();
         &owned_pixels
@@ -2932,10 +2940,12 @@ mod tests {
 
     #[test]
     fn plain_remap_feedback_uses_importance_weights() {
-        let rgba = vec![255u8, 0, 0, 255, 0, 0, 255, 255];
+        let rgba = [255u8, 0, 0, 255, 0, 0, 255, 255];
         let gamma = gamma_lut(SRGB_OUTPUT_GAMMA);
         let pixels = rgba
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .map(|px| InternalPixel::from_rgba(&gamma, px))
             .collect::<Vec<_>>();
         let mut palette_points = vec![InternalPixel::from_rgba(&gamma, &[0, 0, 0, 255])];
@@ -2971,7 +2981,9 @@ mod tests {
         };
 
         let pixels = rgba
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .map(|px| InternalPixel::from_rgba(&gamma, px))
             .collect::<Vec<_>>();
         let (plain_palette, _, _) =

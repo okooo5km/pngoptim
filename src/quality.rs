@@ -116,8 +116,10 @@ pub fn evaluate_quality_against_rgba(original_rgba: &[u8], remapped_rgba: &[u8])
     let mut pixels = 0usize;
 
     for (src, dst) in original_rgba
-        .chunks_exact(4)
-        .zip(remapped_rgba.chunks_exact(4))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .zip(remapped_rgba.as_chunks::<4>().0)
     {
         let src_px = InternalPixel::from_rgba(&gamma_lut, src);
         let dst_px = InternalPixel::from_rgba(&gamma_lut, dst);

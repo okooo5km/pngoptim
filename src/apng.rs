@@ -217,8 +217,12 @@ pub fn encode_apng(apng: &ApngImage) -> Result<Vec<u8>, AppError> {
     }
 
     let mut output = Vec::new();
-    let mut encoder =
-        new_encoder_with_color_metadata(&mut output, apng.width, apng.height, &apng.color_metadata)?;
+    let mut encoder = new_encoder_with_color_metadata(
+        &mut output,
+        apng.width,
+        apng.height,
+        &apng.color_metadata,
+    )?;
     encoder.set_color(ColorType::Rgba);
     encoder.set_depth(png::BitDepth::Eight);
     encoder
@@ -1032,7 +1036,7 @@ mod tests {
         detect_input_characteristics, encode_apng, encode_indexed_apng, find_content_bounds,
         fold_duplicate_frames, merge_delays, minimize_frame_rects, minimize_frame_rects_checked,
     };
-    use png::{BlendOp, ColorType, CodingIndependentCodePoints, DisposeOp};
+    use png::{BlendOp, CodingIndependentCodePoints, ColorType, DisposeOp};
 
     /// Parse the top-level chunk type sequence of an encoded PNG, for asserting
     /// chunk ordering (e.g. "cICP comes before PLTE").
@@ -1792,6 +1796,8 @@ mod tests {
                     rgba: {
                         let mut d = vec![128; 4 * 4 * 4];
                         // Change only pixels (1,1) and (2,3)
+                        // (row * width + col) * 4, spelled out to match idx2.
+                        #[allow(clippy::identity_op)]
                         let idx1 = (1 * 4 + 1) * 4;
                         d[idx1..idx1 + 4].copy_from_slice(&[255, 0, 0, 255]);
                         let idx2 = (3 * 4 + 2) * 4;
@@ -2958,9 +2964,9 @@ mod tests {
 
     fn sample_cicp() -> CodingIndependentCodePoints {
         CodingIndependentCodePoints {
-            color_primaries: 9,       // BT.2020
-            transfer_function: 16,    // PQ
-            matrix_coefficients: 0,   // RGB
+            color_primaries: 9,     // BT.2020
+            transfer_function: 16,  // PQ
+            matrix_coefficients: 0, // RGB
             is_video_full_range_image: true,
         }
     }
@@ -2973,16 +2979,17 @@ mod tests {
         let encoded = encode_apng(&apng).expect("encode APNG with cICP");
 
         let types = chunk_types(&encoded);
-        let cicp_pos = types.iter().position(|t| t == b"cICP").expect("cICP present");
+        let cicp_pos = types
+            .iter()
+            .position(|t| t == b"cICP")
+            .expect("cICP present");
         let idat_pos = types
             .iter()
             .position(|t| t == b"IDAT")
             .expect("IDAT present");
         assert!(cicp_pos < idat_pos, "cICP must precede IDAT: {types:?}");
 
-        let decoded = decode_apng(&encoded)
-            .expect("decode")
-            .expect("is apng");
+        let decoded = decode_apng(&encoded).expect("decode").expect("is apng");
         assert_eq!(decoded.color_metadata.cicp, Some(sample_cicp()));
     }
 
@@ -3016,16 +3023,17 @@ mod tests {
         let encoded = encode_indexed_apng(&indexed).expect("encode indexed APNG with cICP");
 
         let types = chunk_types(&encoded);
-        let cicp_pos = types.iter().position(|t| t == b"cICP").expect("cICP present");
+        let cicp_pos = types
+            .iter()
+            .position(|t| t == b"cICP")
+            .expect("cICP present");
         let plte_pos = types
             .iter()
             .position(|t| t == b"PLTE")
             .expect("PLTE present");
         assert!(cicp_pos < plte_pos, "cICP must precede PLTE: {types:?}");
 
-        let decoded = decode_apng(&encoded)
-            .expect("decode")
-            .expect("is apng");
+        let decoded = decode_apng(&encoded).expect("decode").expect("is apng");
         assert_eq!(decoded.color_metadata.cicp, Some(sample_cicp()));
     }
 
@@ -3047,9 +3055,7 @@ mod tests {
         assert!(types.contains(b"gAMA"));
         assert!(types.contains(b"cHRM"));
 
-        let decoded = decode_apng(&encoded)
-            .expect("decode")
-            .expect("is apng");
+        let decoded = decode_apng(&encoded).expect("decode").expect("is apng");
         assert_eq!(decoded.color_metadata.source_gamma, Some(gamma));
         assert_eq!(decoded.color_metadata.source_chromaticities, Some(chroma));
     }
@@ -3067,9 +3073,7 @@ mod tests {
         assert!(types.contains(b"iCCP"));
         assert!(!types.contains(b"sRGB"));
 
-        let decoded = decode_apng(&encoded)
-            .expect("decode")
-            .expect("is apng");
+        let decoded = decode_apng(&encoded).expect("decode").expect("is apng");
         assert_eq!(decoded.color_metadata.icc_profile, Some(icc));
     }
 

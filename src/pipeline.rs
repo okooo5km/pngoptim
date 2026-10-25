@@ -745,7 +745,9 @@ fn quantize_apng_frames(
             frame.height,
         );
         let bg_pixels: Vec<InternalPixel> = bg_subrect
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .map(|px| InternalPixel::from_rgba(&gamma, px))
             .collect();
 
