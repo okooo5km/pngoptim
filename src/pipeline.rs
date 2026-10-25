@@ -15,8 +15,8 @@ use crate::cli::{ApngMode, QualityRange};
 use crate::error::AppError;
 use crate::palette_quant::{
     IndexedImage, build_histogram_map, finalize_histogram, find_best_palette, merge_histogram_maps,
-    quantize_indexed, quantizer_settings, remap_to_fixed_palette, reposterize_histogram_map,
-    sort_palette_entries,
+    quantize_indexed_with_boost, quantizer_settings, remap_to_fixed_palette,
+    reposterize_histogram_map, sort_palette_entries,
 };
 use crate::quality::{
     InternalPixel, QualityMetrics, SRGB_OUTPUT_GAMMA, SpeedSettings, evaluate_quality_against_rgba,
@@ -380,7 +380,7 @@ fn evaluate_candidate(
     quality_targets: QualityTargets,
     dither_level: f32,
 ) -> QuantizeCandidate {
-    evaluate_candidate_once(
+    let first = evaluate_candidate_once(
         rgba,
         width,
         height,
@@ -389,7 +389,185 @@ fn evaluate_candidate(
         speed_settings,
         quality_targets,
         dither_level,
-    )
+        None,
+    );
+    // A first pass already below the quality floor is rejected by the caller
+    // anyway, and re-weighting only trades global error for local error.
+    if quality_targets
+        .max_mse
+        .is_some_and(|max_mse| first.quality.internal_mse > max_mse)
+    {
+        return first;
+    }
+    let threshold = local_shift_threshold(quality_targets);
+    let first_report = local_shift_report(rgba, &first, width, height, threshold);
+    let Some(boost) = first_report.boost_map(width, height) else {
+        return first;
+    };
+    // One feedback pass: a second one was measured to plateau, since the
+    // first already recovers what the palette budget allows.
+    let second = evaluate_candidate_once(
+        rgba,
+        width,
+        height,
+        max_colors,
+        output_posterize_bits,
+        speed_settings,
+        quality_targets,
+        dither_level,
+        Some(&boost),
+    );
+    let second_report = local_shift_report(rgba, &second, width, height, threshold);
+    let meets_floor = quality_targets
+        .max_mse
+        .is_none_or(|max_mse| second.quality.internal_mse <= max_mse);
+    if meets_floor && second_report.excess < first_report.excess {
+        second
+    } else {
+        first
+    }
+}
+
+/// Block edge (pixels) for the local-error feedback pass.
+const LOCAL_BLOCK: usize = 16;
+/// Upper bound for the per-pixel histogram weight multiplier.
+const LOCAL_MAX_BOOST: u16 = 64;
+/// Histogram weight share the feedback pass aims to give the failing area.
+const LOCAL_TARGET_SHARE: f64 = 0.25;
+
+/// Per-block mean-colour shift above which a block counts as "starved".
+///
+/// The global quality gate averages error over the whole image, so a small
+/// region (e.g. a colourful avatar in a mostly gray screenshot) can be mapped
+/// onto the dominant grays while the image still passes. Comparing the mean
+/// colour of each block before/after remap catches exactly that hue/chroma
+/// collapse and is insensitive to dither noise, which averages out.
+fn local_shift_threshold(targets: QualityTargets) -> f64 {
+    // Whether a colour shift is visible does not depend much on the requested
+    // quality, so high-quality requests share one floor instead of demanding
+    // near-exact block means (which mostly flags harmless dither bias).
+    let base = targets.max_mse.unwrap_or(targets.target_mse);
+    base.max(quality_to_mse(LOCAL_SHIFT_FLOOR_QUALITY))
+}
+const LOCAL_SHIFT_FLOOR_QUALITY: u8 = 80;
+/// Minimum area-weighted excess (≈ number of 16×16 blocks whose mean colour
+/// is twice over the threshold) before a feedback pass is worth its cost.
+const LOCAL_MIN_EXCESS: f64 = 4.0;
+
+struct LocalShiftReport {
+    /// Block-grid width.
+    columns: usize,
+    /// Per-block shift ratio, rounded up (0 = block passes).
+    block_boost: Vec<u16>,
+    block_pixels: Vec<u32>,
+    failing_blocks: usize,
+    /// Sum over failing blocks of (shift / threshold - 1), weighted by area.
+    excess: f64,
+}
+
+impl LocalShiftReport {
+    fn boost_map(&self, width: usize, height: usize) -> Option<Vec<u16>> {
+        let total_blocks = self.block_boost.len();
+        // Nothing to fix, or most of the image fails: the global gate already
+        // sees that and a re-weighting would just shift error around.
+        if self.excess < LOCAL_MIN_EXCESS || self.failing_blocks * 2 > total_blocks {
+            return None;
+        }
+        // Failing blocks are usually a tiny fraction of the image, so a boost
+        // derived from the shift alone barely moves the palette search. Scale
+        // it so the failing area holds roughly LOCAL_TARGET_SHARE of the
+        // histogram weight, then let the per-block shift ratio refine it.
+        let failing_pixels: usize = self
+            .block_boost
+            .iter()
+            .zip(&self.block_pixels)
+            .filter(|(b, _)| **b > 0)
+            .map(|(_, n)| *n as usize)
+            .sum();
+        let fraction = failing_pixels as f64 / (width * height) as f64;
+        let area_boost = (LOCAL_TARGET_SHARE * (1.0 - fraction)
+            / ((1.0 - LOCAL_TARGET_SHARE) * fraction))
+            .max(1.0);
+        let mut boost = vec![1u16; width * height];
+        for y in 0..height {
+            let row = (y / LOCAL_BLOCK) * self.columns;
+            for x in 0..width {
+                let ratio = self.block_boost[row + x / LOCAL_BLOCK];
+                if ratio > 0 {
+                    let b = area_boost * f64::from(ratio).sqrt();
+                    boost[y * width + x] = (b.round() as u16).clamp(2, LOCAL_MAX_BOOST);
+                }
+            }
+        }
+        Some(boost)
+    }
+}
+
+fn local_shift_report(
+    rgba: &[u8],
+    candidate: &QuantizeCandidate,
+    width: usize,
+    height: usize,
+    threshold: f64,
+) -> LocalShiftReport {
+    let columns = width.div_ceil(LOCAL_BLOCK);
+    let rows = height.div_ceil(LOCAL_BLOCK);
+    let lut = gamma_lut(SRGB_OUTPUT_GAMMA);
+    let palette: Vec<InternalPixel> = candidate
+        .indexed
+        .palette
+        .iter()
+        .map(|c| InternalPixel::from_rgba(&lut, c))
+        .collect();
+    let mut src_sum = vec![[0f64; 4]; columns * rows];
+    let mut dst_sum = vec![[0f64; 4]; columns * rows];
+    let mut counts = vec![0u32; columns * rows];
+    for y in 0..height {
+        let row = (y / LOCAL_BLOCK) * columns;
+        for x in 0..width {
+            let i = y * width + x;
+            let block = row + x / LOCAL_BLOCK;
+            let s = InternalPixel::from_rgba(&lut, &rgba[i * 4..i * 4 + 4]);
+            let d = palette[candidate.indexed.indices[i] as usize];
+            let ss = &mut src_sum[block];
+            ss[0] += f64::from(s.a);
+            ss[1] += f64::from(s.r);
+            ss[2] += f64::from(s.g);
+            ss[3] += f64::from(s.b);
+            let ds = &mut dst_sum[block];
+            ds[0] += f64::from(d.a);
+            ds[1] += f64::from(d.r);
+            ds[2] += f64::from(d.g);
+            ds[3] += f64::from(d.b);
+            counts[block] += 1;
+        }
+    }
+    let mut block_boost = vec![0u16; columns * rows];
+    let mut failing_blocks = 0usize;
+    let mut excess = 0.0f64;
+    for block in 0..columns * rows {
+        let n = f64::from(counts[block].max(1));
+        let mean = |v: &[f64; 4]| InternalPixel {
+            a: (v[0] / n) as f32,
+            r: (v[1] / n) as f32,
+            g: (v[2] / n) as f32,
+            b: (v[3] / n) as f32,
+        };
+        let shift = f64::from(mean(&src_sum[block]).diff(mean(&dst_sum[block])));
+        if shift > threshold {
+            let ratio = shift / threshold;
+            failing_blocks += 1;
+            excess += (ratio - 1.0) * n / (LOCAL_BLOCK * LOCAL_BLOCK) as f64;
+            block_boost[block] = (ratio.ceil() as u16).clamp(2, LOCAL_MAX_BOOST);
+        }
+    }
+    LocalShiftReport {
+        columns,
+        block_boost,
+        block_pixels: counts,
+        failing_blocks,
+        excess,
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -402,6 +580,7 @@ fn evaluate_candidate_once(
     speed_settings: SpeedSettings,
     quality_targets: QualityTargets,
     dither_level: f32,
+    importance_boost: Option<&[u16]>,
 ) -> QuantizeCandidate {
     let quantizer = quantizer_settings(
         max_colors,
@@ -412,7 +591,7 @@ fn evaluate_candidate_once(
         output_posterize_bits,
         dither_level,
     );
-    let indexed = quantize_indexed(rgba, width, height, quantizer);
+    let indexed = quantize_indexed_with_boost(rgba, width, height, quantizer, importance_boost);
     let remapped_rgba = remapped_rgba_from_indices(&indexed.indices, &indexed.palette);
     let quality = evaluate_quality_against_rgba(rgba, &remapped_rgba);
     QuantizeCandidate { indexed, quality }
@@ -1302,6 +1481,76 @@ mod tests {
     /// for exercising the static-PNG cICP passthrough / HDR-guard path end to end.
     /// RGBA has no PLTE chunk, so writing cICP right after `write_header()` (before
     /// `write_image_data`) is a valid position (still before IDAT).
+    /// Mean (g - r, b - r) of a rectangle, as a cheap chroma probe.
+    fn mean_chroma(rgba: &[u8], width: usize, x0: usize, y0: usize, size: usize) -> (f64, f64) {
+        let (mut gr, mut br) = (0.0, 0.0);
+        for y in y0..y0 + size {
+            for x in x0..x0 + size {
+                let i = (y * width + x) * 4;
+                gr += f64::from(rgba[i + 1]) - f64::from(rgba[i]);
+                br += f64::from(rgba[i + 2]) - f64::from(rgba[i]);
+            }
+        }
+        let n = (size * size) as f64;
+        (gr / n, br / n)
+    }
+
+    #[test]
+    fn small_colorful_region_in_gray_screenshot_keeps_its_chroma() {
+        // A dark UI screenshot: many gray levels everywhere (anti-aliased text)
+        // plus one small, low-saturation cyan avatar. The global quality gate
+        // alone maps the avatar onto the dominant grays (see 2026-10 Zipic
+        // report); the local-error feedback pass must keep its colour.
+        let (width, height) = (512usize, 512usize);
+        let mut seed = 0x2545_f491u32;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            seed
+        };
+        let mut rgba = vec![0u8; width * height * 4];
+        for y in 0..height {
+            for x in 0..width {
+                let i = (y * width + x) * 4;
+                let g = if (y / 6) % 3 == 0 && next() % 3 != 0 {
+                    (40 + next() % 190) as u8
+                } else {
+                    24
+                };
+                rgba[i..i + 4].copy_from_slice(&[g, g, g, 255]);
+            }
+        }
+        let (ax, ay, size) = (200usize, 200usize, 32usize);
+        for y in 0..size {
+            for x in 0..size {
+                let i = ((ay + y) * width + ax + x) * 4;
+                let t = ((x + y) * 2) as u8;
+                rgba[i..i + 4].copy_from_slice(&[70 + t, 110 + t, 118 + t, 255]);
+            }
+        }
+        let input = encode_test_rgba_png(width as u32, height as u32, &rgba, None, None);
+        let options = PipelineOptions {
+            quality: Some(crate::cli::QualityRange {
+                raw: "75-79".to_string(),
+                min: 75,
+                max: 79,
+            }),
+            ..PipelineOptions::default()
+        };
+        let result = process_png_bytes(&input, options).expect("process PNG");
+        let output = image::load_from_memory(&result.png_data)
+            .expect("decode output")
+            .to_rgba8();
+
+        let (src_gr, src_br) = mean_chroma(&rgba, width, ax, ay, size);
+        let (out_gr, out_br) = mean_chroma(output.as_raw(), width, ax, ay, size);
+        assert!(
+            out_gr >= src_gr * 0.7 && out_br >= src_br * 0.7,
+            "avatar chroma collapsed: source ({src_gr:.1}, {src_br:.1}) -> output ({out_gr:.1}, {out_br:.1})"
+        );
+    }
+
     fn encode_test_rgba_png(
         width: u32,
         height: u32,
@@ -1428,7 +1677,9 @@ mod tests {
 
     #[test]
     fn stripped_output_omits_cicp() {
-        let rgba = vec![10u8, 20, 30, 255, 200, 210, 220, 255, 5, 6, 7, 255, 250, 240, 230, 255];
+        let rgba = vec![
+            10u8, 20, 30, 255, 200, 210, 220, 255, 5, 6, 7, 255, 250, 240, 230, 255,
+        ];
         let input = encode_test_rgba_png(2, 2, &rgba, None, Some(hdr_pq_cicp()));
 
         let result = process_png_bytes(
@@ -1445,7 +1696,9 @@ mod tests {
 
     #[test]
     fn pq_cicp_skips_srgb_normalization_and_keeps_iccp() {
-        let rgba = vec![10u8, 20, 30, 255, 200, 210, 220, 255, 5, 6, 7, 255, 250, 240, 230, 255];
+        let rgba = vec![
+            10u8, 20, 30, 255, 200, 210, 220, 255, 5, 6, 7, 255, 250, 240, 230, 255,
+        ];
         let icc = Profile::new_srgb().icc().expect("serialize sRGB ICC");
         let input = encode_test_rgba_png(2, 2, &rgba, Some(icc), Some(hdr_pq_cicp()));
 
@@ -1477,7 +1730,9 @@ mod tests {
 
     #[test]
     fn sdr_cicp_still_normalizes_icc_but_keeps_cicp_passthrough() {
-        let rgba = vec![10u8, 20, 30, 255, 200, 210, 220, 255, 5, 6, 7, 255, 250, 240, 230, 255];
+        let rgba = vec![
+            10u8, 20, 30, 255, 200, 210, 220, 255, 5, 6, 7, 255, 250, 240, 230, 255,
+        ];
         let icc = Profile::new_srgb().icc().expect("serialize sRGB ICC");
         let input = encode_test_rgba_png(2, 2, &rgba, Some(icc), Some(sdr_srgb_cicp()));
 
@@ -1526,7 +1781,10 @@ mod tests {
         )));
         let reader = decoder.read_info().expect("read info");
         let info = reader.info();
-        assert!(info.source_gamma.is_none(), "encoder-only field stays None on decode");
+        assert!(
+            info.source_gamma.is_none(),
+            "encoder-only field stays None on decode"
+        );
         assert!(info.gama_chunk.is_some(), "decoder populates gama_chunk");
         assert!(info.chrm_chunk.is_some(), "decoder populates chrm_chunk");
     }
@@ -1565,12 +1823,19 @@ mod tests {
 
         let types = chunk_types(&result.png_data);
         assert!(types.contains(b"sRGB"), "expected sRGB chunk: {types:?}");
-        assert!(!types.contains(b"gAMA"), "gAMA should be dropped: {types:?}");
-        assert!(!types.contains(b"cHRM"), "cHRM should be dropped: {types:?}");
+        assert!(
+            !types.contains(b"gAMA"),
+            "gAMA should be dropped: {types:?}"
+        );
+        assert!(
+            !types.contains(b"cHRM"),
+            "cHRM should be dropped: {types:?}"
+        );
 
-        let decoded = image::load_from_memory_with_format(&result.png_data, image::ImageFormat::Png)
-            .expect("decode output PNG")
-            .to_rgba8();
+        let decoded =
+            image::load_from_memory_with_format(&result.png_data, image::ImageFormat::Png)
+                .expect("decode output PNG")
+                .to_rgba8();
         let out_rgba = decoded.into_raw();
         assert_eq!(out_rgba.len(), rgba.len());
         let max_diff = rgba
@@ -1608,9 +1873,10 @@ mod tests {
         let types = chunk_types(&result.png_data);
         assert!(types.contains(b"sRGB"), "expected sRGB chunk: {types:?}");
 
-        let decoded = image::load_from_memory_with_format(&result.png_data, image::ImageFormat::Png)
-            .expect("decode output PNG")
-            .to_rgba8();
+        let decoded =
+            image::load_from_memory_with_format(&result.png_data, image::ImageFormat::Png)
+                .expect("decode output PNG")
+                .to_rgba8();
         let out = decoded.into_raw();
         assert_eq!(out[3], 255, "alpha untouched");
         for channel in &out[0..3] {
@@ -1646,14 +1912,18 @@ mod tests {
         let types = chunk_types(&result.png_data);
         assert!(types.contains(b"gAMA"), "gAMA must pass through: {types:?}");
         assert!(types.contains(b"cHRM"), "cHRM must pass through: {types:?}");
-        assert!(!types.contains(b"sRGB"), "no normalization under --no-icc: {types:?}");
+        assert!(
+            !types.contains(b"sRGB"),
+            "no normalization under --no-icc: {types:?}"
+        );
 
         // Pixels must be byte-identical (decoding treats them as literal 8-bit
         // samples regardless of the declared gAMA/cHRM; only the chunk passthrough
         // matters here).
-        let decoded = image::load_from_memory_with_format(&result.png_data, image::ImageFormat::Png)
-            .expect("decode output PNG")
-            .to_rgba8();
+        let decoded =
+            image::load_from_memory_with_format(&result.png_data, image::ImageFormat::Png)
+                .expect("decode output PNG")
+                .to_rgba8();
         assert_eq!(decoded.into_raw(), rgba);
 
         let decoder = png::Decoder::new(std::io::Cursor::new(&result.png_data));
@@ -1679,9 +1949,10 @@ mod tests {
         assert!(!types.contains(b"sRGB"));
         assert!(!types.contains(b"iCCP"));
 
-        let decoded = image::load_from_memory_with_format(&result.png_data, image::ImageFormat::Png)
-            .expect("decode output PNG")
-            .to_rgba8();
+        let decoded =
+            image::load_from_memory_with_format(&result.png_data, image::ImageFormat::Png)
+                .expect("decode output PNG")
+                .to_rgba8();
         assert_eq!(decoded.into_raw(), rgba);
     }
 }

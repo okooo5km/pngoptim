@@ -50,6 +50,23 @@ pub fn quantize_indexed(
     height: usize,
     settings: QuantizerSettings,
 ) -> IndexedImage {
+    quantize_indexed_with_boost(rgba, width, height, settings, None)
+}
+
+/// Quantize with a per-pixel histogram weight multiplier.
+///
+/// `importance_boost` scales each pixel's contribution to the palette-search
+/// histogram (1 = unchanged). It is used by the local-error feedback pass to
+/// give small regions the palette search starved in the first pass (e.g. a
+/// small colorful avatar inside a large gray UI screenshot) enough weight to
+/// earn palette entries. Remap is unaffected.
+pub(crate) fn quantize_indexed_with_boost(
+    rgba: &[u8],
+    width: usize,
+    height: usize,
+    settings: QuantizerSettings,
+    importance_boost: Option<&[u16]>,
+) -> IndexedImage {
     let pixel_count = width.saturating_mul(height);
     if pixel_count == 0 {
         return IndexedImage {
@@ -82,6 +99,7 @@ pub fn quantize_indexed(
         settings.max_histogram_entries,
         &gamma,
         importance_map,
+        importance_boost,
     );
 
     let (mut palette, palette_error) = find_best_palette(&histogram, settings);
@@ -172,6 +190,7 @@ pub fn quantize_indexed_with_importance(
         settings.max_histogram_entries,
         &gamma,
         importance_map,
+        None,
     );
 
     let (mut palette, palette_error) = find_best_palette(&histogram, settings);
@@ -268,6 +287,7 @@ pub fn quantize_indexed_with_background(
         settings.max_histogram_entries,
         &gamma,
         importance_map,
+        None,
     );
 
     // When background is provided, inject a transparent color into the
@@ -714,8 +734,9 @@ pub(crate) fn build_histogram(
     max_histogram_entries: u32,
     gamma: &[f32; 256],
     importance_map: Option<&[u8]>,
+    importance_boost: Option<&[u16]>,
 ) -> HistogramData {
-    let mut map = build_histogram_map(rgba, importance_map);
+    let mut map = build_histogram_map_boosted(rgba, importance_map, importance_boost);
     let mut bits = 0u8;
     let requested_bits = initial_posterize_bits.min(3);
     if requested_bits > 0 {
@@ -729,6 +750,14 @@ pub(crate) fn build_histogram(
 }
 
 pub(crate) fn build_histogram_map(rgba: &[u8], importance_map: Option<&[u8]>) -> HistMap {
+    build_histogram_map_boosted(rgba, importance_map, None)
+}
+
+fn build_histogram_map_boosted(
+    rgba: &[u8],
+    importance_map: Option<&[u8]>,
+    importance_boost: Option<&[u16]>,
+) -> HistMap {
     let pixel_count = rgba.len() / 4;
     let num_threads = rayon::current_num_threads().max(1);
     let chunk_pixels = pixel_count.div_ceil(num_threads);
@@ -750,6 +779,11 @@ pub(crate) fn build_histogram_map(rgba: &[u8], importance_map: Option<&[u8]>) ->
                         .and_then(|m| m.get(pixel_idx))
                         .copied()
                         .unwrap_or(255),
+                ) * u32::from(
+                    importance_boost
+                        .and_then(|m| m.get(pixel_idx))
+                        .copied()
+                        .unwrap_or(1),
                 );
                 entry.importance_sum = entry.importance_sum.saturating_add(importance);
                 if !entry.initialized {
@@ -2880,7 +2914,7 @@ mod tests {
         let mut expected_map = super::build_histogram_map(&rgba, None);
         super::reposterize_histogram_map(&mut expected_map, 1);
         let expected = super::finalize_histogram(expected_map, &gamma);
-        let histogram = super::build_histogram(&rgba, 8, 0, 4, &gamma, None);
+        let histogram = super::build_histogram(&rgba, 8, 0, 4, &gamma, None, None);
 
         assert_eq!(histogram.items.len(), expected.items.len());
         assert!(histogram.items.len() > 4);
