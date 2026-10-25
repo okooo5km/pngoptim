@@ -400,33 +400,56 @@ fn evaluate_candidate(
         return first;
     }
     let threshold = local_shift_threshold(quality_targets);
-    let first_report = local_shift_report(rgba, &first, width, height, threshold);
-    let Some(boost) = first_report.boost_map(width, height) else {
-        return first;
-    };
-    // One feedback pass: a second one was measured to plateau, since the
-    // first already recovers what the palette budget allows.
-    let second = evaluate_candidate_once(
-        rgba,
-        width,
-        height,
-        max_colors,
-        output_posterize_bits,
-        speed_settings,
-        quality_targets,
-        dither_level,
-        Some(&boost),
-    );
-    let second_report = local_shift_report(rgba, &second, width, height, threshold);
-    let meets_floor = quality_targets
-        .max_mse
-        .is_none_or(|max_mse| second.quality.internal_mse <= max_mse);
-    if meets_floor && second_report.excess < first_report.excess {
-        second
-    } else {
-        first
+    let mut best_report = local_shift_report(rgba, &first, width, height, threshold);
+    let mut best = first;
+    let mut boost: Option<Vec<u16>> = None;
+    for _ in 0..LOCAL_FEEDBACK_ROUNDS {
+        if !best_report.worth_a_pass() {
+            break;
+        }
+        let Some(round_boost) = best_report.boost_map(width, height) else {
+            break;
+        };
+        // Accumulate: re-weighting one region can starve another small
+        // colourful region (seen on a real screenshot: restoring a cyan
+        // avatar pushed a red close button to brown), so later rounds keep
+        // every earlier boost and add the newly failing blocks on top.
+        let merged = match boost.take() {
+            Some(mut prev) => {
+                for (p, b) in prev.iter_mut().zip(&round_boost) {
+                    *p = (*p).max(*b);
+                }
+                prev
+            }
+            None => round_boost,
+        };
+        let candidate = evaluate_candidate_once(
+            rgba,
+            width,
+            height,
+            max_colors,
+            output_posterize_bits,
+            speed_settings,
+            quality_targets,
+            dither_level,
+            Some(&merged),
+        );
+        let report = local_shift_report(rgba, &candidate, width, height, threshold);
+        boost = Some(merged);
+        let meets_floor = quality_targets
+            .max_mse
+            .is_none_or(|max_mse| candidate.quality.internal_mse <= max_mse);
+        if !meets_floor || report.excess >= best_report.excess {
+            break;
+        }
+        best = candidate;
+        best_report = report;
     }
+    best
 }
+
+/// Extra quantization passes spent on starved regions.
+const LOCAL_FEEDBACK_ROUNDS: usize = 2;
 
 /// Block edge (pixels) for the local-error feedback pass.
 const LOCAL_BLOCK: usize = 16;
@@ -453,6 +476,9 @@ const LOCAL_SHIFT_FLOOR_QUALITY: u8 = 80;
 /// Minimum area-weighted excess (≈ number of 16×16 blocks whose mean colour
 /// is twice over the threshold) before a feedback pass is worth its cost.
 const LOCAL_MIN_EXCESS: f64 = 4.0;
+/// A single block whose mean colour shift reaches this multiple of the
+/// threshold is worth a pass on its own.
+const LOCAL_MIN_MAX_RATIO: f64 = 2.0;
 
 struct LocalShiftReport {
     /// Block-grid width.
@@ -461,16 +487,25 @@ struct LocalShiftReport {
     block_boost: Vec<u16>,
     block_pixels: Vec<u32>,
     failing_blocks: usize,
+    /// Worst per-block shift / threshold.
+    max_ratio: f64,
     /// Sum over failing blocks of (shift / threshold - 1), weighted by area.
     excess: f64,
 }
 
 impl LocalShiftReport {
+    /// A pass costs a full re-quantization, so it is only spent when the
+    /// damage is visible: a sizeable area over the threshold, or at least one
+    /// block shifted well past it (e.g. a small saturated button).
+    fn worth_a_pass(&self) -> bool {
+        self.excess >= LOCAL_MIN_EXCESS || self.max_ratio >= LOCAL_MIN_MAX_RATIO
+    }
+
     fn boost_map(&self, width: usize, height: usize) -> Option<Vec<u16>> {
         let total_blocks = self.block_boost.len();
         // Nothing to fix, or most of the image fails: the global gate already
         // sees that and a re-weighting would just shift error around.
-        if self.excess < LOCAL_MIN_EXCESS || self.failing_blocks * 2 > total_blocks {
+        if self.failing_blocks == 0 || self.failing_blocks * 2 > total_blocks {
             return None;
         }
         // Failing blocks are usually a tiny fraction of the image, so a boost
@@ -545,6 +580,7 @@ fn local_shift_report(
     let mut block_boost = vec![0u16; columns * rows];
     let mut failing_blocks = 0usize;
     let mut excess = 0.0f64;
+    let mut max_ratio = 0.0f64;
     for block in 0..columns * rows {
         let n = f64::from(counts[block].max(1));
         let mean = |v: &[f64; 4]| InternalPixel {
@@ -554,6 +590,7 @@ fn local_shift_report(
             b: (v[3] / n) as f32,
         };
         let shift = f64::from(mean(&src_sum[block]).diff(mean(&dst_sum[block])));
+        max_ratio = max_ratio.max(shift / threshold);
         if shift > threshold {
             let ratio = shift / threshold;
             failing_blocks += 1;
@@ -566,6 +603,7 @@ fn local_shift_report(
         block_boost,
         block_pixels: counts,
         failing_blocks,
+        max_ratio,
         excess,
     }
 }
@@ -1498,7 +1536,7 @@ mod tests {
     }
 
     #[test]
-    fn small_colorful_region_in_gray_screenshot_keeps_its_chroma() {
+    fn small_colorful_regions_in_gray_screenshot_keep_their_chroma() {
         // A dark UI screenshot: many gray levels everywhere (anti-aliased text)
         // plus one small, low-saturation cyan avatar. The global quality gate
         // alone maps the avatar onto the dominant grays (see 2026-10 Zipic
@@ -1531,6 +1569,12 @@ mod tests {
                 rgba[i..i + 4].copy_from_slice(&[70 + t, 110 + t, 118 + t, 255]);
             }
         }
+        for y in 0..16 {
+            for x in 0..16 {
+                let i = ((200 + y) * width + 240 + x) * 4;
+                rgba[i..i + 4].copy_from_slice(&[150, 45, 50, 255]);
+            }
+        }
         let input = encode_test_rgba_png(width as u32, height as u32, &rgba, None, None);
         let options = PipelineOptions {
             quality: Some(crate::cli::QualityRange {
@@ -1551,6 +1595,28 @@ mod tests {
             out_gr >= src_gr * 0.7 && out_br >= src_br * 0.7,
             "avatar chroma collapsed: source ({src_gr:.1}, {src_br:.1}) -> output ({out_gr:.1}, {out_br:.1})"
         );
+
+        // A small saturated red button next to the avatar (the real report's
+        // close button): restoring the avatar must not starve it.
+        let (bx, by, bsize) = (240usize, 200usize, 16usize);
+        let src_red = mean_red_excess(&rgba, width, bx, by, bsize);
+        let out_red = mean_red_excess(output.as_raw(), width, bx, by, bsize);
+        assert!(
+            out_red >= src_red * 0.7,
+            "red button chroma collapsed: source {src_red:.1} -> output {out_red:.1}"
+        );
+    }
+
+    /// Mean (r - (g + b) / 2) of a square, i.e. how red it is.
+    fn mean_red_excess(rgba: &[u8], width: usize, x0: usize, y0: usize, size: usize) -> f64 {
+        let mut sum = 0.0;
+        for y in y0..y0 + size {
+            for x in x0..x0 + size {
+                let i = (y * width + x) * 4;
+                sum += f64::from(rgba[i]) - (f64::from(rgba[i + 1]) + f64::from(rgba[i + 2])) / 2.0;
+            }
+        }
+        sum / (size * size) as f64
     }
 
     fn encode_test_rgba_png(
