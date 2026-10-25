@@ -21,11 +21,11 @@
 
 ## 4. Local Validation
 
-提交前至少运行：
+提交前至少运行（与 CI 的 Test / Clippy / Format 三项完全一致，本地不过就别推）：
 ```bash
-cargo fmt
-cargo check
-cargo test
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
 ```
 
 按变更类型补充：
@@ -54,3 +54,13 @@ cargo run --release --bin xtask -- stability --run-id stability-local --binary t
 
 1. 问题定位优先给最小可重放命令
 2. 性能争议优先看结构化报告，不做主观截图争论
+
+## 8. Toolchain & Release
+
+1. Rust 版本由 `rust-toolchain.toml` 唯一确定（本地与 CI 同一版本），CI 不再跟随浮动的 `stable`。
+2. 升级工具链是一次显式变更：改 `channel` 后，在同一个提交里修完 `cargo fmt` / `cargo clippy` 的全部新提示，CI 保持全绿。
+3. 打 tag 发版前必须：
+   - 本地跑完第 4 节三条命令；
+   - `gh run list --workflow CI --branch main --limit 1` 确认 main 最新一次 CI 为 `success`，红的先修再发；
+   - Release workflow 的 `lint` job 与 CI 同门禁，不过则 `Create Release` 不会执行。
+

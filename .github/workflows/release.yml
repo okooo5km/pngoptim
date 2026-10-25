@@ -11,21 +11,34 @@ permissions:
   contents: write
 
 jobs:
+  # Same gate as CI. A tag must not publish while fmt/clippy fail: 0.5.4 and
+  # 0.5.5 shipped with main's CI red because Release only ran tests.
+  lint:
+    name: Lint (fmt + clippy)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install Rust toolchain (rust-toolchain.toml)
+        run: rustup toolchain install --no-self-update
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+
   build-macos:
     name: macOS Universal
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: aarch64-apple-darwin,x86_64-apple-darwin
+      - name: Install Rust toolchain (rust-toolchain.toml)
+        run: rustup toolchain install --no-self-update
+      - name: Add cross-compile targets
+        run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
       - uses: actions/cache@v5
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-${{ hashFiles('rust-toolchain.toml', '**/Cargo.lock') }}
 
       - name: Test
         run: cargo test
@@ -63,14 +76,15 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Install Rust toolchain (rust-toolchain.toml)
+        run: rustup toolchain install --no-self-update
       - uses: actions/cache@v5
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-${{ hashFiles('rust-toolchain.toml', '**/Cargo.lock') }}
 
       - name: Build
         run: cargo build --release
@@ -92,14 +106,15 @@ jobs:
     runs-on: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Install Rust toolchain (rust-toolchain.toml)
+        run: rustup toolchain install --no-self-update
       - uses: actions/cache@v5
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-${{ hashFiles('rust-toolchain.toml', '**/Cargo.lock') }}
 
       - name: Build
         run: cargo build --release
@@ -121,14 +136,15 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Install Rust toolchain (rust-toolchain.toml)
+        run: rustup toolchain install --no-self-update
       - uses: actions/cache@v5
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-${{ hashFiles('rust-toolchain.toml', '**/Cargo.lock') }}
 
       - name: Build
         run: cargo build --release
@@ -151,21 +167,17 @@ jobs:
     runs-on: macos-15
     steps:
       - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: >-
-            aarch64-apple-darwin,
-            x86_64-apple-darwin,
-            aarch64-apple-ios,
-            aarch64-apple-ios-sim,
-            x86_64-apple-ios
+      - name: Install Rust toolchain (rust-toolchain.toml)
+        run: rustup toolchain install --no-self-update
+      - name: Add cross-compile targets
+        run: rustup target add aarch64-apple-darwin x86_64-apple-darwin aarch64-apple-ios aarch64-apple-ios-sim x86_64-apple-ios
       - uses: actions/cache@v5
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-${{ hashFiles('rust-toolchain.toml', '**/Cargo.lock') }}
 
       - name: Build XCFramework
         run: bash scripts/build-xcframework.sh
@@ -187,7 +199,7 @@ jobs:
 
   release:
     name: Create Release
-    needs: [build-macos, build-linux-x86_64, build-linux-arm64, build-windows, build-xcframework]
+    needs: [lint, build-macos, build-linux-x86_64, build-linux-arm64, build-windows, build-xcframework]
     runs-on: ubuntu-latest
     steps:
       # Wipe the download directory first so leftovers can never reach the

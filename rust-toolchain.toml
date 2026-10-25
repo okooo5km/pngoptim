@@ -1,0 +1,11 @@
+# Single source of truth for the Rust toolchain used locally and in CI.
+#
+# Pinned on purpose: CI used to float on `stable`, so a new Rust release
+# turned main red (new clippy lints / rustfmt changes) without any code change,
+# and tags kept shipping on top of it. Upgrading is a deliberate change: bump
+# `channel`, then fix every `cargo fmt` / `cargo clippy` finding in the same
+# commit so CI stays green.
+[toolchain]
+channel = "1.99.0"
+components = ["clippy", "rustfmt"]
+profile = "minimal"

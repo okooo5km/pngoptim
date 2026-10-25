@@ -27,6 +27,7 @@
 4. 目前不直接复制或链接参考实现代码进入主线，不是出于教条式自研，而是因为当前项目已按 MIT 发布，直接引入参考实现代码需要先明确许可证策略与仓库治理方案。
 5. 如果后续决定直接复用参考实现代码，必须先把许可证、分发方式、仓库结构和发布策略记录进文档，再执行代码接入。
 6. 后续所有算法复刻工作采用 `reference-first` 纪律：先对照本地参考仓库对应模块提炼实现细节、启发式和边界条件，再编码；禁止脱离参考实现结构凭感觉连续打补丁。
+7. 工具链钉死在 `rust-toolchain.toml`；发版（打 tag）前 main 的 CI 必须全绿，本地先跑 `cargo fmt --all -- --check`、`cargo clippy --workspace --all-targets -- -D warnings`、`cargo test --workspace`。0.5.4/0.5.5 曾在 CI 红着的情况下发版（浮动 stable 引入新 lint + Release 不跑 lint），详见 `CONTRIBUTING.md` 第 8 节。
 
 ## 2. 分阶段开发规划（不设周期，仅阶段）
 

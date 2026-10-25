@@ -19,14 +19,15 @@ jobs:
         os: [ubuntu-latest, macos-latest]
     steps:
       - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Install Rust toolchain (rust-toolchain.toml)
+        run: rustup toolchain install --no-self-update
       - uses: actions/cache@v5
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-${{ hashFiles('rust-toolchain.toml', '**/Cargo.lock') }}
       - run: cargo test --workspace
       - run: cargo build --release
       - run: ./target/release/pngoptim --version
@@ -36,24 +37,22 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
+      - name: Install Rust toolchain (rust-toolchain.toml)
+        run: rustup toolchain install --no-self-update
       - uses: actions/cache@v5
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-      - run: cargo clippy --workspace -- -D warnings
+          key: ${{ runner.os }}-cargo-${{ hashFiles('rust-toolchain.toml', '**/Cargo.lock') }}
+      - run: cargo clippy --workspace --all-targets -- -D warnings
 
   fmt:
     name: Format
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt
+      - name: Install Rust toolchain (rust-toolchain.toml)
+        run: rustup toolchain install --no-self-update
       - run: cargo fmt --all -- --check
