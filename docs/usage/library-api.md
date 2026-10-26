@@ -107,6 +107,10 @@ pub enum AppError {
 
 `AppError` implements `std::error::Error` and `Display`. Use `exit_code()` to get the appropriate process exit code.
 
+## Low-level Quantizer: `palette_quant`
+
+`palette_quant::quantize_indexed(rgba, width, height, settings)` quantizes raw RGBA without the PNG pipeline. Build `QuantizerSettings` with `palette_quant::quantizer_settings(...)`; it sets `photo_palette: true`, which builds the palette of opaque photo-like images in Oklab (Wu + online k-means). Set `photo_palette: false` to always use the default median cut + k-means search (the PNG pipeline does this automatically when the photo palette misses the `--quality` minimum).
+
 ## APNG Handling
 
 APNG files are automatically detected and routed to the lossless optimization path. The `apng_mode` field in `PipelineOptions` controls the optimization level (see [APNG docs](apng.md)).

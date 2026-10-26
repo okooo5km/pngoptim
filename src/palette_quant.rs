@@ -42,6 +42,10 @@ pub struct QuantizerSettings {
     pub dither_level: f32,
     pub use_dither_map: DitherMapMode,
     pub use_contrast_maps: bool,
+    /// Build the palette of opaque photo-like images with Wu's quantizer and
+    /// online k-means in Oklab (see `photo_palette.rs`); other images, and
+    /// photos where it does not hold the error, keep the default search.
+    pub photo_palette: bool,
 }
 
 pub fn quantize_indexed(
@@ -50,7 +54,7 @@ pub fn quantize_indexed(
     height: usize,
     settings: QuantizerSettings,
 ) -> IndexedImage {
-    quantize_indexed_with_boost(rgba, width, height, settings, None)
+    quantize_indexed_with_boost(rgba, width, height, settings, None).0
 }
 
 /// Quantize with a per-pixel histogram weight multiplier.
@@ -60,19 +64,23 @@ pub fn quantize_indexed(
 /// give small regions the palette search starved in the first pass (e.g. a
 /// small colorful avatar inside a large gray UI screenshot) enough weight to
 /// earn palette entries. Remap is unaffected.
+///
+/// Also returns whether the palette came from the photo builder
+/// (`settings.photo_palette` and the image qualified).
 pub(crate) fn quantize_indexed_with_boost(
     rgba: &[u8],
     width: usize,
     height: usize,
     settings: QuantizerSettings,
     importance_boost: Option<&[u16]>,
-) -> IndexedImage {
+) -> (IndexedImage, bool) {
     let pixel_count = width.saturating_mul(height);
     if pixel_count == 0 {
-        return IndexedImage {
+        let empty = IndexedImage {
             palette: vec![[0, 0, 0, 0]],
             indices: Vec::new(),
         };
+        return (empty, false);
     }
     let gamma = gamma_lut(SRGB_OUTPUT_GAMMA);
     let contrast_pixels =
@@ -102,7 +110,21 @@ pub(crate) fn quantize_indexed_with_boost(
         importance_boost,
     );
 
-    let (mut palette, palette_error) = find_best_palette(&histogram, settings);
+    let (mut palette, mut palette_error) = find_best_palette(&histogram, settings);
+    let mut used_photo_palette = false;
+    if settings.photo_palette
+        && let Some((photo, photo_error)) = photo_palette(
+            &histogram,
+            palette.len(),
+            palette_error,
+            width * height,
+            settings,
+        )
+    {
+        palette = photo;
+        palette_error = Some(photo_error);
+        used_photo_palette = true;
+    }
     if palette.is_empty() {
         palette = vec![PaletteEntry {
             color: InternalPixel::default(),
@@ -115,7 +137,7 @@ pub(crate) fn quantize_indexed_with_boost(
         .iter()
         .map(|entry| (entry.color, entry.color.to_rgba(SRGB_OUTPUT_GAMMA)))
         .collect::<Vec<_>>();
-    remap_image(
+    let indexed = remap_image(
         rgba,
         width,
         height,
@@ -126,7 +148,131 @@ pub(crate) fn quantize_indexed_with_boost(
         edges_map,
         contrast_pixels.as_deref(),
         None,
-    )
+    );
+    (indexed, used_photo_palette)
+}
+
+/// Opaque images count as photo-like from this many distinct colors...
+const PHOTO_MIN_COLORS: usize = 4096;
+/// ...when they have at most this many pixels per distinct color. UI screenshots have
+/// large flat areas (hundreds of pixels per color) whose exact colors Wu's
+/// fixed grid would average away; photos sit well below 100.
+const PHOTO_MAX_PIXELS_PER_COLOR: usize = 100;
+/// Large photos with smooth areas can exceed that ratio, so an image also
+/// counts as photo-like when its most common colors hold at most this share of
+/// the histogram weight (UI: flat backgrounds hold over half).
+const PHOTO_DOMINANT_COLORS: usize = 16;
+const PHOTO_MAX_DOMINANT_SHARE: f64 = 0.25;
+/// The photo palette is dropped when its error (in the quantizer's own space)
+/// exceeds the default palette's by more than this factor. Oklab spends error
+/// where gamma RGB under-weights it, so a moderate excess is expected and
+/// still scores better; a large one means the image is not photo-like.
+const PHOTO_MAX_ERROR_RATIO: f64 = 1.5;
+
+/// Palette for opaque photo-like images: Wu's quantizer on the histogram in
+/// Oklab, refined by online k-means sampling the histogram by weight, with as
+/// many colors as the default search chose. `None` when the image does not
+/// qualify or the result does not hold the error bounds.
+fn photo_palette(
+    histogram: &HistogramData,
+    colors: usize,
+    default_error: Option<f64>,
+    pixels: usize,
+    settings: QuantizerSettings,
+) -> Option<(Vec<PaletteEntry>, f64)> {
+    use crate::photo_palette as pp;
+    let items = histogram.items.len();
+    if colors < 2
+        || items <= colors
+        || items < PHOTO_MIN_COLORS
+        || histogram.items.iter().any(|item| item.rgba[3] != 255)
+        || (items.saturating_mul(PHOTO_MAX_PIXELS_PER_COLOR) < pixels
+            && dominant_share(histogram) > PHOTO_MAX_DOMINANT_SHARE)
+    {
+        return None;
+    }
+    // Histogram order follows hash-map iteration; sort so the result is fixed.
+    let mut weighted: Vec<([u8; 3], f32)> = histogram
+        .items
+        .iter()
+        .map(|item| {
+            (
+                [item.rgba[0], item.rgba[1], item.rgba[2]],
+                item.perceptual_weight,
+            )
+        })
+        .collect();
+    weighted.sort_unstable_by_key(|entry| entry.0);
+    let entries = pp::entries(&weighted);
+    let mut centers = pp::wu(&entries, colors);
+    let samples = pixels.min(pp::ONLINE_SAMPLES);
+    let counts = pp::online_kmeans_weighted(&entries, &mut centers, samples);
+    let gamma = gamma_lut(SRGB_OUTPUT_GAMMA);
+    let mut palette: Vec<PaletteEntry> = Vec::with_capacity(centers.len());
+    for (center, count) in centers.iter().zip(counts) {
+        let rgb = pp::oklab_to_rgb(*center);
+        let rgba = [rgb[0], rgb[1], rgb[2], 255];
+        if let Some(existing) = palette
+            .iter_mut()
+            .find(|entry| entry.color.to_rgba(SRGB_OUTPUT_GAMMA) == rgba)
+        {
+            existing.popularity += count as f32;
+            continue;
+        }
+        palette.push(PaletteEntry {
+            color: InternalPixel::from_rgba(&gamma, &rgba),
+            popularity: count as f32,
+        });
+    }
+
+    let error = histogram_error(
+        &histogram.items,
+        &palette,
+        histogram.total_perceptual_weight,
+    );
+    let within_default = default_error
+        .is_none_or(|default| error <= default.max(f64::MIN_POSITIVE) * PHOTO_MAX_ERROR_RATIO);
+    let within_floor = settings.max_mse.is_none_or(|max_mse| error <= max_mse);
+    (within_default && within_floor).then_some((palette, error))
+}
+
+/// Share of the histogram weight held by its `PHOTO_DOMINANT_COLORS` heaviest entries.
+fn dominant_share(histogram: &HistogramData) -> f64 {
+    let mut weights = histogram
+        .items
+        .iter()
+        .map(|item| item.perceptual_weight)
+        .collect::<Vec<_>>();
+    let n = PHOTO_DOMINANT_COLORS.min(weights.len());
+    if n == 0 {
+        return 1.0;
+    }
+    if n < weights.len() {
+        weights.select_nth_unstable_by(n - 1, |a, b| b.total_cmp(a));
+    }
+    let top: f64 = weights[..n].iter().map(|&w| f64::from(w)).sum();
+    top / histogram.total_perceptual_weight.max(1e-9)
+}
+
+/// Weighted mean nearest-color error of the histogram against a palette,
+/// summed per fixed chunk in order (thread-count independent).
+fn histogram_error(items: &[HistItem], palette: &[PaletteEntry], total_weight: f64) -> f64 {
+    let points = palette.iter().map(|entry| entry.color).collect::<Vec<_>>();
+    let tree = NearestTree::new(&points);
+    let sum: f64 = items
+        .par_chunks(KMEANS_CHUNK)
+        .map(|chunk| {
+            chunk
+                .iter()
+                .map(|item| {
+                    f64::from(tree.search(item.color, 0).1) * f64::from(item.perceptual_weight)
+                })
+                .sum::<f64>()
+        })
+        .collect::<Vec<_>>()
+        .into_iter()
+        .sum();
+    sum / total_weight.max(1e-9)
 }
 
 /// Quantize with an external importance map (e.g. from a temporal denoiser).
@@ -361,12 +507,15 @@ pub fn quantizer_settings(
         dither_level,
         use_dither_map: speed.use_dither_map,
         use_contrast_maps: speed.use_contrast_maps,
+        photo_palette: true,
     }
 }
 
 #[derive(Debug, Clone, Copy)]
 struct HistItem {
     color: InternalPixel,
+    /// Source sRGB(A) of this entry (the first pixel seen with this key).
+    rgba: [u8; 4],
     adjusted_weight: f32,
     perceptual_weight: f32,
     mc_color_weight: f32,
@@ -881,6 +1030,7 @@ fn inject_fixed_transparent(histogram: &mut HistogramData) {
         insert_pos,
         HistItem {
             color: InternalPixel::default(),
+            rgba: [0, 0, 0, 0],
             adjusted_weight: min_weight,
             perceptual_weight: min_weight,
             mc_color_weight: 0.0,
@@ -931,6 +1081,7 @@ pub(crate) fn finalize_histogram(map: HistMap, gamma: &[f32; 256]) -> HistogramD
     let mut items = vec![
         HistItem {
             color: InternalPixel::default(),
+            rgba: [0, 0, 0, 0],
             adjusted_weight: 0.0,
             perceptual_weight: 0.0,
             mc_color_weight: 0.0,
@@ -951,6 +1102,7 @@ pub(crate) fn finalize_histogram(map: HistMap, gamma: &[f32; 256]) -> HistogramD
 
         items[next_index] = HistItem {
             color: InternalPixel::from_rgba(gamma, &item.representative),
+            rgba: item.representative,
             adjusted_weight: weight,
             perceptual_weight: weight,
             mc_color_weight: 0.0,
@@ -2873,6 +3025,84 @@ mod tests {
     };
     use crate::quality::{DitherMapMode, SRGB_OUTPUT_GAMMA};
 
+    /// Opaque test image: `photo` gives a noisy gradient (a distinct color for
+    /// almost every pixel), otherwise a flat four-color "UI" layout.
+    fn synthetic_rgba(width: usize, height: usize, photo: bool) -> Vec<u8> {
+        let mut out = Vec::with_capacity(width * height * 4);
+        let mut state = 12345u32;
+        for y in 0..height {
+            for x in 0..width {
+                state = state.wrapping_mul(1_103_515_245).wrapping_add(12345);
+                let noise = ((state >> 16) % 24) as usize;
+                let px = if photo {
+                    [
+                        ((x * 255 / width + noise) % 256) as u8,
+                        ((y * 255 / height + noise / 2) % 256) as u8,
+                        (((x + y) * 127 / (width + height) + noise) % 256) as u8,
+                        255,
+                    ]
+                } else {
+                    match (x * 4 / width, y * 2 / height) {
+                        (0, _) => [32, 32, 36, 255],
+                        (_, 0) => [250, 250, 250, 255],
+                        (1, _) => [0, 122, 255, 255],
+                        _ => [255, 255, 255, 255],
+                    }
+                };
+                out.extend_from_slice(&px);
+            }
+        }
+        out
+    }
+
+    fn photo_palette_for(rgba: &[u8], width: usize, height: usize) -> bool {
+        let settings =
+            quantizer_settings(256, SpeedSettings::from_speed(4), 0.0, None, false, 0, 1.0);
+        let gamma = gamma_lut(SRGB_OUTPUT_GAMMA);
+        let histogram = super::build_histogram(
+            rgba,
+            width,
+            0,
+            settings.max_histogram_entries,
+            &gamma,
+            None,
+            None,
+        );
+        let (palette, error) = super::find_best_palette(&histogram, settings);
+        super::photo_palette(&histogram, palette.len(), error, width * height, settings).is_some()
+    }
+
+    #[test]
+    fn photo_palette_applies_to_opaque_photos_only() {
+        let (w, h) = (256, 192);
+        let photo = synthetic_rgba(w, h, true);
+        assert!(photo_palette_for(&photo, w, h));
+        assert!(!photo_palette_for(&synthetic_rgba(w, h, false), w, h));
+        // One translucent pixel disables it.
+        let mut translucent = photo.clone();
+        translucent[3] = 128;
+        assert!(!photo_palette_for(&translucent, w, h));
+    }
+
+    #[test]
+    fn quantize_is_thread_count_independent() {
+        let (w, h) = (256, 192);
+        let photo = synthetic_rgba(w, h, true);
+        let settings =
+            quantizer_settings(256, SpeedSettings::from_speed(4), 0.0, None, false, 0, 1.0);
+        let run = |threads: usize| {
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap()
+                .install(|| quantize_indexed(&photo, w, h, settings))
+        };
+        let one = run(1);
+        let four = run(4);
+        assert_eq!(one.palette, four.palette);
+        assert_eq!(one.indices, four.indices);
+    }
+
     #[test]
     fn merge_histogram_maps_combines_importance_sums() {
         let rgba_a = vec![255u8, 0, 0, 255, 0, 255, 0, 255];
@@ -2993,6 +3223,7 @@ mod tests {
             dither_level: 1.0,
             use_dither_map: DitherMapMode::Enabled,
             use_contrast_maps: false,
+            photo_palette: false,
         };
 
         let pixels = rgba
@@ -3080,6 +3311,7 @@ mod tests {
                 g: 0.2,
                 b: 0.3,
             },
+            rgba: [0, 0, 0, 255],
             adjusted_weight: 7.5,
             perceptual_weight: 1.0,
             mc_color_weight: 0.0,
@@ -3122,6 +3354,7 @@ mod tests {
             dither_level: 1.0,
             use_dither_map: DitherMapMode::None,
             use_contrast_maps: false,
+            photo_palette: false,
         }
     }
 
@@ -3163,6 +3396,7 @@ mod tests {
         let gamma = gamma_lut(SRGB_OUTPUT_GAMMA);
         let mut histogram = vec![super::HistItem {
             color: InternalPixel::from_rgba(&gamma, &[255, 16, 16, 16]),
+            rgba: [255, 16, 16, 16],
             adjusted_weight: 1.0,
             perceptual_weight: 1.0,
             mc_color_weight: 1.0,

@@ -21,5 +21,6 @@ pub mod apng;
 pub mod cli;
 pub mod error;
 pub mod palette_quant;
+mod photo_palette;
 pub mod pipeline;
 pub mod quality;

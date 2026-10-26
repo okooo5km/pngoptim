@@ -14,13 +14,13 @@ use crate::apng::{
 use crate::cli::{ApngMode, QualityRange};
 use crate::error::AppError;
 use crate::palette_quant::{
-    IndexedImage, build_histogram_map, finalize_histogram, find_best_palette, merge_histogram_maps,
-    quantize_indexed_with_boost, quantizer_settings, remap_to_fixed_palette,
+    IndexedImage, QuantizerSettings, build_histogram_map, finalize_histogram, find_best_palette,
+    merge_histogram_maps, quantize_indexed_with_boost, quantizer_settings, remap_to_fixed_palette,
     reposterize_histogram_map, sort_palette_entries,
 };
 use crate::quality::{
     InternalPixel, QualityMetrics, SRGB_OUTPUT_GAMMA, SpeedSettings, evaluate_quality_against_rgba,
-    gamma_lut, quality_to_mse,
+    gamma_lut, mse_to_quality, quality_to_mse,
 };
 
 const DEFAULT_MAX_COLORS: usize = 256;
@@ -629,10 +629,51 @@ fn evaluate_candidate_once(
         output_posterize_bits,
         dither_level,
     );
-    let indexed = quantize_indexed_with_boost(rgba, width, height, quantizer, importance_boost);
+    let (candidate, used_photo_palette) =
+        quantize_and_measure(rgba, width, height, quantizer, importance_boost);
+    // The photo palette (Oklab) is checked against the error bounds before
+    // remap, but dithering can still push a borderline result under the
+    // requested minimum. The default palette then gets its own chance, so
+    // `--quality min` passes whenever it did without the photo palette. A
+    // result several quality points short would miss with either palette
+    // (they differ by about one point), so it is not re-run.
+    if used_photo_palette
+        && let Some(max_mse) = quality_targets.max_mse
+        && candidate.quality.internal_mse > max_mse
+        && candidate
+            .quality
+            .quality_score
+            .saturating_add(PHOTO_FALLBACK_MAX_SHORTFALL)
+            >= mse_to_quality(max_mse)
+    {
+        let fallback = QuantizerSettings {
+            photo_palette: false,
+            ..quantizer
+        };
+        let (retry, _) = quantize_and_measure(rgba, width, height, fallback, importance_boost);
+        if retry.quality.internal_mse < candidate.quality.internal_mse {
+            return retry;
+        }
+    }
+    candidate
+}
+
+/// Quality points below `--quality` min within which a photo-palette result
+/// is re-quantized with the default palette.
+const PHOTO_FALLBACK_MAX_SHORTFALL: u8 = 3;
+
+fn quantize_and_measure(
+    rgba: &[u8],
+    width: usize,
+    height: usize,
+    quantizer: QuantizerSettings,
+    importance_boost: Option<&[u16]>,
+) -> (QuantizeCandidate, bool) {
+    let (indexed, used_photo_palette) =
+        quantize_indexed_with_boost(rgba, width, height, quantizer, importance_boost);
     let remapped_rgba = remapped_rgba_from_indices(&indexed.indices, &indexed.palette);
     let quality = evaluate_quality_against_rgba(rgba, &remapped_rgba);
-    QuantizeCandidate { indexed, quality }
+    (QuantizeCandidate { indexed, quality }, used_photo_palette)
 }
 
 fn quantize_apng_frames(
