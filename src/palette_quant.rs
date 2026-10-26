@@ -728,6 +728,11 @@ fn hist_item_sort_half(mut base: &mut [HistItem], mut weight_half_sum: f64) -> u
 }
 
 const MAX_CLUSTERS: usize = 16;
+/// Histogram partial maps per image (thread-count independent).
+const HISTOGRAM_CHUNKS: usize = 8;
+const HISTOGRAM_MIN_CHUNK: usize = 1 << 16;
+/// Histogram items per k-means accumulator; fixed so sums merge in one order.
+const KMEANS_CHUNK: usize = 4096;
 
 pub(crate) fn build_histogram(
     rgba: &[u8],
@@ -761,8 +766,12 @@ fn build_histogram_map_boosted(
     importance_boost: Option<&[u16]>,
 ) -> HistMap {
     let pixel_count = rgba.len() / 4;
-    let num_threads = rayon::current_num_threads().max(1);
-    let chunk_pixels = pixel_count.div_ceil(num_threads);
+    // Fixed chunking (not per-thread): the merge order, and with it the map's
+    // iteration order and every float sum downstream, must not depend on the
+    // thread count.
+    let chunk_pixels = pixel_count
+        .div_ceil(HISTOGRAM_CHUNKS)
+        .max(HISTOGRAM_MIN_CHUNK);
     let chunk_bytes = chunk_pixels * 4;
 
     let partial_maps: Vec<HistMap> = rgba
@@ -1316,17 +1325,19 @@ fn kmeans_iteration(
         .sum::<f64>()
         .max(1e-9);
 
+    // Per fixed-size chunk accumulators merged in chunk order: float sums come
+    // out the same for any thread count.
     let acc = histogram
-        .par_chunks_mut(256)
+        .par_chunks_mut(KMEANS_CHUNK)
+        .map(|batch| {
+            let mut acc = KmeansAccumulator::new(palette.len());
+            kmeans_iteration_batch(batch, &tree, palette, adjust_weights, &mut acc);
+            acc
+        })
+        .collect::<Vec<_>>()
+        .into_iter()
         .fold(
-            || KmeansAccumulator::new(palette.len()),
-            |mut acc, batch| {
-                kmeans_iteration_batch(batch, &tree, palette, adjust_weights, &mut acc);
-                acc
-            },
-        )
-        .reduce(
-            || KmeansAccumulator::new(palette.len()),
+            KmeansAccumulator::new(palette.len()),
             KmeansAccumulator::merge,
         );
 
@@ -2351,6 +2362,9 @@ fn remap_image_dithered_rows(
         });
 }
 
+/// Upper bound on parallel dither strips (the default thread count on 8-core machines).
+const MAX_DITHER_CHUNKS: usize = 8;
+
 fn effective_dither_chunks(width: usize, height: usize) -> usize {
     if height <= 128 {
         return 1;
@@ -2358,7 +2372,9 @@ fn effective_dither_chunks(width: usize, height: usize) -> usize {
     let suggested = (width.saturating_mul(height) / 524_288)
         .min(height / 128)
         .max(2)
-        .min(rayon::current_num_threads());
+        // A fixed cap rather than the thread count: chunk boundaries reset the
+        // diffused error, so output must not depend on how many threads run.
+        .min(MAX_DITHER_CHUNKS);
     suggested.max(1)
 }
 
