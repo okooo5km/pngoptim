@@ -32,12 +32,13 @@ cargo run --release --bin xtask -- stability --run-id <id>
 | File | Lines | Purpose |
 |------|-------|---------|
 | `src/palette_quant.rs` | ~3200 | Core quantization: histogram, median cut, k-means, VP-tree nearest search, remap (plain + Floyd dithering), dither map, contrast maps, background-aware dithering |
-| `src/pipeline.rs` | ~850 | Processing pipeline: decode -> color management -> quantize -> encode. Hand-written PNG encoder with zlib-rs (dual mem_level). APNG detection/routing. Quality gating, metadata preservation, ICC/gAMA normalization |
+| `src/pipeline.rs` | ~850 | Processing pipeline: decode -> color management -> quantize -> encode. Hand-written PNG encoder: libdeflate level 12 via `src/deflate.rs` (speed ≤7), zlib-rs dual mem_level (speed 8–9), zlib-rs level 1 (speed ≥10); ≤16-color images also try 8-bit indices. APNG detection/routing. Quality gating, metadata preservation, ICC/gAMA normalization |
 | `src/quality.rs` | ~257 | InternalPixel (gamma-weighted ARGB), quality<->MSE mapping, SpeedSettings, quality evaluation |
 | `src/cli.rs` | ~293 | CLI argument parsing (clap), QualityRange, output path logic |
 | `src/main.rs` | ~252 | Entry point, batch processing, exit codes |
 | `src/error.rs` | ~79 | Error types (AppError) |
 | `src/apng.rs` | ~900 | APNG support: decode/encode/compose, lossless optimizations (duplicate frame folding, frame rect minimization) |
+| `src/deflate.rs` | ~350 | libdeflate level 12 zlib streams for IDAT/fdAT: row-aligned chunks compressed in parallel, stitched into one stream (BFINAL cleared + empty stored block); minimal deflate block walker |
 | `src/quant.rs` | ~115 | Legacy quantizer bridge (mostly unused) |
 | `src/bin/xtask.rs` | ~3148 | Test harness: smoke, compat, quality-size, perf, stability, cross-platform |
 
@@ -142,7 +143,7 @@ Key details:
 
 ## Engineering Constraints
 
-1. Rust toolchain + zlib-rs for deflate compression (direct dependency for custom mem_level); no Python in mainline
+1. Rust toolchain; IDAT deflate via libdeflate (`libdeflater`, C, built by cc — keep the 5 Apple XCFramework targets building) with zlib-rs for speed ≥8; no Python in mainline
 2. Algorithm alignment with pngquant/libimagequant, not blind invention
 3. MIT license; reference code not directly copied (license policy pending)
 4. Every change must pass regression gates before merging

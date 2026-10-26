@@ -19,6 +19,7 @@
 
 pub mod apng;
 pub mod cli;
+mod deflate;
 pub mod error;
 pub mod palette_quant;
 pub mod pipeline;

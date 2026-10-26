@@ -116,7 +116,7 @@ pngoptim implements a full quantization pipeline inspired by [libimagequant](htt
 3. **K-Means Refinement** — Parallelized k-means with reflected-color weight adjustment
 4. **VP-Tree Nearest Search** — Vantage-point tree with popularity-based vantage selection and early exit
 5. **Remap** — Plain (row-hint nearest) or Floyd-Steinberg dithering with edge/noise-aware dither maps
-6. **Encode** — Hand-written PNG encoder with [zlib-rs](https://github.com/trifectatechfoundation/zlib-rs), dual `mem_level` (5 & 8) parallel compression picking the smaller result
+6. **Encode** — Hand-written PNG encoder. IDAT is compressed with [libdeflate](https://github.com/ebiggers/libdeflate) level 12 (near-optimal parsing, ~7% smaller than zlib level 9), split into row-aligned chunks that are compressed in parallel and stitched into a single zlib stream. Images with ≤16 colors also try 8-bit indices instead of packed 1/2/4-bit ones and keep the smaller. All of this is lossless: pixels and palette are unchanged. `--speed 8`–`9` fall back to [zlib-rs](https://github.com/trifectatechfoundation/zlib-rs) level 9 (dual `mem_level` 5 & 8), `--speed 10`+ to zlib-rs level 1
 
 Additional features:
 - **ICC Color Management**: Embedded ICC profiles are normalized to sRGB via lcms2 before quantization

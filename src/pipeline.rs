@@ -928,66 +928,105 @@ fn encode_indexed_png_to_vec(
     speed: u8,
 ) -> Result<Vec<u8>, AppError> {
     let bit_depth = indexed_bit_depth(palette_rgba.len());
-    let packed_indices = pack_indices_by_bit_depth(indices, width, height, bit_depth)?;
-    let compression_level = if speed >= 10 { 1 } else { 9 };
+    let packed = filtered_indexed_rows(indices, width, height, bit_depth)?;
 
-    if speed >= 10 {
-        // Fast mode: single attempt with default mem_level
-        return encode_indexed_png_raw(
-            width,
-            height,
-            bit_depth,
-            &packed_indices,
-            palette_rgba,
-            metadata,
-            strip,
-            compression_level,
-            8,
+    let (bit_depth, idat) = if speed >= 10 {
+        (bit_depth, zlib_rs_compress(&packed.0, 1, 8)?)
+    } else if speed > LIBDEFLATE_MAX_SPEED {
+        // Speed 8-9: zlib-rs level 9, trying mem_level 5 and 8 in parallel. mem_level=5
+        // often wins for small palettes / repetitive data, 8 for larger varied images.
+        let (ml5, ml8) = rayon::join(
+            || zlib_rs_compress(&packed.0, 9, 5),
+            || zlib_rs_compress(&packed.0, 9, 8),
         );
-    }
-
-    // Try both mem_level=5 and mem_level=8 in parallel, pick smaller output.
-    // mem_level=5 often wins for small palettes / repetitive data,
-    // mem_level=8 wins for larger images with more varied index patterns.
-    let (out_ml5, out_ml8) = rayon::join(
-        || {
-            encode_indexed_png_raw(
-                width,
-                height,
-                bit_depth,
-                &packed_indices,
-                palette_rgba,
-                metadata,
-                strip,
-                compression_level,
-                5,
-            )
-        },
-        || {
-            encode_indexed_png_raw(
-                width,
-                height,
-                bit_depth,
-                &packed_indices,
-                palette_rgba,
-                metadata,
-                strip,
-                compression_level,
-                8,
-            )
-        },
-    );
-    let out_ml5 = out_ml5?;
-    let out_ml8 = out_ml8?;
-
-    Ok(if out_ml5.len() <= out_ml8.len() {
-        out_ml5
+        let (ml5, ml8) = (ml5?, ml8?);
+        (bit_depth, if ml5.len() <= ml8.len() { ml5 } else { ml8 })
+    } else if bit_depth == png::BitDepth::Eight {
+        (bit_depth, compress_idat(&packed.0, packed.1))
     } else {
-        out_ml8
-    })
+        // Sub-byte packing splits pixel runs across byte boundaries, which hurts
+        // deflate's byte-level matching: storing <=16-color images at 8 bits per index
+        // is smaller for most of them (5-13% on icons), so try both and keep the smaller.
+        let unpacked = filtered_indexed_rows(indices, width, height, png::BitDepth::Eight)?;
+        let (packed_idat, unpacked_idat) = rayon::join(
+            || compress_idat(&packed.0, packed.1),
+            || compress_idat(&unpacked.0, unpacked.1),
+        );
+        if unpacked_idat.len() < packed_idat.len() {
+            (png::BitDepth::Eight, unpacked_idat)
+        } else {
+            (bit_depth, packed_idat)
+        }
+    };
+
+    Ok(assemble_indexed_png(
+        width,
+        height,
+        bit_depth,
+        &idat,
+        palette_rgba,
+        metadata,
+        strip,
+    ))
 }
 
-// ── Hand-written PNG encoder with zlib-rs (mem_level=5) ──
+/// Pack indices at `bit_depth` and prepend a filter byte to every row.
+/// Returns the filtered data and its row length (including the filter byte).
+///
+/// Always uses filter type None: per-row adaptive filters (MinSum/Entropy/BigEnt)
+/// make palette indices 15-28% larger, and fixed Sub/Up/Paeth never beat None on our
+/// outputs.
+fn filtered_indexed_rows(
+    indices: &[u8],
+    width: u32,
+    height: u32,
+    bit_depth: png::BitDepth,
+) -> Result<(Vec<u8>, usize), AppError> {
+    let packed_indices = pack_indices_by_bit_depth(indices, width, height, bit_depth)?;
+    let row_bytes = row_byte_count(width, bit_depth);
+    if packed_indices.len() != row_bytes * height as usize {
+        return Err(AppError::Encode(format!(
+            "packed data length mismatch: expected={}, actual={}",
+            row_bytes * height as usize,
+            packed_indices.len()
+        )));
+    }
+    let mut filtered = Vec::with_capacity((row_bytes + 1) * height as usize);
+    for row in packed_indices.chunks(row_bytes) {
+        filtered.push(0u8); // NoFilter
+        filtered.extend_from_slice(row);
+    }
+    Ok((filtered, row_bytes + 1))
+}
+
+/// Highest `--speed` that still compresses IDAT with libdeflate level 12.
+const LIBDEFLATE_MAX_SPEED: u8 = 7;
+
+/// libdeflate level 12 (near-optimal parsing): ~6.7% smaller IDAT than zlib level 9
+/// on palette indices, on every image measured. Chunked and parallel, since level 12
+/// alone is 10-25x slower than zlib level 9.
+fn compress_idat(filtered: &[u8], row_len: usize) -> Vec<u8> {
+    crate::deflate::zlib_compress_rows(filtered, row_len, 12)
+}
+
+/// zlib-rs compression (speed >= 8, where libdeflate level 12 is too slow).
+fn zlib_rs_compress(filtered: &[u8], level: i32, mem_level: i32) -> Result<Vec<u8>, AppError> {
+    let config = zlib_rs::DeflateConfig {
+        level,
+        mem_level,
+        ..zlib_rs::DeflateConfig::default()
+    };
+    let mut compressed = vec![0u8; zlib_rs::compress_bound(filtered.len())];
+    let (compressed_data, rc) = zlib_rs::compress_slice(&mut compressed, filtered, config);
+    if rc != zlib_rs::ReturnCode::Ok {
+        return Err(AppError::Encode(format!("zlib compression failed: {rc:?}")));
+    }
+    let len = compressed_data.len();
+    compressed.truncate(len);
+    Ok(compressed)
+}
+
+// ── Hand-written PNG encoder (IDAT via libdeflate, see `deflate.rs`) ──
 
 const PNG_SIGNATURE: [u8; 8] = [137, 80, 78, 71, 13, 10, 26, 10];
 
@@ -1001,47 +1040,16 @@ pub(crate) fn write_png_chunk(out: &mut Vec<u8>, chunk_type: &[u8; 4], data: &[u
     out.extend_from_slice(&crc.finalize().to_be_bytes());
 }
 
-fn encode_indexed_png_raw(
+fn assemble_indexed_png(
     width: u32,
     height: u32,
     bit_depth: png::BitDepth,
-    packed_indices: &[u8],
+    idat: &[u8],
     palette_rgba: &[[u8; 4]],
     metadata: Option<&PreservedMetadata>,
     strip: bool,
-    compression_level: i32,
-    mem_level: i32,
-) -> Result<Vec<u8>, AppError> {
-    #![allow(clippy::too_many_arguments)]
-    let row_bytes = row_byte_count(width, bit_depth);
-    if packed_indices.len() != row_bytes * height as usize {
-        return Err(AppError::Encode(format!(
-            "packed data length mismatch: expected={}, actual={}",
-            row_bytes * height as usize,
-            packed_indices.len()
-        )));
-    }
-
-    // Build filtered row data (NoFilter: prepend 0x00 to each row)
-    let filtered_len = (row_bytes + 1) * height as usize;
-    let mut filtered = Vec::with_capacity(filtered_len);
-    for row in packed_indices.chunks(row_bytes) {
-        filtered.push(0u8); // NoFilter
-        filtered.extend_from_slice(row);
-    }
-
-    let config = zlib_rs::DeflateConfig {
-        level: compression_level,
-        mem_level,
-        ..zlib_rs::DeflateConfig::default()
-    };
-    let bound = zlib_rs::compress_bound(filtered.len());
-    let mut compressed = vec![0u8; bound];
-    let (compressed_data, rc) = zlib_rs::compress_slice(&mut compressed, &filtered, config);
-    if rc != zlib_rs::ReturnCode::Ok {
-        return Err(AppError::Encode(format!("zlib compression failed: {rc:?}")));
-    }
-    let compressed_len = compressed_data.len();
+) -> Vec<u8> {
+    let compressed_len = idat.len();
 
     // Estimate output size and allocate
     let est_size = 8 + 25 + 12 + palette_rgba.len() * 3 + 12 + compressed_len + 12 + 256;
@@ -1179,14 +1187,14 @@ fn encode_indexed_png_raw(
 
     // IDAT (split into max 2GB chunks per PNG spec, but typically one chunk suffices)
     const MAX_IDAT_LEN: usize = (u32::MAX >> 1) as usize;
-    for chunk in compressed[..compressed_len].chunks(MAX_IDAT_LEN) {
+    for chunk in idat.chunks(MAX_IDAT_LEN) {
         write_png_chunk(&mut out, b"IDAT", chunk);
     }
 
     // IEND
     write_png_chunk(&mut out, b"IEND", &[]);
 
-    Ok(out)
+    out
 }
 
 fn row_byte_count(width: u32, bit_depth: png::BitDepth) -> usize {

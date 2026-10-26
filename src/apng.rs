@@ -358,6 +358,10 @@ pub fn encode_indexed_apng(image: &IndexedApngImage) -> Result<Vec<u8>, AppError
     )?;
     encoder.set_color(ColorType::Indexed);
     encoder.set_depth(png::BitDepth::Eight);
+    // Row filters only hurt palette indices, and the png crate's flate2 output is
+    // replaced by libdeflate in `recompress_image_streams`, so emit cheap stored blocks.
+    encoder.set_filter(png::Filter::NoFilter);
+    encoder.set_deflate_compression(png::DeflateCompression::NoCompression);
     encoder.set_palette(plte);
     if !trns.is_empty() {
         encoder.set_trns(trns);
@@ -443,7 +447,127 @@ pub fn encode_indexed_apng(image: &IndexedApngImage) -> Result<Vec<u8>, AppError
     writer
         .finish()
         .map_err(|e| AppError::Encode(format!("failed to finish indexed APNG encoding: {e}")))?;
+    let output = recompress_image_streams(&output).unwrap_or(output);
     Ok(splice_cicp_after_ihdr(output, image.color_metadata.cicp))
+}
+
+/// Recompress every image data stream (the IDAT run and each frame's fdAT run) of an
+/// encoded PNG/APNG with libdeflate level 12, merging each run into a single chunk and
+/// renumbering the shared fcTL/fdAT sequence. Filtered scanlines are left untouched,
+/// so pixels are bit-identical. Returns `None` on any malformed input.
+fn recompress_image_streams(png_bytes: &[u8]) -> Option<Vec<u8>> {
+    use rayon::prelude::*;
+    use std::io::Read;
+
+    enum Item<'a> {
+        Chunk(&'a [u8; 4], &'a [u8]),
+        Stream {
+            kind: &'static [u8; 4],
+            row_len: usize,
+            zlib: Vec<u8>,
+        },
+    }
+
+    const SIGNATURE_LEN: usize = 8;
+    let mut items: Vec<Item> = Vec::new();
+    let mut bits_per_pixel = 0usize;
+    let mut canvas_width = 0usize;
+    let mut frame_width = None;
+    let mut pos = SIGNATURE_LEN;
+    while pos < png_bytes.len() {
+        let len = u32::from_be_bytes(png_bytes.get(pos..pos + 4)?.try_into().ok()?) as usize;
+        let kind: &[u8; 4] = png_bytes.get(pos + 4..pos + 8)?.try_into().ok()?;
+        let data = png_bytes.get(pos + 8..pos + 8 + len)?;
+        pos += 12 + len;
+        match kind {
+            b"IHDR" => {
+                canvas_width = u32::from_be_bytes(data.get(0..4)?.try_into().ok()?) as usize;
+                let channels = match *data.get(9)? {
+                    0 | 3 => 1,
+                    2 => 3,
+                    4 => 2,
+                    6 => 4,
+                    _ => return None,
+                };
+                bits_per_pixel = channels * usize::from(*data.get(8)?);
+                items.push(Item::Chunk(kind, data));
+            }
+            b"fcTL" => {
+                frame_width = Some(u32::from_be_bytes(data.get(4..8)?.try_into().ok()?) as usize);
+                items.push(Item::Chunk(kind, data));
+            }
+            b"IDAT" | b"fdAT" => {
+                let (stream_kind, payload): (&'static [u8; 4], _) = if kind == b"IDAT" {
+                    (b"IDAT", data)
+                } else {
+                    (b"fdAT", data.get(4..)?)
+                };
+                // Consecutive data chunks of the same kind form one zlib stream.
+                if let Some(Item::Stream { kind: k, zlib, .. }) = items.last_mut()
+                    && *k == stream_kind
+                {
+                    zlib.extend_from_slice(payload);
+                    continue;
+                }
+                let width = if stream_kind == b"IDAT" {
+                    frame_width.unwrap_or(canvas_width)
+                } else {
+                    frame_width?
+                };
+                items.push(Item::Stream {
+                    kind: stream_kind,
+                    row_len: (width * bits_per_pixel).div_ceil(8) + 1,
+                    zlib: payload.to_vec(),
+                });
+            }
+            _ => items.push(Item::Chunk(kind, data)),
+        }
+    }
+
+    let recompressed: Vec<Option<Vec<u8>>> = items
+        .par_iter()
+        .map(|item| match item {
+            Item::Stream { row_len, zlib, .. } => {
+                let mut raw = Vec::new();
+                flate2::read::ZlibDecoder::new(zlib.as_slice())
+                    .read_to_end(&mut raw)
+                    .ok()?;
+                Some(crate::deflate::zlib_compress_rows(&raw, *row_len, 12))
+            }
+            Item::Chunk(..) => Some(Vec::new()),
+        })
+        .collect();
+
+    const MAX_CHUNK_LEN: usize = (u32::MAX >> 1) as usize - 4;
+    let mut out = Vec::with_capacity(png_bytes.len());
+    out.extend_from_slice(&png_bytes[..SIGNATURE_LEN]);
+    let mut sequence = 0u32;
+    for (item, stream) in items.iter().zip(recompressed) {
+        let stream = stream?;
+        match item {
+            Item::Chunk(kind, data) if *kind == b"fcTL" => {
+                let mut fctl = data.to_vec();
+                fctl[0..4].copy_from_slice(&sequence.to_be_bytes());
+                sequence += 1;
+                write_png_chunk(&mut out, kind, &fctl);
+            }
+            Item::Chunk(kind, data) => write_png_chunk(&mut out, kind, data),
+            Item::Stream { kind, .. } => {
+                for part in stream.chunks(MAX_CHUNK_LEN) {
+                    if *kind == b"fdAT" {
+                        let mut fdat = Vec::with_capacity(4 + part.len());
+                        fdat.extend_from_slice(&sequence.to_be_bytes());
+                        fdat.extend_from_slice(part);
+                        sequence += 1;
+                        write_png_chunk(&mut out, kind, &fdat);
+                    } else {
+                        write_png_chunk(&mut out, kind, part);
+                    }
+                }
+            }
+        }
+    }
+    Some(out)
 }
 
 /// Build a `png::Encoder` pre-populated with color-space metadata (iCCP/gAMA/cHRM/sRGB)
