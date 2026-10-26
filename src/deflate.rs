@@ -20,8 +20,9 @@ use rayon::prelude::*;
 
 /// Chunks smaller than this lose too much to the cold window at each boundary.
 const MIN_CHUNK_BYTES: usize = 64 * 1024;
-/// Upper bound on chunk count (keeps boundary overhead and per-chunk setup bounded).
-const MAX_CHUNKS: usize = 16;
+/// Upper bound on chunk count: enough to fill a typical 8-core machine; every extra
+/// boundary costs a cold window and a new Huffman header.
+const MAX_CHUNKS: usize = 8;
 
 /// Compress `data` (a sequence of `row_len`-byte filtered scanlines) into a zlib
 /// stream with libdeflate at `level`, splitting at row boundaries for parallelism.
