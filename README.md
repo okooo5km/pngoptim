@@ -73,7 +73,7 @@ pngoptim animated.png -o optimized.png --apng-mode aggressive
 | `--ext SUFFIX` | Output filename suffix (batch mode) | `-mvp.png` |
 | `--quality MIN-MAX` | Quality range (0–100). Formats: `N`, `-N`, `N-`, `MIN-MAX` | Full range |
 | `--speed N` | Speed/quality trade-off (1=slowest/best, 11=fastest) | `4` |
-| `--floyd[=N]` | Floyd-Steinberg dithering strength (0.0–1.0) | `1.0` |
+| `--floyd[=N]` | Floyd-Steinberg dithering strength (0.0–1.0), applied uniformly | adaptive |
 | `--nofs` | Disable Floyd-Steinberg dithering entirely | Off |
 | `--posterize N` | Posterize output (0–8 bits) | Off |
 | `--strip` | Strip all metadata chunks | Off |
@@ -115,7 +115,7 @@ pngoptim implements a full quantization pipeline inspired by [libimagequant](htt
 2. **Median Cut** — Variance-based palette generation with quality-target early termination
 3. **K-Means Refinement** — Parallelized k-means with reflected-color weight adjustment
 4. **VP-Tree Nearest Search** — Vantage-point tree with popularity-based vantage selection and early exit
-5. **Remap** — Plain (row-hint nearest) or Floyd-Steinberg dithering with edge/noise-aware dither maps
+5. **Remap** — Plain (row-hint nearest) or Floyd-Steinberg dithering with edge/noise-aware dither maps; by default the strength is adapted per region (full in smooth gradients, faded in texture, no dithering on anti-aliased alpha edges) with a neighbor-run preference that keeps the average color while compressing better
 6. **Encode** — Hand-written PNG encoder with [zlib-rs](https://github.com/trifectatechfoundation/zlib-rs), dual `mem_level` (5 & 8) parallel compression picking the smaller result
 
 Additional features:

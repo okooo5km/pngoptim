@@ -42,7 +42,8 @@ pub struct PNGOptimOptions {
     pub quality_max: u8,
     /// Speed preset (1-11, 0 = default of 4).
     pub speed: u8,
-    /// Dither level (0.0-1.0, negative = default of 1.0).
+    /// Dither level (0.0-1.0). Negative = default: full strength, modulated per
+    /// region (adaptive). An explicit 0.0-1.0 value is applied uniformly.
     pub dither_level: f32,
     /// Posterize bits (0 = disabled).
     pub posterize: u8,
@@ -103,7 +104,7 @@ pub extern "C" fn pngoptim_default_options() -> PNGOptimOptions {
         quality_min: 0,
         quality_max: 100,
         speed: 4,
-        dither_level: 1.0,
+        dither_level: -1.0,
         posterize: 0,
         strip: false,
         skip_if_larger: false,
@@ -231,6 +232,7 @@ fn convert_options(c_opts: &PNGOptimOptions) -> PipelineOptions {
         quality,
         speed,
         dither_level,
+        adaptive_dither: c_opts.dither_level < 0.0,
         posterize,
         strip: c_opts.strip,
         skip_if_larger: c_opts.skip_if_larger,

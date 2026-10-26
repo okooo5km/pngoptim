@@ -55,10 +55,20 @@ If the quantized quality falls below the minimum, pngoptim exits with code **99*
 
 | Option | Description | Default |
 |--------|-------------|---------|
-| `--floyd[=N]` | Floyd-Steinberg dithering strength (0.0–1.0). Use `--floyd` for full strength or `--floyd=0.5` for partial. | `1.0` |
+| `--floyd[=N]` | Floyd-Steinberg dithering strength (0.0–1.0), applied uniformly as in pngquant. Use `--floyd` for full strength or `--floyd=0.5` for partial. | adaptive |
 | `--nofs` | Disable Floyd-Steinberg dithering entirely. Conflicts with `--floyd`. | Off |
 
 Dithering smooths color transitions by adding controlled noise at palette boundaries. Higher values produce smoother gradients but slightly larger files. At `--speed 10+`, dithering is automatically disabled regardless of this setting.
+
+**Default (adaptive) dithering.** Without `--floyd` or `--nofs`, pngoptim dithers at full strength but modulates it per region, so the noise goes where it prevents banding and is trimmed where it only costs bytes:
+
+- smooth gradients (sky, skin, 3D shading, soft shadows) keep at least half strength and diffuse even tiny errors, so they never posterize into flat bands;
+- dithering fades out with local contrast (edges and texture already hide banding);
+- outside gradients, errors too small to see are not diffused, which keeps flat areas clean;
+- anti-aliased alpha edges are not dithered (soft shadows with gently changing alpha still are);
+- a pixel may reuse its left or upper neighbor's palette entry when that is nearly as close as the nearest one (less so in dark tones); the difference is still diffused, so the average color is kept while runs get longer and compress better.
+
+At equal SSIMULACRA2 quality this makes files about 2% smaller in the median (3D renders about 3.5%, some screenshots up to 10%), with pngoptim's own quality score unchanged. Passing `--floyd` (any value) restores plain libimagequant-style dithering at that strength.
 
 ### Post-processing
 

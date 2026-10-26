@@ -30,6 +30,9 @@ pub struct PipelineOptions {
     pub quality: Option<QualityRange>,
     pub speed: u8,
     pub dither_level: f32,
+    /// Let the quantizer modulate dithering strength per region (default path).
+    /// Front ends turn this off when the user asks for a specific `--floyd` level.
+    pub adaptive_dither: bool,
     pub posterize: Option<u8>,
     pub strip: bool,
     pub skip_if_larger: bool,
@@ -43,6 +46,7 @@ impl Default for PipelineOptions {
             quality: None,
             speed: 4,
             dither_level: 1.0,
+            adaptive_dither: true,
             posterize: None,
             strip: false,
             skip_if_larger: false,
@@ -164,6 +168,7 @@ pub fn process_png_bytes(
         options.posterize.unwrap_or(0),
         speed_settings,
         options.dither_level,
+        options.adaptive_dither,
     );
     let quantize_ms = t_quantize.elapsed().as_secs_f64() * 1000.0;
 
@@ -347,6 +352,7 @@ struct QualityTargets {
     target_mse_is_zero: bool,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn select_palette_candidate(
     rgba: &[u8],
     width: usize,
@@ -355,6 +361,7 @@ fn select_palette_candidate(
     output_posterize_bits: u8,
     speed_settings: SpeedSettings,
     dither_level: f32,
+    adaptive_dither: bool,
 ) -> QuantizeCandidate {
     let targets = quality_targets(quality, output_posterize_bits);
     evaluate_candidate(
@@ -366,6 +373,7 @@ fn select_palette_candidate(
         speed_settings,
         targets,
         dither_level,
+        adaptive_dither,
     )
 }
 
@@ -379,6 +387,7 @@ fn evaluate_candidate(
     speed_settings: SpeedSettings,
     quality_targets: QualityTargets,
     dither_level: f32,
+    adaptive_dither: bool,
 ) -> QuantizeCandidate {
     let first = evaluate_candidate_once(
         rgba,
@@ -389,6 +398,7 @@ fn evaluate_candidate(
         speed_settings,
         quality_targets,
         dither_level,
+        adaptive_dither,
         None,
     );
     // A first pass already below the quality floor is rejected by the caller
@@ -432,6 +442,7 @@ fn evaluate_candidate(
             speed_settings,
             quality_targets,
             dither_level,
+            adaptive_dither,
             Some(&merged),
         );
         let report = local_shift_report(rgba, &candidate, width, height, threshold);
@@ -618,6 +629,7 @@ fn evaluate_candidate_once(
     speed_settings: SpeedSettings,
     quality_targets: QualityTargets,
     dither_level: f32,
+    adaptive_dither: bool,
     importance_boost: Option<&[u16]>,
 ) -> QuantizeCandidate {
     let quantizer = quantizer_settings(
@@ -628,6 +640,7 @@ fn evaluate_candidate_once(
         quality_targets.target_mse_is_zero,
         output_posterize_bits,
         dither_level,
+        adaptive_dither,
     );
     let indexed = quantize_indexed_with_boost(rgba, width, height, quantizer, importance_boost);
     let remapped_rgba = remapped_rgba_from_indices(&indexed.indices, &indexed.palette);
@@ -650,6 +663,7 @@ fn quantize_apng_frames(
         targets.target_mse_is_zero,
         output_posterize_bits,
         options.dither_level,
+        options.adaptive_dither,
     );
     let gamma = gamma_lut(SRGB_OUTPUT_GAMMA);
 
