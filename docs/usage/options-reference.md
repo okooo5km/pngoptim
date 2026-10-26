@@ -39,7 +39,7 @@ pngoptim [OPTIONS] INPUT...
 | `MIN-` | MIN | 100 | `65-` → min=65, max=100 |
 | `N` | ~90% of N | N | `70` → min=63, max=70 |
 
-If the quantized quality falls below the minimum, pngoptim exits with code **99** without writing the output file.
+If the quantized quality falls below the minimum, pngoptim exits with code **98** without writing the output file.
 
 #### Speed Levels
 
