@@ -35,6 +35,18 @@ const LEVEL12_MIN_BYTES: usize = 2 * 1024 * 1024;
 /// Compress filtered IDAT scanlines, picking the method by input size and
 /// redundancy (see `zlib_compress_idat_probed`).
 pub(crate) fn zlib_compress_idat(data: &[u8], row_len: usize) -> Vec<u8> {
+    if data.len() < SMALL_IDAT_BYTES {
+        // Small inputs are rarely redundant, so the level 10 pass runs alongside
+        // the probe instead of after it; same output, minus the serial probe.
+        let (probe, level10) = rayon::join(
+            || probe_size(data),
+            || compress_rows(data, row_len, 10, SMALL_MIN_CHUNK_BYTES),
+        );
+        if let Some(zlib) = redundant_zlib(data, probe) {
+            return zlib;
+        }
+        return level10;
+    }
     let probe = if data.len() >= LEVEL12_MIN_BYTES {
         0
     } else {
@@ -69,12 +81,8 @@ pub(crate) fn zlib_compress_idat_probed(data: &[u8], row_len: usize, probe: usiz
     if data.len() >= LEVEL12_MIN_BYTES {
         return compress_rows(data, row_len, 12, MIN_CHUNK_BYTES);
     }
-    if probe.saturating_mul(REDUNDANT_RATIO) <= data.len() {
-        let (ml5, ml8) = rayon::join(|| zlib_rs_level9(data, 5), || zlib_rs_level9(data, 8));
-        let best = [ml5, ml8].into_iter().flatten().min_by_key(Vec::len);
-        if let Some(best) = best {
-            return best;
-        }
+    if let Some(zlib) = redundant_zlib(data, probe) {
+        return zlib;
     }
     let min_chunk = if data.len() >= SMALL_IDAT_BYTES {
         MIN_CHUNK_BYTES
@@ -86,6 +94,16 @@ pub(crate) fn zlib_compress_idat_probed(data: &[u8], row_len: usize, probe: usiz
 
 /// Probe compression ratio from which data counts as highly redundant.
 const REDUNDANT_RATIO: usize = 20;
+
+/// For highly redundant data (see `zlib_compress_idat_probed`), the smaller of
+/// zlib-rs level 9 with mem_level 5 and 8.
+fn redundant_zlib(data: &[u8], probe: usize) -> Option<Vec<u8>> {
+    if probe.saturating_mul(REDUNDANT_RATIO) > data.len() {
+        return None;
+    }
+    let (ml5, ml8) = rayon::join(|| zlib_rs_level9(data, 5), || zlib_rs_level9(data, 8));
+    [ml5, ml8].into_iter().flatten().min_by_key(Vec::len)
+}
 /// Upper bound on chunk count: enough to fill a typical 8-core machine; every extra
 /// boundary costs a cold window and a new Huffman header.
 const MAX_CHUNKS: usize = 8;
