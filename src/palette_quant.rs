@@ -71,6 +71,11 @@ pub(crate) struct ImageAnalysis {
 }
 
 impl ImageAnalysis {
+    /// The image as gamma-weighted pixels, when contrast or dither maps needed them.
+    pub(crate) fn pixels(&self) -> Option<&[InternalPixel]> {
+        self.contrast_pixels.as_deref()
+    }
+
     pub(crate) fn new(
         rgba: &[u8],
         width: usize,
@@ -234,7 +239,7 @@ fn photo_palette(
     if colors < 2
         || items <= colors
         || items < PHOTO_MIN_COLORS
-        || histogram.items.iter().any(|item| item.rgba[3] != 255)
+        || histogram.rgba.iter().any(|rgba| rgba[3] != 255)
         || (items.saturating_mul(PHOTO_MAX_PIXELS_PER_COLOR) < pixels
             && dominant_share(histogram) > PHOTO_MAX_DOMINANT_SHARE)
     {
@@ -244,12 +249,8 @@ fn photo_palette(
     let mut weighted: Vec<([u8; 3], f32)> = histogram
         .items
         .iter()
-        .map(|item| {
-            (
-                [item.rgba[0], item.rgba[1], item.rgba[2]],
-                item.perceptual_weight,
-            )
-        })
+        .zip(&histogram.rgba)
+        .map(|(item, rgba)| ([rgba[0], rgba[1], rgba[2]], item.perceptual_weight))
         .collect();
     weighted.sort_unstable_by_key(|entry| entry.0);
     let entries = pp::entries(&weighted);
@@ -568,13 +569,14 @@ pub fn quantizer_settings(
 #[derive(Debug, Clone, Copy)]
 struct HistItem {
     color: InternalPixel,
-    /// Source sRGB(A) of this entry (the first pixel seen with this key).
-    rgba: [u8; 4],
     adjusted_weight: f32,
     perceptual_weight: f32,
     mc_color_weight: f32,
-    sort_value: u32,
-    likely_palette_index: u16,
+    /// Median cut sort key while splitting, then the likely palette index
+    /// (set in `boxes_to_palette`, refreshed by k-means). The two uses never
+    /// overlap, so they share one field like libimagequant does; that keeps
+    /// the item at 32 bytes for the median cut and k-means passes.
+    sort_value_or_index: u32,
 }
 
 #[derive(Default)]
@@ -624,6 +626,10 @@ struct Cluster {
 #[derive(Debug, Clone, Default)]
 pub(crate) struct HistogramData {
     items: Vec<HistItem>,
+    /// Source sRGB(A) of each item (the first pixel seen with its key), in
+    /// the items' original order. Only the photo palette reads it, before any
+    /// median cut reorders a copy of `items`.
+    rgba: Vec<[u8; 4]>,
     total_perceptual_weight: f64,
     clusters: [Cluster; MAX_CLUSTERS],
 }
@@ -635,19 +641,25 @@ struct ColorBox {
     average: InternalPixel,
     adjusted_weight_sum: f64,
     variance: [f32; 4],
+    /// Weighted error of the box, once `total_box_error_below_target` has
+    /// counted it.
     total_error: Option<f64>,
+    /// The same error, accumulated in the variance pass (which computes each
+    /// item's distance anyway) so counting it later costs no second pass.
+    error_sum: f64,
     max_error: f32,
 }
 
 impl ColorBox {
-    /// Create a new box from split with a pre-computed weight sum.
+    /// Create a new box from split, with a pre-computed weight sum or (`None`)
+    /// the sum of its items' adjusted weights.
     /// Matches reference `MBox::from_split` behavior where the right side's
     /// weight is computed via subtraction (parent_sum - left_sum).
     fn new_from_split(
         items: &[HistItem],
         start: usize,
         end: usize,
-        adjusted_weight_sum: f64,
+        adjusted_weight_sum: Option<f64>,
     ) -> Option<Self> {
         if start > end || end > items.len() {
             return None;
@@ -660,14 +672,17 @@ impl ColorBox {
                 adjusted_weight_sum: 0.0,
                 variance: [0.0; 4],
                 total_error: Some(0.0),
+                error_sum: 0.0,
                 max_error: 0.0,
             });
         }
 
         let mut average = InternalPixel::default();
         let mut average_weight_sum = 0.0f32;
+        let mut summed_weight = 0.0f64;
 
         for item in &items[start..end] {
+            summed_weight += f64::from(item.adjusted_weight);
             average_weight_sum += item.adjusted_weight;
             average.a += item.color.a * item.adjusted_weight;
             average.r += item.color.r * item.adjusted_weight;
@@ -684,6 +699,7 @@ impl ColorBox {
 
         let mut variance = [0.0f32; 4];
         let mut max_error = 0.0f32;
+        let mut error_sum = 0.0f64;
         for item in &items[start..end] {
             let delta_a = item.color.a - average.a;
             let delta_r = item.color.r - average.r;
@@ -693,16 +709,19 @@ impl ColorBox {
             variance[1] += delta_r * delta_r * item.adjusted_weight;
             variance[2] += delta_g * delta_g * item.adjusted_weight;
             variance[3] += delta_b * delta_b * item.adjusted_weight;
-            max_error = max_error.max(average.diff(item.color));
+            let diff = average.diff(item.color);
+            max_error = max_error.max(diff);
+            error_sum += f64::from(diff) * f64::from(item.perceptual_weight);
         }
 
         Some(Self {
             start,
             end,
             average,
-            adjusted_weight_sum,
+            adjusted_weight_sum: adjusted_weight_sum.unwrap_or(summed_weight),
             variance,
             total_error: None,
+            error_sum,
             max_error,
         })
     }
@@ -723,6 +742,7 @@ impl ColorBox {
                 adjusted_weight_sum: 0.0,
                 variance: [0.0; 4],
                 total_error: Some(0.0),
+                error_sum: 0.0,
                 max_error: 0.0,
             });
         }
@@ -754,6 +774,7 @@ impl ColorBox {
 
         let mut variance = [0.0f32; 4];
         let mut max_error = 0.0f32;
+        let mut error_sum = 0.0f64;
         for item in &items[start..end] {
             let delta_a = item.color.a - average.a;
             let delta_r = item.color.r - average.r;
@@ -763,7 +784,9 @@ impl ColorBox {
             variance[1] += delta_r * delta_r * item.adjusted_weight;
             variance[2] += delta_g * delta_g * item.adjusted_weight;
             variance[3] += delta_b * delta_b * item.adjusted_weight;
-            max_error = max_error.max(average.diff(item.color));
+            let diff = average.diff(item.color);
+            max_error = max_error.max(diff);
+            error_sum += f64::from(diff) * f64::from(item.perceptual_weight);
         }
 
         Some(Self {
@@ -773,6 +796,7 @@ impl ColorBox {
             adjusted_weight_sum,
             variance,
             total_error: None,
+            error_sum,
             max_error,
         })
     }
@@ -797,25 +821,21 @@ impl ColorBox {
                 ((comps[channels[2].0] + comps[channels[1].0] / 2.0 + comps[channels[3].0] / 4.0)
                     * 65535.0)
                     .clamp(0.0, 65535.0) as u16;
-            item.sort_value = (u32::from(primary) << 16) | u32::from(secondary);
+            item.sort_value_or_index = (u32::from(primary) << 16) | u32::from(secondary);
         }
     }
 
-    fn compute_total_error(&mut self, items: &[HistItem]) -> f64 {
-        let avg = self.average;
-        let total_error = items[self.start..self.end]
-            .iter()
-            .map(|item| f64::from(avg.diff(item.color)) * f64::from(item.perceptual_weight))
-            .sum::<f64>();
-        self.total_error = Some(total_error);
-        total_error
+    fn compute_total_error(&mut self) -> f64 {
+        self.total_error = Some(self.error_sum);
+        self.error_sum
     }
 
     fn prepare_color_weight_total(self, items: &mut [HistItem]) -> f64 {
         let len = self.len();
         let median = {
             let slice = &mut items[self.start..self.end];
-            let (_, mid, _) = slice.select_nth_unstable_by_key(len / 2, |item| item.sort_value);
+            let (_, mid, _) =
+                slice.select_nth_unstable_by_key(len / 2, |item| item.sort_value_or_index);
             mid.color
         };
         items[self.start..self.end]
@@ -844,20 +864,16 @@ impl ColorBox {
         let split = self.start + local_split;
         // Match reference: left sum is freshly computed, right sum via subtraction.
         // This affects take_best_splittable_box scoring and thus split order.
-        let left_sum: f64 = items[self.start..split]
-            .iter()
-            .map(|item| f64::from(item.adjusted_weight))
-            .sum();
-        let right_sum = parent_weight_sum - left_sum;
-        let left = Self::new_from_split(items, self.start, split, left_sum)?;
-        let right = Self::new_from_split(items, split, self.end, right_sum)?;
+        let left = Self::new_from_split(items, self.start, split, None)?;
+        let right_sum = parent_weight_sum - left.adjusted_weight_sum;
+        let right = Self::new_from_split(items, split, self.end, Some(right_sum))?;
         Some((left, right))
     }
 }
 
 #[inline(always)]
 fn mc_sort_value(base: &[HistItem], idx: usize) -> Option<u32> {
-    base.get(idx).map(|item| item.sort_value)
+    base.get(idx).map(|item| item.sort_value_or_index)
 }
 
 #[inline]
@@ -933,9 +949,9 @@ fn hist_item_sort_half(mut base: &mut [HistItem], mut weight_half_sum: f64) -> u
 const MAX_CLUSTERS: usize = 16;
 /// Histogram partial maps per image (thread-count independent).
 const HISTOGRAM_CHUNKS: usize = 8;
-const HISTOGRAM_MIN_CHUNK: usize = 1 << 16;
+const HISTOGRAM_MIN_CHUNK: usize = 1 << 14;
 /// Histogram items per k-means accumulator; fixed so sums merge in one order.
-const KMEANS_CHUNK: usize = 4096;
+const KMEANS_CHUNK: usize = 1024;
 
 pub(crate) fn build_histogram(
     rgba: &[u8],
@@ -1080,16 +1096,15 @@ fn inject_fixed_transparent(histogram: &mut HistogramData) {
     // Transparent pixel goes into cluster 0 (all high bits zero for RGBA=0,0,0,0)
     let cluster_idx = 0usize;
     let insert_pos = histogram.clusters[cluster_idx].end;
+    histogram.rgba.insert(insert_pos, [0, 0, 0, 0]);
     histogram.items.insert(
         insert_pos,
         HistItem {
             color: InternalPixel::default(),
-            rgba: [0, 0, 0, 0],
             adjusted_weight: min_weight,
             perceptual_weight: min_weight,
             mc_color_weight: 0.0,
-            sort_value: 0,
-            likely_palette_index: 0,
+            sort_value_or_index: 0,
         },
     );
     histogram.total_perceptual_weight += f64::from(min_weight);
@@ -1135,15 +1150,14 @@ pub(crate) fn finalize_histogram(map: HistMap, gamma: &[f32; 256]) -> HistogramD
     let mut items = vec![
         HistItem {
             color: InternalPixel::default(),
-            rgba: [0, 0, 0, 0],
             adjusted_weight: 0.0,
             perceptual_weight: 0.0,
             mc_color_weight: 0.0,
-            sort_value: 0,
-            likely_palette_index: 0,
+            sort_value_or_index: 0,
         };
         temp.len()
     ];
+    let mut rgba = vec![[0u8; 4]; temp.len()];
     let mut total_perceptual_weight = 0.0f64;
 
     for item in temp {
@@ -1154,19 +1168,19 @@ pub(crate) fn finalize_histogram(map: HistMap, gamma: &[f32; 256]) -> HistogramD
         let weight = ((item.importance_sum as f32) / 255.0).min(max_perceptual_weight);
         total_perceptual_weight += f64::from(weight);
 
+        rgba[next_index] = item.representative;
         items[next_index] = HistItem {
             color: InternalPixel::from_rgba(gamma, &item.representative),
-            rgba: item.representative,
             adjusted_weight: weight,
             perceptual_weight: weight,
             mc_color_weight: 0.0,
-            sort_value: 0,
-            likely_palette_index: 0,
+            sort_value_or_index: 0,
         };
     }
 
     HistogramData {
         items,
+        rgba,
         total_perceptual_weight,
         clusters,
     }
@@ -1202,12 +1216,7 @@ fn median_cut_palette(
         boxes.push(left);
         boxes.push(right);
 
-        if total_box_error_below_target(
-            &mut boxes,
-            &histogram.items,
-            histogram.total_perceptual_weight,
-            target_mse,
-        ) {
+        if total_box_error_below_target(&mut boxes, histogram.total_perceptual_weight, target_mse) {
             break;
         }
     }
@@ -1258,7 +1267,6 @@ fn take_best_splittable_box(boxes: &[ColorBox], max_mse: f64) -> Option<usize> {
 
 fn total_box_error_below_target(
     boxes: &mut [ColorBox],
-    items: &[HistItem],
     total_perceptual_weight: f64,
     target_mse: f64,
 ) -> bool {
@@ -1279,7 +1287,7 @@ fn total_box_error_below_target(
         .iter_mut()
         .filter(|color_box| color_box.total_error.is_none())
     {
-        total_error += color_box.compute_total_error(items);
+        total_error += color_box.compute_total_error();
         if total_error > target_total_error {
             return false;
         }
@@ -1291,7 +1299,7 @@ fn boxes_to_palette(boxes: &mut [ColorBox], items: &mut [HistItem]) -> Vec<Palet
     let mut palette = Vec::with_capacity(boxes.len());
     for (palette_index, color_box) in boxes.iter_mut().enumerate() {
         for item in &mut items[color_box.start..color_box.end] {
-            item.likely_palette_index = palette_index as u16;
+            item.sort_value_or_index = palette_index as u32;
         }
 
         let representative = if color_box.len() > 2 {
@@ -1578,10 +1586,10 @@ fn kmeans_iteration_batch(
     acc: &mut KmeansAccumulator,
 ) {
     for item in batch.iter_mut() {
-        let hint = usize::from(item.likely_palette_index).min(palette.len().saturating_sub(1));
+        let hint = (item.sort_value_or_index as usize).min(palette.len().saturating_sub(1));
         let (nearest, diff_sq) = tree.search(item.color, hint);
         let mut diff = f64::from(diff_sq);
-        item.likely_palette_index = nearest as u16;
+        item.sort_value_or_index = nearest as u32;
 
         if adjust_weights {
             let reflected = reflected_color(item.color, palette[nearest].color);
@@ -1618,8 +1626,7 @@ fn replace_unused_palette_entries(histogram: &[HistItem], palette: &mut [Palette
             let mut worst_idx = None;
             let mut worst_diff = 0.0f32;
             for (item_idx, item) in histogram.iter().enumerate() {
-                let hint =
-                    usize::from(item.likely_palette_index).min(palette.len().saturating_sub(1));
+                let hint = (item.sort_value_or_index as usize).min(palette.len().saturating_sub(1));
                 let may_be_worst = palette
                     .get(hint)
                     .is_none_or(|pal| pal.color.diff(item.color) > worst_diff);
@@ -2185,6 +2192,11 @@ struct PlainRemapPass {
     palette_error: f64,
 }
 
+/// Plain remap splits the image into at most this many row bands...
+const PLAIN_REMAP_MAX_BANDS: usize = 64;
+/// ...of at least this many pixels (fewer, larger bands on small images).
+const PLAIN_REMAP_MIN_BAND_PIXELS: usize = 4096;
+
 fn remap_image_plain_pass(
     width: usize,
     pixels: &[InternalPixel],
@@ -2196,27 +2208,32 @@ fn remap_image_plain_pass(
     let tree = NearestTree::new(palette_points);
     let height = pixels.len().div_ceil(width);
 
-    // Process rows in parallel — row hint dependency is within-row only
+    // Bands of rows run in parallel, each with one set of accumulators; the row
+    // hint resets per row. Band size depends only on the image size, so sums
+    // merge in the same order for any thread count.
+    let band_rows = height
+        .div_ceil(PLAIN_REMAP_MAX_BANDS)
+        .max(PLAIN_REMAP_MIN_BAND_PIXELS.div_ceil(width.max(1)));
     #[allow(clippy::type_complexity)]
-    let row_results: Vec<(Vec<u8>, Vec<usize>, Vec<[f64; 4]>, Vec<f64>, f64)> = (0..height)
+    let row_results: Vec<(Vec<u8>, Vec<usize>, Vec<[f64; 4]>, Vec<f64>, f64)> = (0..height
+        .div_ceil(band_rows))
         .into_par_iter()
-        .map(|row| {
-            let row_start = row * width;
-            let row_end = (row_start + width).min(pixels.len());
-            let row_pixels = &pixels[row_start..row_end];
-            let mut row_indices = Vec::with_capacity(row_pixels.len());
+        .map(|band| {
+            let band_start = band * band_rows * width;
+            let band_end = (band_start + band_rows * width).min(pixels.len());
+            let mut row_indices = Vec::with_capacity(band_end - band_start);
             let mut counts = vec![0usize; pal_len];
             let mut sums = vec![[0.0f64; 4]; pal_len];
             let mut weights = vec![0.0f64; pal_len];
             let mut total_error = 0.0f64;
             let mut last_idx = 0usize;
 
-            for (col, &color) in row_pixels.iter().enumerate() {
-                if col == 0 {
+            for (offset, &color) in pixels[band_start..band_end].iter().enumerate() {
+                if offset % width == 0 {
                     last_idx = 0;
                 }
                 let (idx, diff) = tree.search(color, last_idx);
-                let pixel_idx = row_start + col;
+                let pixel_idx = band_start + offset;
 
                 // Background-aware plain remap: if background pixel is closer, use transparent_index
                 if let Some((bg_pixels, transparent_idx)) = background
@@ -2600,8 +2617,12 @@ fn effective_dither_chunks(width: usize, height: usize) -> usize {
     if height <= 128 {
         return 1;
     }
-    let suggested = (width.saturating_mul(height) / 524_288)
-        .min(height / 128)
+    // Strips of at least 32 rows and 8K pixels: each one re-dithers the two rows
+    // above it to warm up the error, which measured size- and score-neutral
+    // (SSIMULACRA2) against fewer, taller strips, and lets small images use
+    // more than two cores.
+    let suggested = (width.saturating_mul(height) / 8_192)
+        .min(height / 32)
         // A fixed cap rather than the thread count: chunk boundaries reset the
         // diffused error, so output must not depend on how many threads run.
         .clamp(2, MAX_DITHER_CHUNKS);
@@ -2766,6 +2787,7 @@ fn select_dither_map(
                     pixels,
                     width,
                     height,
+                    edges_map,
                     &plain_pass.indices,
                     palette_points,
                     uses_background,
@@ -3052,10 +3074,14 @@ pub(crate) fn build_contrast_maps(
     })
 }
 
+/// `edges` is the edge map already computed for `pixels` (see
+/// `build_contrast_maps`); without it the contrast maps are computed here.
+#[allow(clippy::too_many_arguments)]
 fn build_dither_map(
     pixels: &[InternalPixel],
     width: usize,
     height: usize,
+    edges: Option<&[u8]>,
     remapped_indices: &[u8],
     palette: &[InternalPixel],
     uses_background: bool,
@@ -3064,52 +3090,60 @@ fn build_dither_map(
         return Vec::new();
     }
 
-    let (_, mut edges) = compute_contrast_maps(pixels, width, height);
+    let mut edges = match edges {
+        Some(edges) => edges.to_vec(),
+        None => compute_contrast_maps(pixels, width, height).1,
+    };
     if edges.is_empty() {
         return edges;
     }
 
-    for row in 0..height {
-        let row_start = row * width;
-        let row_pixels = &remapped_indices[row_start..row_start + width];
-        let mut last_pixel = row_pixels[0];
-        let mut last_col = 0usize;
+    // Each row only rewrites its own edges (reading the rows next to it).
+    edges
+        .par_chunks_mut(width)
+        .enumerate()
+        .for_each(|(row, row_edges)| {
+            let row_start = row * width;
+            let row_pixels = &remapped_indices[row_start..row_start + width];
+            let mut last_pixel = row_pixels[0];
+            let mut last_col = 0usize;
 
-        #[allow(clippy::needless_range_loop)]
-        for col in 1..width {
-            let px = row_pixels[col];
-            // When background is set, transparent pixels may or may not
-            // create edges — assume no edge (matches libimagequant behavior).
-            if uses_background
-                && palette
-                    .get(px as usize)
-                    .is_some_and(|c| c.is_fully_transparent())
-            {
-                continue;
-            }
-            if px != last_pixel || col == width - 1 {
-                let mut neighbor_count = 10usize * (col - last_col);
-                for i in last_col..col {
-                    if row > 0 && remapped_indices[(row - 1) * width + i] == last_pixel {
-                        neighbor_count += 15;
-                    }
-                    if row + 1 < height && remapped_indices[(row + 1) * width + i] == last_pixel {
-                        neighbor_count += 15;
-                    }
+            #[allow(clippy::needless_range_loop)]
+            for col in 1..width {
+                let px = row_pixels[col];
+                // When background is set, transparent pixels may or may not
+                // create edges — assume no edge (matches libimagequant behavior).
+                if uses_background
+                    && palette
+                        .get(px as usize)
+                        .is_some_and(|c| c.is_fully_transparent())
+                {
+                    continue;
                 }
+                if px != last_pixel || col == width - 1 {
+                    let mut neighbor_count = 10usize * (col - last_col);
+                    for i in last_col..col {
+                        if row > 0 && remapped_indices[(row - 1) * width + i] == last_pixel {
+                            neighbor_count += 15;
+                        }
+                        if row + 1 < height && remapped_indices[(row + 1) * width + i] == last_pixel
+                        {
+                            neighbor_count += 15;
+                        }
+                    }
 
-                for i in last_col..=col {
-                    edges[row_start + i] = (f32::from(u16::from(edges[row_start + i]) + 128)
-                        * (255.0 / (255.0 + 128.0))
-                        * (1.0 - 20.0 / (20.0 + neighbor_count as f32)))
-                        as u8;
+                    for edge in &mut row_edges[last_col..=col] {
+                        *edge = (f32::from(u16::from(*edge) + 128)
+                            * (255.0 / (255.0 + 128.0))
+                            * (1.0 - 20.0 / (20.0 + neighbor_count as f32)))
+                            as u8;
+                    }
+
+                    last_col = col;
+                    last_pixel = px;
                 }
-
-                last_col = col;
-                last_pixel = px;
             }
-        }
-    }
+        });
 
     edges
 }
@@ -3675,12 +3709,10 @@ mod tests {
                 g: 0.2,
                 b: 0.3,
             },
-            rgba: [0, 0, 0, 255],
             adjusted_weight: 7.5,
             perceptual_weight: 1.0,
             mc_color_weight: 0.0,
-            sort_value: 0,
-            likely_palette_index: 0,
+            sort_value_or_index: 0,
         }];
         let mut palette = vec![super::PaletteEntry {
             color: InternalPixel {
@@ -3761,12 +3793,10 @@ mod tests {
         let gamma = gamma_lut(SRGB_OUTPUT_GAMMA);
         let mut histogram = vec![super::HistItem {
             color: InternalPixel::from_rgba(&gamma, &[255, 16, 16, 16]),
-            rgba: [255, 16, 16, 16],
             adjusted_weight: 1.0,
             perceptual_weight: 1.0,
             mc_color_weight: 1.0,
-            sort_value: 0,
-            likely_palette_index: 0,
+            sort_value_or_index: 0,
         }];
         let original = InternalPixel::from_rgba(&gamma, &[255, 32, 32, 32]);
         let mut palette = vec![super::PaletteEntry {

@@ -135,6 +135,55 @@ pub fn evaluate_quality_against_rgba(original_rgba: &[u8], remapped_rgba: &[u8])
     }
 }
 
+/// Same result as [`evaluate_quality_against_rgba`] on the remapped image, but
+/// straight from palette indices: the palette is converted once, per-pixel
+/// errors are computed in parallel, and they are summed in pixel order.
+/// `original_pixels` (the original already converted) skips that conversion.
+pub(crate) fn evaluate_quality_indexed(
+    original_rgba: &[u8],
+    original_pixels: Option<&[InternalPixel]>,
+    indices: &[u8],
+    palette: &[[u8; 4]],
+) -> QualityMetrics {
+    use rayon::prelude::*;
+    assert_eq!(original_rgba.len(), indices.len() * 4);
+    if indices.is_empty() {
+        return QualityMetrics {
+            internal_mse: 0.0,
+            standard_mse: 0.0,
+            quality_score: 100,
+        };
+    }
+    let gamma_lut = gamma_lut(SRGB_OUTPUT_GAMMA);
+    let palette: Vec<InternalPixel> = palette
+        .iter()
+        .map(|px| InternalPixel::from_rgba(&gamma_lut, px))
+        .collect();
+    let mut errors = vec![0f32; indices.len()];
+    const CHUNK: usize = 1 << 14;
+    errors
+        .par_chunks_mut(CHUNK)
+        .enumerate()
+        .for_each(|(chunk, errors)| {
+            let start = chunk * CHUNK;
+            for (i, error) in errors.iter_mut().enumerate() {
+                let p = start + i;
+                let src = match original_pixels {
+                    Some(pixels) => pixels[p],
+                    None => InternalPixel::from_rgba(&gamma_lut, &original_rgba[p * 4..p * 4 + 4]),
+                };
+                *error = src.diff(palette[indices[p] as usize]);
+            }
+        });
+    let total: f64 = errors.iter().map(|&e| f64::from(e)).sum();
+    let internal_mse = total / indices.len() as f64;
+    QualityMetrics {
+        internal_mse,
+        standard_mse: internal_mse_to_standard_mse(internal_mse),
+        quality_score: mse_to_quality(internal_mse),
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct InternalPixel {
     pub(crate) a: f32,
@@ -222,8 +271,46 @@ fn internal_mse_to_standard_mse(mse: f64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        DitherMapMode, SpeedSettings, evaluate_quality_against_rgba, mse_to_quality, quality_to_mse,
+        DitherMapMode, InternalPixel, SRGB_OUTPUT_GAMMA, SpeedSettings,
+        evaluate_quality_against_rgba, evaluate_quality_indexed, gamma_lut, mse_to_quality,
+        quality_to_mse,
     };
+
+    #[test]
+    fn indexed_quality_matches_rgba_quality_exactly() {
+        let palette: Vec<[u8; 4]> = (0..37u32)
+            .map(|i| {
+                [
+                    (i * 7) as u8,
+                    (i * 53) as u8,
+                    (i * 101) as u8,
+                    (255 - i * 3) as u8,
+                ]
+            })
+            .collect();
+        let n = 40_000usize;
+        let mut seed = 1u32;
+        let mut next = || {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            seed
+        };
+        let rgba: Vec<u8> = (0..n * 4).map(|_| (next() >> 24) as u8).collect();
+        let indices: Vec<u8> = (0..n).map(|_| (next() % 37) as u8).collect();
+        let remapped: Vec<u8> = indices.iter().flat_map(|&i| palette[i as usize]).collect();
+        let expected = evaluate_quality_against_rgba(&rgba, &remapped);
+        let lut = gamma_lut(SRGB_OUTPUT_GAMMA);
+        let pixels: Vec<InternalPixel> = rgba
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|px| InternalPixel::from_rgba(&lut, px))
+            .collect();
+        for pixels in [None, Some(pixels.as_slice())] {
+            let got = evaluate_quality_indexed(&rgba, pixels, &indices, &palette);
+            assert_eq!(got.internal_mse.to_bits(), expected.internal_mse.to_bits());
+            assert_eq!(got.quality_score, expected.quality_score);
+        }
+    }
 
     #[test]
     fn quality_mse_roundtrip_is_monotonic() {

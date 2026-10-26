@@ -20,7 +20,7 @@ use crate::palette_quant::{
 };
 use crate::quality::{
     InternalPixel, QualityMetrics, SRGB_OUTPUT_GAMMA, SpeedSettings, evaluate_quality_against_rgba,
-    gamma_lut, mse_to_quality, quality_to_mse,
+    evaluate_quality_indexed, gamma_lut, mse_to_quality, quality_to_mse,
 };
 
 const DEFAULT_MAX_COLORS: usize = 256;
@@ -103,6 +103,16 @@ pub fn process_png_file(
 }
 
 pub fn process_png_bytes(
+    input_bytes: &[u8],
+    options: PipelineOptions,
+) -> Result<PipelineResult, AppError> {
+    // Run on a pool worker: the pipeline issues dozens of parallel calls, and
+    // each one made from outside the pool is injected and waited for through a
+    // lock, which costs milliseconds per small image.
+    rayon::scope(|_| process_png_bytes_in_pool(input_bytes, options))
+}
+
+fn process_png_bytes_in_pool(
     input_bytes: &[u8],
     options: PipelineOptions,
 ) -> Result<PipelineResult, AppError> {
@@ -420,7 +430,8 @@ fn evaluate_candidate(
         return first;
     }
     let threshold = local_shift_threshold(quality_targets);
-    let mut best_report = local_shift_report(rgba, &first, width, height, threshold);
+    let mut best_report =
+        local_shift_report(rgba, analysis.pixels(), &first, width, height, threshold);
     let mut best = first;
     let mut boost: Option<Vec<u16>> = None;
     for _ in 0..LOCAL_FEEDBACK_ROUNDS {
@@ -452,7 +463,14 @@ fn evaluate_candidate(
             quality_targets,
             Some(&merged),
         );
-        let report = local_shift_report(rgba, &candidate, width, height, threshold);
+        let report = local_shift_report(
+            rgba,
+            analysis.pixels(),
+            &candidate,
+            width,
+            height,
+            threshold,
+        );
         boost = Some(merged);
         let meets_floor = quality_targets
             .max_mse
@@ -558,11 +576,13 @@ impl LocalShiftReport {
 
 fn local_shift_report(
     rgba: &[u8],
+    pixels: Option<&[InternalPixel]>,
     candidate: &QuantizeCandidate,
     width: usize,
     height: usize,
     threshold: f64,
 ) -> LocalShiftReport {
+    use rayon::prelude::*;
     let columns = width.div_ceil(LOCAL_BLOCK);
     let rows = height.div_ceil(LOCAL_BLOCK);
     let lut = gamma_lut(SRGB_OUTPUT_GAMMA);
@@ -575,26 +595,37 @@ fn local_shift_report(
     let mut src_sum = vec![[0f64; 4]; columns * rows];
     let mut dst_sum = vec![[0f64; 4]; columns * rows];
     let mut counts = vec![0u32; columns * rows];
-    for y in 0..height {
-        let row = (y / LOCAL_BLOCK) * columns;
-        for x in 0..width {
-            let i = y * width + x;
-            let block = row + x / LOCAL_BLOCK;
-            let s = InternalPixel::from_rgba(&lut, &rgba[i * 4..i * 4 + 4]);
-            let d = palette[candidate.indexed.indices[i] as usize];
-            let ss = &mut src_sum[block];
-            ss[0] += f64::from(s.a);
-            ss[1] += f64::from(s.r);
-            ss[2] += f64::from(s.g);
-            ss[3] += f64::from(s.b);
-            let ds = &mut dst_sum[block];
-            ds[0] += f64::from(d.a);
-            ds[1] += f64::from(d.r);
-            ds[2] += f64::from(d.g);
-            ds[3] += f64::from(d.b);
-            counts[block] += 1;
-        }
-    }
+    // One block row per task; each block still sums its pixels in raster order.
+    src_sum
+        .par_chunks_mut(columns)
+        .zip(dst_sum.par_chunks_mut(columns))
+        .zip(counts.par_chunks_mut(columns))
+        .enumerate()
+        .for_each(|(block_row, ((src_sum, dst_sum), counts))| {
+            let y0 = block_row * LOCAL_BLOCK;
+            for y in y0..(y0 + LOCAL_BLOCK).min(height) {
+                for x in 0..width {
+                    let i = y * width + x;
+                    let block = x / LOCAL_BLOCK;
+                    let s = match pixels {
+                        Some(pixels) => pixels[i],
+                        None => InternalPixel::from_rgba(&lut, &rgba[i * 4..i * 4 + 4]),
+                    };
+                    let d = palette[candidate.indexed.indices[i] as usize];
+                    let ss = &mut src_sum[block];
+                    ss[0] += f64::from(s.a);
+                    ss[1] += f64::from(s.r);
+                    ss[2] += f64::from(s.g);
+                    ss[3] += f64::from(s.b);
+                    let ds = &mut dst_sum[block];
+                    ds[0] += f64::from(d.a);
+                    ds[1] += f64::from(d.r);
+                    ds[2] += f64::from(d.g);
+                    ds[3] += f64::from(d.b);
+                    counts[block] += 1;
+                }
+            }
+        });
     let mut block_boost = vec![0u16; columns * rows];
     let mut failing_blocks = 0usize;
     let mut excess = 0.0f64;
@@ -686,8 +717,8 @@ fn quantize_and_measure(
         importance_boost,
         Some(analysis),
     );
-    let remapped_rgba = remapped_rgba_from_indices(&indexed.indices, &indexed.palette);
-    let quality = evaluate_quality_against_rgba(rgba, &remapped_rgba);
+    let quality =
+        evaluate_quality_indexed(rgba, analysis.pixels(), &indexed.indices, &indexed.palette);
     (QuantizeCandidate { indexed, quality }, used_photo_palette)
 }
 
