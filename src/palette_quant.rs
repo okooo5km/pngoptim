@@ -54,7 +54,51 @@ pub fn quantize_indexed(
     height: usize,
     settings: QuantizerSettings,
 ) -> IndexedImage {
-    quantize_indexed_with_boost(rgba, width, height, settings, None)
+    quantize_indexed_with_boost(rgba, width, height, settings, None, None)
+}
+
+/// Per-image work that does not depend on the palette: gamma-weighted pixels,
+/// contrast maps and the adaptive dither map. The pipeline quantizes one image
+/// up to three times (local-error feedback rounds), so it builds this once.
+pub(crate) struct ImageAnalysis {
+    contrast_pixels: Option<Vec<InternalPixel>>,
+    contrast_maps: Option<ContrastMaps>,
+    adaptive: Option<AdaptiveDither>,
+}
+
+impl ImageAnalysis {
+    pub(crate) fn new(
+        rgba: &[u8],
+        width: usize,
+        height: usize,
+        settings: QuantizerSettings,
+    ) -> Self {
+        let gamma = gamma_lut(SRGB_OUTPUT_GAMMA);
+        let contrast_pixels =
+            if settings.use_contrast_maps || settings.use_dither_map != DitherMapMode::None {
+                Some(
+                    rgba.par_chunks_exact(4)
+                        .map(|px| InternalPixel::from_rgba(&gamma, px))
+                        .collect::<Vec<_>>(),
+                )
+            } else {
+                None
+            };
+        let contrast_maps = contrast_pixels
+            .as_deref()
+            .and_then(|pixels| build_contrast_maps(pixels, width, height));
+        let adaptive = contrast_pixels
+            .as_deref()
+            .filter(|_| settings.dither && settings.adaptive_dither)
+            .map(|pixels| {
+                AdaptiveDither::new(pixels, width, height, full_dithering_level(settings))
+            });
+        Self {
+            contrast_pixels,
+            contrast_maps,
+            adaptive,
+        }
+    }
 }
 
 /// Quantize with a per-pixel histogram weight multiplier.
@@ -70,6 +114,7 @@ pub(crate) fn quantize_indexed_with_boost(
     height: usize,
     settings: QuantizerSettings,
     importance_boost: Option<&[u16]>,
+    analysis: Option<&ImageAnalysis>,
 ) -> IndexedImage {
     let pixel_count = width.saturating_mul(height);
     if pixel_count == 0 {
@@ -79,23 +124,22 @@ pub(crate) fn quantize_indexed_with_boost(
         };
     }
     let gamma = gamma_lut(SRGB_OUTPUT_GAMMA);
-    let contrast_pixels =
-        if settings.use_contrast_maps || settings.use_dither_map != DitherMapMode::None {
-            Some(
-                rgba.par_chunks_exact(4)
-                    .map(|px| InternalPixel::from_rgba(&gamma, px))
-                    .collect::<Vec<_>>(),
-            )
-        } else {
-            None
-        };
-    let contrast_maps = contrast_pixels
-        .as_deref()
-        .and_then(|pixels| build_contrast_maps(pixels, width, height));
-    let importance_map = contrast_maps
+    let owned_analysis;
+    let analysis = match analysis {
+        Some(analysis) => analysis,
+        None => {
+            owned_analysis = ImageAnalysis::new(rgba, width, height, settings);
+            &owned_analysis
+        }
+    };
+    let importance_map = analysis
+        .contrast_maps
         .as_ref()
         .map(|maps| maps.importance_map.as_slice());
-    let edges_map = contrast_maps.as_ref().map(|maps| maps.edges.as_slice());
+    let edges_map = analysis
+        .contrast_maps
+        .as_ref()
+        .map(|maps| maps.edges.as_slice());
     let histogram = build_histogram(
         rgba,
         width,
@@ -128,8 +172,9 @@ pub(crate) fn quantize_indexed_with_boost(
         settings,
         importance_map,
         edges_map,
-        contrast_pixels.as_deref(),
+        analysis.contrast_pixels.as_deref(),
         None,
+        analysis.adaptive.as_ref(),
     )
 }
 
@@ -220,6 +265,7 @@ pub fn quantize_indexed_with_importance(
         importance_map,
         edges_map,
         contrast_pixels.as_deref(),
+        None,
         None,
     )
 }
@@ -338,6 +384,7 @@ pub fn quantize_indexed_with_background(
         edges_map,
         contrast_pixels.as_deref(),
         bg_pixels,
+        None,
     )
 }
 
@@ -1721,6 +1768,7 @@ pub(crate) fn remap_image(
     edges_map: Option<&[u8]>,
     contrast_pixels: Option<&[InternalPixel]>,
     background_pixels: Option<&[InternalPixel]>,
+    adaptive: Option<&AdaptiveDither>,
 ) -> IndexedImage {
     let (palette, mut indices, counts) = if settings.dither {
         remap_image_dithered(
@@ -1734,6 +1782,7 @@ pub(crate) fn remap_image(
             edges_map,
             contrast_pixels,
             background_pixels,
+            adaptive,
         )
     } else {
         remap_image_plain(
@@ -1864,9 +1913,7 @@ pub(crate) fn remap_to_fixed_palette(
             .filter(|_| output_image_is_remapped)
             .map(|pass| pass.indices.clone())
             .unwrap_or_else(|| vec![0u8; pixels.len()]);
-        let mut base_dithering_level = (1.0 - settings.dither_level)
-            .mul_add(-(1.0 - settings.dither_level), 1.0)
-            * (15.0f32 / 16.0f32);
+        let mut base_dithering_level = full_dithering_level(settings);
         let adaptive = settings
             .adaptive_dither
             .then(|| AdaptiveDither::new(&pixels, width, height, base_dithering_level));
@@ -2132,6 +2179,7 @@ fn remap_image_dithered(
     edges_map: Option<&[u8]>,
     contrast_pixels: Option<&[InternalPixel]>,
     background_pixels: Option<&[InternalPixel]>,
+    adaptive: Option<&AdaptiveDither>,
 ) -> (Vec<(InternalPixel, [u8; 4])>, Vec<u8>, Vec<usize>) {
     let mut palette_points = palette.iter().map(|entry| entry.0).collect::<Vec<_>>();
     let gamma = gamma_lut(SRGB_OUTPUT_GAMMA);
@@ -2211,12 +2259,16 @@ fn remap_image_dithered(
         .filter(|_| output_image_is_remapped)
         .map(|pass| pass.indices.clone())
         .unwrap_or_else(|| vec![0u8; pixels.len()]);
-    let mut base_dithering_level = (1.0 - settings.dither_level)
-        .mul_add(-(1.0 - settings.dither_level), 1.0)
-        * (15.0f32 / 16.0f32);
-    let adaptive = settings
-        .adaptive_dither
-        .then(|| AdaptiveDither::new(pixels, width, height, base_dithering_level));
+    let mut base_dithering_level = full_dithering_level(settings);
+    let owned_adaptive;
+    let adaptive = match adaptive {
+        Some(adaptive) => Some(adaptive),
+        None if settings.adaptive_dither => {
+            owned_adaptive = AdaptiveDither::new(pixels, width, height, base_dithering_level);
+            Some(&owned_adaptive)
+        }
+        None => None,
+    };
     if !dither_map.is_empty() {
         base_dithering_level *= 1.0 / 255.0;
     }
@@ -2246,7 +2298,7 @@ fn remap_image_dithered(
         &mut indices,
         effective_bg,
         transparent_index,
-        adaptive.as_ref(),
+        adaptive,
     );
     let mut counts = vec![0usize; palette.len()];
     for &idx in &indices {
@@ -2448,7 +2500,8 @@ fn dither_row(
             && !isolated
         {
             let left = (offset > 0).then(|| output_row[if even_row { x - 1 } else { x + 1 }]);
-            let neighbors = [left, row.above.get(x).copied()];
+            let above = row.above.get(x).copied().filter(|&up| Some(up) != left);
+            let neighbors = [left, above];
             if !neighbors.contains(&Some(pal_idx as u8)) {
                 let shade = (row_pixels[x].g * ADAPTIVE_RUN_DARK).min(1.0);
                 let mut best = shade.mul_add(shade * row.params.run_bias, dither_diff);
@@ -2564,6 +2617,12 @@ fn select_dither_map(
     Vec::new()
 }
 
+/// Floyd-Steinberg level before the dither map scales it (libimagequant's
+/// `(1-(1-d)²)·15/16`).
+fn full_dithering_level(settings: QuantizerSettings) -> f32 {
+    (1.0 - settings.dither_level).mul_add(-(1.0 - settings.dither_level), 1.0) * (15.0f32 / 16.0f32)
+}
+
 fn get_dithered_pixel(
     dither_level: f32,
     max_dither_error: f32,
@@ -2660,7 +2719,7 @@ const ADAPTIVE_RUN_DARK: f32 = 2.0;
 ///   nearest entry. Its larger error is still diffused, so the average color holds,
 ///   while runs get longer. Using both neighbors avoids the horizontal streaks a
 ///   left-only preference draws in flat skies.
-struct AdaptiveDither {
+pub(crate) struct AdaptiveDither {
     /// Per pixel: `ADAPTIVE_SMOOTH` bit plus strength in `ADAPTIVE_STRENGTH` units.
     map: Vec<u8>,
     /// Squared error (sum over channels) below which errors are not diffused.
@@ -2727,18 +2786,6 @@ impl AdaptiveDither {
                         down_diff[x] = below.map_or(0.0, |below| px.diff(below[x]));
                         let most = left_diff.max(right_diff).max(up_diff[x]).max(down_diff[x]);
                         left_diff = right_diff;
-                        let mut alpha_jump = 0f32;
-                        for nb in [
-                            x.checked_sub(1).map(|l| row[l]),
-                            row.get(x + 1).copied(),
-                            above.map(|r| r[x]),
-                            below.map(|r| r[x]),
-                        ]
-                        .into_iter()
-                        .flatten()
-                        {
-                            alpha_jump = alpha_jump.max((nb.a - px.a).abs());
-                        }
                         class_row[x] = if most == 0.0 {
                             0
                         } else if most <= fade_from {
@@ -2746,8 +2793,20 @@ impl AdaptiveDither {
                         } else {
                             2
                         };
-                        let opaque = px.a >= InternalPixel::OPAQUE_A - 1e-6;
-                        if opaque || (!px.is_fully_transparent() && alpha_jump <= alpha_step) {
+                        // Opaque pixels are always ditherable; the alpha-edge test is
+                        // only needed for translucent ones.
+                        let ditherable = px.a >= InternalPixel::OPAQUE_A - 1e-6
+                            || (!px.is_fully_transparent()
+                                && [
+                                    x.checked_sub(1).map(|l| row[l]),
+                                    row.get(x + 1).copied(),
+                                    above.map(|r| r[x]),
+                                    below.map(|r| r[x]),
+                                ]
+                                .into_iter()
+                                .flatten()
+                                .all(|nb| (nb.a - px.a).abs() <= alpha_step));
+                        if ditherable {
                             let strength = if most <= fade_from {
                                 1.0
                             } else if most >= fade_to {
@@ -3284,6 +3343,7 @@ mod tests {
             None,
             settings,
             Some(&[255, 1]),
+            None,
             None,
             None,
             None,

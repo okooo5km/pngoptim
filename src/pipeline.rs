@@ -14,9 +14,9 @@ use crate::apng::{
 use crate::cli::{ApngMode, QualityRange};
 use crate::error::AppError;
 use crate::palette_quant::{
-    IndexedImage, build_histogram_map, finalize_histogram, find_best_palette, merge_histogram_maps,
-    quantize_indexed_with_boost, quantizer_settings, remap_to_fixed_palette,
-    reposterize_histogram_map, sort_palette_entries,
+    ImageAnalysis, IndexedImage, QuantizerSettings, build_histogram_map, finalize_histogram,
+    find_best_palette, merge_histogram_maps, quantize_indexed_with_boost, quantizer_settings,
+    remap_to_fixed_palette, reposterize_histogram_map, sort_palette_entries,
 };
 use crate::quality::{
     InternalPixel, QualityMetrics, SRGB_OUTPUT_GAMMA, SpeedSettings, evaluate_quality_against_rgba,
@@ -389,18 +389,20 @@ fn evaluate_candidate(
     dither_level: f32,
     adaptive_dither: bool,
 ) -> QuantizeCandidate {
-    let first = evaluate_candidate_once(
-        rgba,
-        width,
-        height,
+    let quantizer = quantizer_settings(
         max_colors,
-        output_posterize_bits,
         speed_settings,
-        quality_targets,
+        quality_targets.target_mse,
+        quality_targets.max_mse,
+        quality_targets.target_mse_is_zero,
+        output_posterize_bits,
         dither_level,
         adaptive_dither,
-        None,
     );
+    // Feedback rounds only change histogram weights; the palette-independent
+    // per-image maps are built once.
+    let analysis = ImageAnalysis::new(rgba, width, height, quantizer);
+    let first = evaluate_candidate_once(rgba, width, height, quantizer, &analysis, None);
     // A first pass already below the quality floor is rejected by the caller
     // anyway, and re-weighting only trades global error for local error.
     if quality_targets
@@ -433,18 +435,8 @@ fn evaluate_candidate(
             }
             None => round_boost,
         };
-        let candidate = evaluate_candidate_once(
-            rgba,
-            width,
-            height,
-            max_colors,
-            output_posterize_bits,
-            speed_settings,
-            quality_targets,
-            dither_level,
-            adaptive_dither,
-            Some(&merged),
-        );
+        let candidate =
+            evaluate_candidate_once(rgba, width, height, quantizer, &analysis, Some(&merged));
         let report = local_shift_report(rgba, &candidate, width, height, threshold);
         boost = Some(merged);
         let meets_floor = quality_targets
@@ -624,25 +616,18 @@ fn evaluate_candidate_once(
     rgba: &[u8],
     width: usize,
     height: usize,
-    max_colors: usize,
-    output_posterize_bits: u8,
-    speed_settings: SpeedSettings,
-    quality_targets: QualityTargets,
-    dither_level: f32,
-    adaptive_dither: bool,
+    quantizer: QuantizerSettings,
+    analysis: &ImageAnalysis,
     importance_boost: Option<&[u16]>,
 ) -> QuantizeCandidate {
-    let quantizer = quantizer_settings(
-        max_colors,
-        speed_settings,
-        quality_targets.target_mse,
-        quality_targets.max_mse,
-        quality_targets.target_mse_is_zero,
-        output_posterize_bits,
-        dither_level,
-        adaptive_dither,
+    let indexed = quantize_indexed_with_boost(
+        rgba,
+        width,
+        height,
+        quantizer,
+        importance_boost,
+        Some(analysis),
     );
-    let indexed = quantize_indexed_with_boost(rgba, width, height, quantizer, importance_boost);
     let remapped_rgba = remapped_rgba_from_indices(&indexed.indices, &indexed.palette);
     let quality = evaluate_quality_against_rgba(rgba, &remapped_rgba);
     QuantizeCandidate { indexed, quality }
