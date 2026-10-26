@@ -1003,16 +1003,20 @@ fn encode_indexed_png_to_vec(
     } else {
         // Sub-byte packing splits pixel runs across byte boundaries, which hurts
         // deflate's byte-level matching: storing <=16-color images at 8 bits per index
-        // is smaller for most of them (5-13% on icons), so try both and keep the smaller.
+        // is smaller for most of them (5-13% on icons). A fast probe of both picks the
+        // layout, so only one is compressed for real.
         let unpacked = filtered_indexed_rows(indices, width, height, png::BitDepth::Eight)?;
-        let (packed_idat, unpacked_idat) = rayon::join(
-            || compress_idat(&packed.0, packed.1),
-            || compress_idat(&unpacked.0, unpacked.1),
+        let (packed_probe, unpacked_probe) = rayon::join(
+            || crate::deflate::probe_size(&packed.0),
+            || crate::deflate::probe_size(&unpacked.0),
         );
-        if unpacked_idat.len() < packed_idat.len() {
-            (png::BitDepth::Eight, unpacked_idat)
+        if unpacked_probe < packed_probe {
+            let idat =
+                crate::deflate::zlib_compress_idat_probed(&unpacked.0, unpacked.1, unpacked_probe);
+            (png::BitDepth::Eight, idat)
         } else {
-            (bit_depth, packed_idat)
+            let idat = crate::deflate::zlib_compress_idat_probed(&packed.0, packed.1, packed_probe);
+            (bit_depth, idat)
         }
     };
 
@@ -1056,17 +1060,16 @@ fn filtered_indexed_rows(
     Ok((filtered, row_bytes + 1))
 }
 
-/// Highest `--speed` that still compresses IDAT with libdeflate level 12.
+/// Highest `--speed` that still compresses IDAT with libdeflate.
 const LIBDEFLATE_MAX_SPEED: u8 = 7;
 
-/// libdeflate level 12 (near-optimal parsing): ~6.7% smaller IDAT than zlib level 9
-/// on palette indices, on every image measured. Chunked and parallel, since level 12
-/// alone is 10-25x slower than zlib level 9.
+/// libdeflate level 10-12 by size (see `deflate::zlib_compress_idat`): 4-8% smaller
+/// IDAT than zlib level 9 on palette indices. Chunked and parallel.
 fn compress_idat(filtered: &[u8], row_len: usize) -> Vec<u8> {
-    crate::deflate::zlib_compress_rows(filtered, row_len, 12)
+    crate::deflate::zlib_compress_idat(filtered, row_len)
 }
 
-/// zlib-rs compression (speed >= 8, where libdeflate level 12 is too slow).
+/// zlib-rs compression (speed >= 8).
 fn zlib_rs_compress(filtered: &[u8], level: i32, mem_level: i32) -> Result<Vec<u8>, AppError> {
     let config = zlib_rs::DeflateConfig {
         level,

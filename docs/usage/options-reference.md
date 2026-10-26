@@ -48,11 +48,11 @@ If the quantized quality falls below the minimum, pngoptim exits with code **98*
 | 1–3 | More k-means iterations, finer palette refinement, full dithering |
 | 4 | Default balanced mode |
 | 5–7 | Fewer iterations, faster processing |
-| 8 | Fewer iterations; faster zlib-rs level 9 compression instead of libdeflate level 12 (output ~7% larger) |
+| 8 | Fewer iterations; zlib-rs level 9 compression instead of libdeflate (output ~5% larger) |
 | 9 | Minimal refinement; zlib-rs level 9 compression |
 | 10–11 | Fastest; dithering automatically disabled; zlib-rs level 1 compression |
 
-Speeds 1–7 compress image data with libdeflate level 12 (parallel, chunked). It is lossless and makes files ~7% smaller than zlib level 9, at some extra encode time on small, highly compressible images such as icons; use `--speed 8` if encode speed matters more than size.
+Speeds 1–7 compress image data with libdeflate (parallel, chunked), choosing the method by data size: level 12 for large images (≥ 2 MiB of index data), level 10 below that, and zlib-rs level 9 for highly redundant data such as flat icons and line art, where it compresses as well and faster. It is lossless and makes files ~5% smaller than zlib level 9 alone, at about the same encode time; use `--speed 8` for the previous zlib-only encoder.
 
 ### Dithering
 

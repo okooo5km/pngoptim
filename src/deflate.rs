@@ -20,14 +20,85 @@ use rayon::prelude::*;
 
 /// Chunks smaller than this lose too much to the cold window at each boundary.
 const MIN_CHUNK_BYTES: usize = 64 * 1024;
+/// Inputs below `SMALL_IDAT_BYTES` use this chunk size instead: they would otherwise
+/// be one serial chunk, and the cold windows cost ~2% there, less than the level
+/// choice saves in time.
+const SMALL_MIN_CHUNK_BYTES: usize = 16 * 1024;
+const SMALL_IDAT_BYTES: usize = 128 * 1024;
+/// Inputs from this size up get libdeflate level 12; smaller ones level 10. Measured
+/// on 80 quantized outputs (filtered palette indices): level 10 is 0.6-1.3% larger
+/// than 12 at a quarter to a third of the time, and still 3-5% smaller and faster
+/// than zlib level 9. Small and medium images are where encode time dominates the
+/// total, large ones already run well ahead of pngquant.
+const LEVEL12_MIN_BYTES: usize = 2 * 1024 * 1024;
+
+/// Compress filtered IDAT scanlines, picking the method by input size and
+/// redundancy (see `zlib_compress_idat_probed`).
+pub(crate) fn zlib_compress_idat(data: &[u8], row_len: usize) -> Vec<u8> {
+    let probe = if data.len() >= LEVEL12_MIN_BYTES {
+        0
+    } else {
+        probe_size(data)
+    };
+    zlib_compress_idat_probed(data, row_len, probe)
+}
+
+/// Rough compressed size of `data` from a fast libdeflate level 6 pass (parallel,
+/// a few percent of a level 10 pass). Used to choose between alternative encodings
+/// of the same image and to detect highly redundant data.
+pub(crate) fn probe_size(data: &[u8]) -> usize {
+    let n = chunk_count(data.len(), MIN_CHUNK_BYTES);
+    let parts: Vec<&[u8]> = data.chunks(data.len().div_ceil(n).max(1)).collect();
+    parts
+        .par_iter()
+        .map(|part| {
+            let mut c = compressor(6);
+            let mut raw = vec![0u8; c.deflate_compress_bound(part.len())];
+            c.deflate_compress(part, &mut raw).unwrap_or(part.len())
+        })
+        .sum()
+}
+
+/// `zlib_compress_idat` with a `probe_size` result already at hand:
+/// - from `LEVEL12_MIN_BYTES` up, libdeflate level 12;
+/// - highly redundant data (probe ratio of at least `REDUNDANT_RATIO`: flat icons,
+///   line art), zlib-rs level 9 with mem_level 5 and 8: lazy matching does as well
+///   as libdeflate 11 there, beats level 10 by up to 10%, and is fast on such input;
+/// - everything else, libdeflate level 10, in smaller chunks below `SMALL_IDAT_BYTES`.
+pub(crate) fn zlib_compress_idat_probed(data: &[u8], row_len: usize, probe: usize) -> Vec<u8> {
+    if data.len() >= LEVEL12_MIN_BYTES {
+        return compress_rows(data, row_len, 12, MIN_CHUNK_BYTES);
+    }
+    if probe.saturating_mul(REDUNDANT_RATIO) <= data.len() {
+        let (ml5, ml8) = rayon::join(|| zlib_rs_level9(data, 5), || zlib_rs_level9(data, 8));
+        let best = [ml5, ml8].into_iter().flatten().min_by_key(Vec::len);
+        if let Some(best) = best {
+            return best;
+        }
+    }
+    let min_chunk = if data.len() >= SMALL_IDAT_BYTES {
+        MIN_CHUNK_BYTES
+    } else {
+        SMALL_MIN_CHUNK_BYTES
+    };
+    compress_rows(data, row_len, 10, min_chunk)
+}
+
+/// Probe compression ratio from which data counts as highly redundant.
+const REDUNDANT_RATIO: usize = 20;
 /// Upper bound on chunk count: enough to fill a typical 8-core machine; every extra
 /// boundary costs a cold window and a new Huffman header.
 const MAX_CHUNKS: usize = 8;
 
 /// Compress `data` (a sequence of `row_len`-byte filtered scanlines) into a zlib
 /// stream with libdeflate at `level`, splitting at row boundaries for parallelism.
+#[cfg(test)]
 pub(crate) fn zlib_compress_rows(data: &[u8], row_len: usize, level: i32) -> Vec<u8> {
-    let chunk_count = chunk_count(data.len());
+    compress_rows(data, row_len, level, MIN_CHUNK_BYTES)
+}
+
+fn compress_rows(data: &[u8], row_len: usize, level: i32, min_chunk: usize) -> Vec<u8> {
+    let chunk_count = chunk_count(data.len(), min_chunk);
     if chunk_count > 1 && row_len > 0 {
         let rows = data.len() / row_len;
         let rows_per_chunk = rows.div_ceil(chunk_count);
@@ -40,7 +111,7 @@ pub(crate) fn zlib_compress_rows(data: &[u8], row_len: usize, level: i32) -> Vec
     if data.len() < SMALL_INPUT_BYTES {
         // libdeflate falls back to stored blocks on tiny inputs where zlib's fixed
         // Huffman block is a few bytes smaller; both are negligible in cost here.
-        if let Some(zlib) = zlib_rs_level9(data)
+        if let Some(zlib) = zlib_rs_level9(data, 8)
             && zlib.len() < stream.len()
         {
             return zlib;
@@ -52,9 +123,10 @@ pub(crate) fn zlib_compress_rows(data: &[u8], row_len: usize, level: i32) -> Vec
 /// Inputs below this size also try zlib-rs level 9 (see `zlib_compress_rows`).
 const SMALL_INPUT_BYTES: usize = 16 * 1024;
 
-fn zlib_rs_level9(data: &[u8]) -> Option<Vec<u8>> {
+fn zlib_rs_level9(data: &[u8], mem_level: i32) -> Option<Vec<u8>> {
     let config = zlib_rs::DeflateConfig {
         level: 9,
+        mem_level,
         ..zlib_rs::DeflateConfig::default()
     };
     let mut out = vec![0u8; zlib_rs::compress_bound(data.len())];
@@ -67,8 +139,8 @@ fn zlib_rs_level9(data: &[u8]) -> Option<Vec<u8>> {
     Some(out)
 }
 
-fn chunk_count(len: usize) -> usize {
-    (len / MIN_CHUNK_BYTES).clamp(1, MAX_CHUNKS)
+fn chunk_count(len: usize, min_chunk: usize) -> usize {
+    (len / min_chunk).clamp(1, MAX_CHUNKS)
 }
 
 fn compressor(level: i32) -> libdeflater::Compressor {
@@ -376,6 +448,23 @@ mod tests {
     }
 
     #[test]
+    fn idat_paths_round_trip() {
+        // Small (16 KiB chunks), medium (64 KiB chunks), large (level 12) and
+        // highly redundant (zlib-rs) inputs.
+        let flat = vec![0u8; 300 * 1001];
+        let cases = [
+            sample_rows(100, 1001, 1),
+            sample_rows(400, 1001, 2),
+            sample_rows(2200, 1001, 3),
+            flat,
+        ];
+        for data in cases {
+            let stream = zlib_compress_idat(&data, 1001);
+            assert_eq!(inflate(&stream), data, "len={}", data.len());
+        }
+    }
+
+    #[test]
     fn make_non_final_handles_all_block_types() {
         // Stored (level 0), fixed-Huffman-friendly tiny input, and dynamic blocks,
         // across varied lengths so the end-of-block lands at every bit offset.
@@ -405,9 +494,9 @@ mod tests {
 
     #[test]
     fn chunk_layout_ignores_thread_count() {
-        assert_eq!(chunk_count(0), 1);
-        assert_eq!(chunk_count(MIN_CHUNK_BYTES * 2 - 1), 1);
-        assert_eq!(chunk_count(MIN_CHUNK_BYTES * 3), 3);
-        assert_eq!(chunk_count(usize::MAX / 2), MAX_CHUNKS);
+        assert_eq!(chunk_count(0, MIN_CHUNK_BYTES), 1);
+        assert_eq!(chunk_count(MIN_CHUNK_BYTES * 2 - 1, MIN_CHUNK_BYTES), 1);
+        assert_eq!(chunk_count(MIN_CHUNK_BYTES * 3, MIN_CHUNK_BYTES), 3);
+        assert_eq!(chunk_count(usize::MAX / 2, MIN_CHUNK_BYTES), MAX_CHUNKS);
     }
 }

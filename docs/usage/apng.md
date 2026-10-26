@@ -24,7 +24,7 @@ APNG files are quantized using a **global shared palette** strategy:
 
 This approach ensures all frames share a single `PLTE` chunk (as required by the APNG spec) while preserving per-frame visual quality.
 
-Indexed frames are written without row filters and each frame's image data is compressed with libdeflate level 12 (one `IDAT`/`fdAT` chunk per frame, sequence numbers renumbered). This step is lossless and applies regardless of `--speed`.
+Indexed frames are written without row filters and each frame's image data is recompressed with the same size-adaptive libdeflate encoder as still images (one `IDAT`/`fdAT` chunk per frame, sequence numbers renumbered). This step is lossless and applies regardless of `--speed`.
 
 ```bash
 # Quantize APNG with quality control

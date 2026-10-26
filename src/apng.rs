@@ -452,7 +452,7 @@ pub fn encode_indexed_apng(image: &IndexedApngImage) -> Result<Vec<u8>, AppError
 }
 
 /// Recompress every image data stream (the IDAT run and each frame's fdAT run) of an
-/// encoded PNG/APNG with libdeflate level 12, merging each run into a single chunk and
+/// encoded PNG/APNG with `deflate::zlib_compress_idat`, merging each run into a single chunk and
 /// renumbering the shared fcTL/fdAT sequence. Filtered scanlines are left untouched,
 /// so pixels are bit-identical. Returns `None` on any malformed input.
 fn recompress_image_streams(png_bytes: &[u8]) -> Option<Vec<u8>> {
@@ -532,7 +532,7 @@ fn recompress_image_streams(png_bytes: &[u8]) -> Option<Vec<u8>> {
                 flate2::read::ZlibDecoder::new(zlib.as_slice())
                     .read_to_end(&mut raw)
                     .ok()?;
-                Some(crate::deflate::zlib_compress_rows(&raw, *row_len, 12))
+                Some(crate::deflate::zlib_compress_idat(&raw, *row_len))
             }
             Item::Chunk(..) => Some(Vec::new()),
         })
