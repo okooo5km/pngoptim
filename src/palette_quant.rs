@@ -869,7 +869,65 @@ impl ColorBox {
         let right = Self::new_from_split(items, split, self.end, Some(right_sum))?;
         Some((left, right))
     }
+
+    fn offset_by(self, offset: usize) -> Self {
+        Self {
+            start: self.start + offset,
+            end: self.end + offset,
+            ..self
+        }
+    }
 }
+
+/// A box's split computed before the box is chosen, on a copy of its items:
+/// the items as the split leaves them, the two halves (`None` if it could not
+/// split), and the same for each large half. A box's split reads and reorders
+/// only its own range, so this is exactly what an in-place split would give
+/// whenever the box is chosen.
+struct SplitNode {
+    items: Vec<HistItem>,
+    halves: Option<(ColorBox, ColorBox)>,
+    children: [Option<Box<SplitNode>>; 2],
+}
+
+/// Split `color_box` (whose items start at `base` in `items`) and, in
+/// parallel, its halves, down to boxes of `SPECULATIVE_SPLIT_MIN_ITEMS`.
+fn split_ahead(color_box: ColorBox, items: &[HistItem], base: usize) -> Option<Box<SplitNode>> {
+    if color_box.len() < SPECULATIVE_SPLIT_MIN_ITEMS {
+        return None;
+    }
+    let mut scratch = items[color_box.start - base..color_box.end - base].to_vec();
+    let local = ColorBox {
+        start: 0,
+        end: scratch.len(),
+        ..color_box
+    };
+    let halves = local.split(&mut scratch).map(|(left, right)| {
+        (
+            left.offset_by(color_box.start),
+            right.offset_by(color_box.start),
+        )
+    });
+    let children = match halves {
+        Some((left, right)) => {
+            let (left, right) = rayon::join(
+                || split_ahead(left, &scratch, color_box.start),
+                || split_ahead(right, &scratch, color_box.start),
+            );
+            [left, right]
+        }
+        None => [None, None],
+    };
+    Some(Box::new(SplitNode {
+        items: scratch,
+        halves,
+        children,
+    }))
+}
+
+/// Boxes smaller than this are split in place; below it a parallel task costs
+/// more than the split itself.
+const SPECULATIVE_SPLIT_MIN_ITEMS: usize = 128;
 
 #[inline(always)]
 fn mc_sort_value(base: &[HistItem], idx: usize) -> Option<u32> {
@@ -952,6 +1010,9 @@ const HISTOGRAM_CHUNKS: usize = 8;
 const HISTOGRAM_MIN_CHUNK: usize = 1 << 14;
 /// Histogram items per k-means accumulator; fixed so sums merge in one order.
 const KMEANS_CHUNK: usize = 1024;
+/// Histogram items per k-means nearest-color search task. The searches are
+/// independent, so they can run finer than `KMEANS_CHUNK` and balance better.
+const KMEANS_SEARCH_CHUNK: usize = 256;
 
 pub(crate) fn build_histogram(
     rgba: &[u8],
@@ -1201,6 +1262,13 @@ fn median_cut_palette(
 
     let mut boxes = initial_color_boxes(histogram, target_colors);
     let max_mse_per_color = max_mse_per_color.max(quality_to_mse(20));
+    // Splits are chosen one at a time, but each takes only microseconds, so
+    // the large boxes' split trees are computed up front in parallel and a
+    // split is committed when its box is chosen. The output is the serial one.
+    let mut ahead: Vec<Option<Box<SplitNode>>> = boxes
+        .par_iter()
+        .map(|color_box| split_ahead(*color_box, &histogram.items, 0))
+        .collect();
 
     while boxes.len() < target_colors {
         let fraction_done = boxes.len() as f64 / target_colors as f64;
@@ -1210,18 +1278,27 @@ fn median_cut_palette(
         };
 
         let selected = boxes.swap_remove(box_index);
-        let Some((left, right)) = selected.split(&mut histogram.items) else {
+        let (halves, [left_ahead, right_ahead]) = match ahead.swap_remove(box_index) {
+            Some(node) => {
+                histogram.items[selected.start..selected.end].copy_from_slice(&node.items);
+                (node.halves, node.children)
+            }
+            None => (selected.split(&mut histogram.items), [None, None]),
+        };
+        let Some((left, right)) = halves else {
             break;
         };
         boxes.push(left);
         boxes.push(right);
+        ahead.push(left_ahead);
+        ahead.push(right_ahead);
 
         if total_box_error_below_target(&mut boxes, histogram.total_perceptual_weight, target_mse) {
             break;
         }
     }
 
-    boxes_to_palette(&mut boxes, &mut histogram.items)
+    boxes_to_palette(&boxes, &mut histogram.items)
 }
 
 fn initial_color_boxes(histogram: &HistogramData, target_colors: usize) -> Vec<ColorBox> {
@@ -1233,7 +1310,7 @@ fn initial_color_boxes(histogram: &HistogramData, target_colors: usize) -> Vec<C
     if used_boxes > 0 && used_boxes <= target_colors / 3 {
         histogram
             .clusters
-            .iter()
+            .par_iter()
             .filter(|cluster| cluster.begin != cluster.end)
             .filter_map(|cluster| ColorBox::new(&histogram.items, cluster.begin, cluster.end))
             .collect()
@@ -1295,36 +1372,40 @@ fn total_box_error_below_target(
     true
 }
 
-fn boxes_to_palette(boxes: &mut [ColorBox], items: &mut [HistItem]) -> Vec<PaletteEntry> {
-    let mut palette = Vec::with_capacity(boxes.len());
-    for (palette_index, color_box) in boxes.iter_mut().enumerate() {
+fn boxes_to_palette(boxes: &[ColorBox], items: &mut [HistItem]) -> Vec<PaletteEntry> {
+    let palette = boxes
+        .par_iter()
+        .map(|color_box| {
+            let box_items = &items[color_box.start..color_box.end];
+            let representative = if color_box.len() > 2 {
+                box_items
+                    .iter()
+                    .min_by(|a, b| {
+                        color_box
+                            .average
+                            .diff(a.color)
+                            .partial_cmp(&color_box.average.diff(b.color))
+                            .unwrap_or(Ordering::Equal)
+                    })
+                    .map(|item| item.color)
+                    .unwrap_or(color_box.average)
+            } else {
+                color_box.average
+            };
+            let popularity = box_items
+                .iter()
+                .map(|item| item.perceptual_weight)
+                .sum::<f32>();
+            PaletteEntry {
+                color: representative,
+                popularity,
+            }
+        })
+        .collect();
+    for (palette_index, color_box) in boxes.iter().enumerate() {
         for item in &mut items[color_box.start..color_box.end] {
             item.sort_value_or_index = palette_index as u32;
         }
-
-        let representative = if color_box.len() > 2 {
-            items[color_box.start..color_box.end]
-                .iter()
-                .min_by(|a, b| {
-                    color_box
-                        .average
-                        .diff(a.color)
-                        .partial_cmp(&color_box.average.diff(b.color))
-                        .unwrap_or(Ordering::Equal)
-                })
-                .map(|item| item.color)
-                .unwrap_or(color_box.average)
-        } else {
-            color_box.average
-        };
-        let popularity = items[color_box.start..color_box.end]
-            .iter()
-            .map(|item| item.perceptual_weight)
-            .sum::<f32>();
-        palette.push(PaletteEntry {
-            color: representative,
-            popularity,
-        });
     }
     palette
 }
@@ -1539,13 +1620,31 @@ fn kmeans_iteration(
         .sum::<f64>()
         .max(1e-9);
 
+    let mut diffs = vec![0.0f32; histogram.len()];
+    histogram
+        .par_chunks_mut(KMEANS_SEARCH_CHUNK)
+        .zip(diffs.par_chunks_mut(KMEANS_SEARCH_CHUNK))
+        .for_each(|(batch, diffs)| {
+            kmeans_assign_batch(batch, diffs, &tree, palette, adjust_weights);
+        });
+
     // Per fixed-size chunk accumulators merged in chunk order: float sums come
     // out the same for any thread count.
     let acc = histogram
-        .par_chunks_mut(KMEANS_CHUNK)
-        .map(|batch| {
+        .par_chunks(KMEANS_CHUNK)
+        .zip(diffs.par_chunks(KMEANS_CHUNK))
+        .map(|(batch, diffs)| {
             let mut acc = KmeansAccumulator::new(palette.len());
-            kmeans_iteration_batch(batch, &tree, palette, adjust_weights, &mut acc);
+            for (item, &diff) in batch.iter().zip(diffs) {
+                let nearest = item.sort_value_or_index as usize;
+                acc.total_error += f64::from(diff) * f64::from(item.perceptual_weight);
+                let weight = f64::from(item.adjusted_weight);
+                acc.weights[nearest] += weight;
+                acc.sums[nearest][0] += f64::from(item.color.a) * weight;
+                acc.sums[nearest][1] += f64::from(item.color.r) * weight;
+                acc.sums[nearest][2] += f64::from(item.color.g) * weight;
+                acc.sums[nearest][3] += f64::from(item.color.b) * weight;
+            }
             acc
         })
         .collect::<Vec<_>>()
@@ -1578,34 +1677,29 @@ fn kmeans_iteration(
     }
 }
 
-fn kmeans_iteration_batch(
+/// Map each item to its nearest palette entry (stored in
+/// `sort_value_or_index`), record its error in `diffs` and, with
+/// `adjust_weights`, update its adjusted weight.
+fn kmeans_assign_batch(
     batch: &mut [HistItem],
+    diffs: &mut [f32],
     tree: &NearestTree<'_>,
     palette: &[PaletteEntry],
     adjust_weights: bool,
-    acc: &mut KmeansAccumulator,
 ) {
-    for item in batch.iter_mut() {
+    for (item, diff) in batch.iter_mut().zip(diffs) {
         let hint = (item.sort_value_or_index as usize).min(palette.len().saturating_sub(1));
         let (nearest, diff_sq) = tree.search(item.color, hint);
-        let mut diff = f64::from(diff_sq);
+        *diff = diff_sq;
         item.sort_value_or_index = nearest as u32;
 
         if adjust_weights {
             let reflected = reflected_color(item.color, palette[nearest].color);
-            let reflected_diff = f64::from(tree.search(reflected, nearest).1);
-            diff = reflected_diff;
-            item.adjusted_weight = ((2.0 * item.adjusted_weight) + item.perceptual_weight)
-                * (0.5 + reflected_diff as f32);
+            let reflected_diff = tree.search(reflected, nearest).1;
+            *diff = reflected_diff;
+            item.adjusted_weight =
+                ((2.0 * item.adjusted_weight) + item.perceptual_weight) * (0.5 + reflected_diff);
         }
-
-        acc.total_error += diff * f64::from(item.perceptual_weight);
-        let weight = f64::from(item.adjusted_weight);
-        acc.weights[nearest] += weight;
-        acc.sums[nearest][0] += f64::from(item.color.a) * weight;
-        acc.sums[nearest][1] += f64::from(item.color.r) * weight;
-        acc.sums[nearest][2] += f64::from(item.color.g) * weight;
-        acc.sums[nearest][3] += f64::from(item.color.b) * weight;
     }
 }
 
