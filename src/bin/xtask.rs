@@ -3502,7 +3502,7 @@ fn run_apng_compat_command(args: ApngCompatArgs) -> AppResult<i32> {
             }
         };
 
-        let composited_input = match pngoptim::apng::compose_frames(&input_apng) {
+        let composited_input = match apng_timeline(&input_apng) {
             Ok(c) => c,
             Err(e) => {
                 println!("  FAIL (compose input): {} — {e}", path.display());
@@ -3552,7 +3552,7 @@ fn run_apng_compat_command(args: ApngCompatArgs) -> AppResult<i32> {
             }
         };
 
-        let composited_output = match pngoptim::apng::compose_frames(&output_apng) {
+        let composited_output = match apng_timeline(&output_apng) {
             Ok(c) => c,
             Err(e) => {
                 println!("  FAIL (compose output): {} — {e}", path.display());
@@ -3566,7 +3566,7 @@ fn run_apng_compat_command(args: ApngCompatArgs) -> AppResult<i32> {
             passed += 1;
         } else {
             println!(
-                "  FAIL (composited mismatch): {} — input_frames={} output_frames={}",
+                "  FAIL (composited mismatch): {} — input_segments={} output_segments={}",
                 path.display(),
                 composited_input.len(),
                 composited_output.len()
@@ -3733,6 +3733,52 @@ fn run_apng_quality_size_command(args: ApngQualitySizeArgs) -> AppResult<i32> {
 
 // ── APNG visual guard command ──
 
+/// One stretch of an animation's timeline: what is on screen and for how long.
+#[derive(Debug, PartialEq)]
+struct TimelineSegment {
+    rgba: Vec<u8>,
+    /// Seconds as a reduced fraction (numerator, denominator).
+    duration: (u64, u64),
+}
+
+/// Composite an APNG and merge consecutive identical frames, summing their
+/// delays. Folding duplicate frames is a lossless optimization, so the gates
+/// compare timelines rather than frame lists.
+fn apng_timeline(
+    apng: &pngoptim::apng::ApngImage,
+) -> Result<Vec<TimelineSegment>, pngoptim::error::AppError> {
+    fn gcd(a: u64, b: u64) -> u64 {
+        if b == 0 { a.max(1) } else { gcd(b, a % b) }
+    }
+    let composited = pngoptim::apng::compose_frames(apng)?;
+    let mut timeline: Vec<TimelineSegment> = Vec::new();
+    for (rgba, frame) in composited.into_iter().zip(&apng.frames) {
+        // APNG: a zero denominator means 1/100 s.
+        let den = if frame.delay_den == 0 {
+            100
+        } else {
+            u64::from(frame.delay_den)
+        };
+        let delay = (u64::from(frame.delay_num), den);
+        match timeline.last_mut() {
+            Some(last) if last.rgba == rgba => {
+                let (n, d) = last.duration;
+                let (n, d) = (n * delay.1 + delay.0 * d, d * delay.1);
+                let g = gcd(n, d);
+                last.duration = (n / g, d / g);
+            }
+            _ => {
+                let g = gcd(delay.0, delay.1);
+                timeline.push(TimelineSegment {
+                    rgba,
+                    duration: (delay.0 / g, delay.1 / g),
+                });
+            }
+        }
+    }
+    Ok(timeline)
+}
+
 fn run_apng_visual_guard_command(args: ApngVisualGuardArgs) -> AppResult<i32> {
     let root = std::env::current_dir()?;
     let run_id = args
@@ -3764,7 +3810,7 @@ fn run_apng_visual_guard_command(args: ApngVisualGuardArgs) -> AppResult<i32> {
             _ => continue,
         };
 
-        let composited_input = match pngoptim::apng::compose_frames(&input_apng) {
+        let composited_input = match apng_timeline(&input_apng) {
             Ok(c) => c,
             Err(_) => continue,
         };
@@ -3798,7 +3844,7 @@ fn run_apng_visual_guard_command(args: ApngVisualGuardArgs) -> AppResult<i32> {
             }
         };
 
-        let composited_output = match pngoptim::apng::compose_frames(&output_apng) {
+        let composited_output = match apng_timeline(&output_apng) {
             Ok(c) => c,
             Err(_) => {
                 failed += 1;
@@ -3834,7 +3880,7 @@ fn run_apng_visual_guard_command(args: ApngVisualGuardArgs) -> AppResult<i32> {
             for &fi in &frame_mismatches {
                 // Export input frame
                 export_rgba_as_png(
-                    &composited_input[fi],
+                    &composited_input[fi].rgba,
                     input_apng.width,
                     input_apng.height,
                     &reports_dir
@@ -3843,7 +3889,7 @@ fn run_apng_visual_guard_command(args: ApngVisualGuardArgs) -> AppResult<i32> {
                 )?;
                 // Export output frame
                 export_rgba_as_png(
-                    &composited_output[fi],
+                    &composited_output[fi].rgba,
                     output_apng.width,
                     output_apng.height,
                     &reports_dir
