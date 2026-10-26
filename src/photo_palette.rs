@@ -305,12 +305,26 @@ pub(crate) fn online_kmeans_weighted(
     if entries.is_empty() || total <= 0.0 {
         return vec![0; centers.len()];
     }
+    // Guide table: guide[b] is the first index whose cumulative weight exceeds
+    // bucket b's lower edge, so a draw only searches its bucket's few entries
+    // instead of the whole (cache-cold) array. Same index as a full search.
+    let buckets = entries.len().next_power_of_two();
+    let scale = buckets as f64 / total;
+    let mut guide = Vec::with_capacity(buckets + 1);
+    let mut i = 0;
+    for b in 0..=buckets {
+        let edge = b as f64 / scale;
+        while i < cumulative.len() && cumulative[i] <= edge {
+            i += 1;
+        }
+        guide.push(i);
+    }
     online_kmeans_with(centers, samples, |rng| {
         // 53 random bits → uniform in [0, total).
         let u = (rng.next() >> 11) as f64 / (1u64 << 53) as f64 * total;
-        let i = cumulative
-            .partition_point(|&c| c <= u)
-            .min(entries.len() - 1);
+        let b = ((u * scale) as usize).min(buckets - 1);
+        let (lo, hi) = (guide[b], (guide[b + 1] + 1).min(cumulative.len()));
+        let i = (lo + cumulative[lo..hi].partition_point(|&c| c <= u)).min(entries.len() - 1);
         entries[i].0
     })
 }
