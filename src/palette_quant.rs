@@ -2371,10 +2371,9 @@ fn effective_dither_chunks(width: usize, height: usize) -> usize {
     }
     let suggested = (width.saturating_mul(height) / 524_288)
         .min(height / 128)
-        .max(2)
         // A fixed cap rather than the thread count: chunk boundaries reset the
         // diffused error, so output must not depend on how many threads run.
-        .min(MAX_DITHER_CHUNKS);
+        .clamp(2, MAX_DITHER_CHUNKS);
     suggested.max(1)
 }
 
