@@ -22,5 +22,6 @@ pub mod cli;
 mod deflate;
 pub mod error;
 pub mod palette_quant;
+mod photo_palette;
 pub mod pipeline;
 pub mod quality;

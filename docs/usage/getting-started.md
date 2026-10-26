@@ -56,6 +56,8 @@ cat input.png | pngoptim - -o - > output.png
 
 PNG quantization reduces the number of colors in an image (typically to 256 or fewer), converting from 32-bit RGBA to an 8-bit indexed palette. This is a lossy process but usually produces visually identical results at dramatically smaller file sizes (60–80% reduction).
 
+The palette is chosen automatically by image type. Opaque photos (no transparency, many distinct colors) are clustered in the perceptual Oklab color space with Wu's quantizer and online k-means, which keeps more distinct shades at the same color count. Screenshots, UI graphics and images with transparency use the libimagequant-style median cut + k-means search. Quality scores and `--quality` gating are measured the same way for both; when the photo palette would miss the requested minimum, the default palette is used instead. Output does not depend on the number of CPU threads.
+
 ### Quality Range
 
 The `--quality` option controls the minimum acceptable quality and target quality as a range `MIN-MAX` (0–100):

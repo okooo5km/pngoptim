@@ -17,7 +17,7 @@ APNG files are quantized using a **global shared palette** strategy:
 
 1. **Lossless structure optimization** runs first (duplicate frame folding, optional rect minimization)
 2. Per-frame histograms are built and **merged into a single global histogram**
-3. A single optimal palette (up to 256 colors) is generated from the merged histogram
+3. A single optimal palette (up to 256 colors) is generated from the merged histogram (always with the default median cut + k-means search; the Oklab photo palette used for single opaque photos does not apply to APNG)
 4. Each frame is independently **remapped** to the global palette (with optional dithering)
 5. Quality is evaluated per-frame; the **worst frame's score** determines the overall quality
 6. Quality gating applies: if the worst frame falls below `--quality` minimum, the operation fails

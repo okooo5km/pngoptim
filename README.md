@@ -114,6 +114,7 @@ pngoptim implements a full quantization pipeline inspired by [libimagequant](htt
 1. **Histogram** — RGBA pixels are converted to gamma-weighted internal representation with importance weighting
 2. **Median Cut** — Variance-based palette generation with quality-target early termination
 3. **K-Means Refinement** — Parallelized k-means with reflected-color weight adjustment
+   - **Opaque photos** (no transparency, many distinct colors, few pixels per color) instead get a palette built in [Oklab](https://bottosson.github.io/posts/oklab/): Wu's quantizer for the initial boxes, then online (MacQueen) k-means. Same color count, higher ceiling — about 10% smaller at equal SSIMULACRA2 on photos. UI screenshots and transparent images keep the default search; if the photo palette misses the `--quality` minimum, the default palette is used
 4. **VP-Tree Nearest Search** — Vantage-point tree with popularity-based vantage selection and early exit
 5. **Remap** — Plain (row-hint nearest) or Floyd-Steinberg dithering with edge/noise-aware dither maps
 6. **Encode** — Hand-written PNG encoder. IDAT is compressed with [libdeflate](https://github.com/ebiggers/libdeflate) level 12 (near-optimal parsing, ~7% smaller than zlib level 9), split into row-aligned chunks that are compressed in parallel and stitched into a single zlib stream. Images with ≤16 colors also try 8-bit indices instead of packed 1/2/4-bit ones and keep the smaller. All of this is lossless: pixels and palette are unchanged. `--speed 8`–`9` fall back to [zlib-rs](https://github.com/trifectatechfoundation/zlib-rs) level 9 (dual `mem_level` 5 & 8), `--speed 10`+ to zlib-rs level 1
@@ -121,7 +122,7 @@ pngoptim implements a full quantization pipeline inspired by [libimagequant](htt
 Additional features:
 - **ICC Color Management**: Embedded ICC profiles are normalized to sRGB via lcms2 before quantization
 - **APNG Optimization**: Automatic detection via `acTL` chunk (no special flag needed). Lossy quantization uses a global shared palette built from all frames' merged histograms, with per-frame independent remapping and worst-frame quality gating. Two structural modes: **safe** (default) folds duplicate consecutive frames; **aggressive** additionally minimizes frame rectangles with post-verification rollback to prevent size regression. Already-optimized APNG inputs (indexed/sub-rect) are detected and skipped to avoid re-optimization
-- **Parallelism**: Rayon-based parallelism across histogram building, k-means, contrast maps, remap, and encoding
+- **Parallelism**: Rayon-based parallelism across histogram building, k-means, contrast maps, remap, and encoding. Work is split into fixed chunks merged in order, so the output is identical for any thread count
 
 ## Building from Source
 
