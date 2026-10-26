@@ -73,7 +73,7 @@ pngoptim animated.png -o optimized.png --apng-mode aggressive
 | `--ext SUFFIX` | Output filename suffix (batch mode) | `-mvp.png` |
 | `--quality MIN-MAX` | Quality range (0–100). Formats: `N`, `-N`, `N-`, `MIN-MAX` | Full range |
 | `--speed N` | Speed/quality trade-off (1=slowest/best, 11=fastest) | `4` |
-| `--floyd[=N]` | Floyd-Steinberg dithering strength (0.0–1.0) | `1.0` |
+| `--floyd[=N]` | Floyd-Steinberg dithering strength (0.0–1.0), applied uniformly | adaptive |
 | `--nofs` | Disable Floyd-Steinberg dithering entirely | Off |
 | `--posterize N` | Posterize output (0–8 bits) | Off |
 | `--strip` | Strip all metadata chunks | Off |
@@ -116,7 +116,7 @@ pngoptim implements a full quantization pipeline inspired by [libimagequant](htt
 3. **K-Means Refinement** — Parallelized k-means with reflected-color weight adjustment
    - **Opaque photos** (no transparency, many distinct colors, few pixels per color) instead get a palette built in [Oklab](https://bottosson.github.io/posts/oklab/): Wu's quantizer for the initial boxes, then online (MacQueen) k-means. Same color count, higher ceiling — about 10% smaller at equal SSIMULACRA2 on photos. UI screenshots and transparent images keep the default search; if the photo palette misses the `--quality` minimum, the default palette is used
 4. **VP-Tree Nearest Search** — Vantage-point tree with popularity-based vantage selection and early exit
-5. **Remap** — Plain (row-hint nearest) or Floyd-Steinberg dithering with edge/noise-aware dither maps
+5. **Remap** — Plain (row-hint nearest) or Floyd-Steinberg dithering with edge/noise-aware dither maps; by default the strength is adapted per region (full in smooth gradients, faded in texture, no dithering on anti-aliased alpha edges) with a neighbor-run preference that keeps the average color while compressing better
 6. **Encode** — Hand-written PNG encoder. IDAT is compressed with [libdeflate](https://github.com/ebiggers/libdeflate) level 12 (near-optimal parsing, ~7% smaller than zlib level 9), split into row-aligned chunks that are compressed in parallel and stitched into a single zlib stream. Images with ≤16 colors also try 8-bit indices instead of packed 1/2/4-bit ones and keep the smaller. All of this is lossless: pixels and palette are unchanged. `--speed 8`–`9` fall back to [zlib-rs](https://github.com/trifectatechfoundation/zlib-rs) level 9 (dual `mem_level` 5 & 8), `--speed 10`+ to zlib-rs level 1
 
 Additional features:

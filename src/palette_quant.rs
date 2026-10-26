@@ -40,6 +40,10 @@ pub struct QuantizerSettings {
     pub target_mse_is_zero: bool,
     pub dither: bool,
     pub dither_level: f32,
+    /// Modulate Floyd strength per region (see `AdaptiveDither`). Set for the
+    /// default dithering path only; an explicit `--floyd=N` keeps the plain
+    /// libimagequant behavior.
+    pub adaptive_dither: bool,
     pub use_dither_map: DitherMapMode,
     pub use_contrast_maps: bool,
     /// Build the palette of opaque photo-like images with Wu's quantizer and
@@ -54,7 +58,51 @@ pub fn quantize_indexed(
     height: usize,
     settings: QuantizerSettings,
 ) -> IndexedImage {
-    quantize_indexed_with_boost(rgba, width, height, settings, None).0
+    quantize_indexed_with_boost(rgba, width, height, settings, None, None).0
+}
+
+/// Per-image work that does not depend on the palette: gamma-weighted pixels,
+/// contrast maps and the adaptive dither map. The pipeline quantizes one image
+/// up to three times (local-error feedback rounds), so it builds this once.
+pub(crate) struct ImageAnalysis {
+    contrast_pixels: Option<Vec<InternalPixel>>,
+    contrast_maps: Option<ContrastMaps>,
+    adaptive: Option<AdaptiveDither>,
+}
+
+impl ImageAnalysis {
+    pub(crate) fn new(
+        rgba: &[u8],
+        width: usize,
+        height: usize,
+        settings: QuantizerSettings,
+    ) -> Self {
+        let gamma = gamma_lut(SRGB_OUTPUT_GAMMA);
+        let contrast_pixels =
+            if settings.use_contrast_maps || settings.use_dither_map != DitherMapMode::None {
+                Some(
+                    rgba.par_chunks_exact(4)
+                        .map(|px| InternalPixel::from_rgba(&gamma, px))
+                        .collect::<Vec<_>>(),
+                )
+            } else {
+                None
+            };
+        let contrast_maps = contrast_pixels
+            .as_deref()
+            .and_then(|pixels| build_contrast_maps(pixels, width, height));
+        let adaptive = contrast_pixels
+            .as_deref()
+            .filter(|_| settings.dither && settings.adaptive_dither)
+            .map(|pixels| {
+                AdaptiveDither::new(pixels, width, height, full_dithering_level(settings))
+            });
+        Self {
+            contrast_pixels,
+            contrast_maps,
+            adaptive,
+        }
+    }
 }
 
 /// Quantize with a per-pixel histogram weight multiplier.
@@ -73,6 +121,7 @@ pub(crate) fn quantize_indexed_with_boost(
     height: usize,
     settings: QuantizerSettings,
     importance_boost: Option<&[u16]>,
+    analysis: Option<&ImageAnalysis>,
 ) -> (IndexedImage, bool) {
     let pixel_count = width.saturating_mul(height);
     if pixel_count == 0 {
@@ -83,23 +132,22 @@ pub(crate) fn quantize_indexed_with_boost(
         return (empty, false);
     }
     let gamma = gamma_lut(SRGB_OUTPUT_GAMMA);
-    let contrast_pixels =
-        if settings.use_contrast_maps || settings.use_dither_map != DitherMapMode::None {
-            Some(
-                rgba.par_chunks_exact(4)
-                    .map(|px| InternalPixel::from_rgba(&gamma, px))
-                    .collect::<Vec<_>>(),
-            )
-        } else {
-            None
-        };
-    let contrast_maps = contrast_pixels
-        .as_deref()
-        .and_then(|pixels| build_contrast_maps(pixels, width, height));
-    let importance_map = contrast_maps
+    let owned_analysis;
+    let analysis = match analysis {
+        Some(analysis) => analysis,
+        None => {
+            owned_analysis = ImageAnalysis::new(rgba, width, height, settings);
+            &owned_analysis
+        }
+    };
+    let importance_map = analysis
+        .contrast_maps
         .as_ref()
         .map(|maps| maps.importance_map.as_slice());
-    let edges_map = contrast_maps.as_ref().map(|maps| maps.edges.as_slice());
+    let edges_map = analysis
+        .contrast_maps
+        .as_ref()
+        .map(|maps| maps.edges.as_slice());
     let histogram = build_histogram(
         rgba,
         width,
@@ -146,8 +194,9 @@ pub(crate) fn quantize_indexed_with_boost(
         settings,
         importance_map,
         edges_map,
-        contrast_pixels.as_deref(),
+        analysis.contrast_pixels.as_deref(),
         None,
+        analysis.adaptive.as_ref(),
     );
     (indexed, used_photo_palette)
 }
@@ -363,6 +412,7 @@ pub fn quantize_indexed_with_importance(
         edges_map,
         contrast_pixels.as_deref(),
         None,
+        None,
     )
 }
 
@@ -480,9 +530,11 @@ pub fn quantize_indexed_with_background(
         edges_map,
         contrast_pixels.as_deref(),
         bg_pixels,
+        None,
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn quantizer_settings(
     max_colors: usize,
     speed: SpeedSettings,
@@ -491,6 +543,7 @@ pub fn quantizer_settings(
     target_mse_is_zero: bool,
     output_posterize_bits: u8,
     dither_level: f32,
+    adaptive_dither: bool,
 ) -> QuantizerSettings {
     QuantizerSettings {
         max_colors,
@@ -505,6 +558,7 @@ pub fn quantizer_settings(
         target_mse_is_zero,
         dither: dither_level > 0.0 && !speed.force_disable_dither,
         dither_level,
+        adaptive_dither,
         use_dither_map: speed.use_dither_map,
         use_contrast_maps: speed.use_contrast_maps,
         photo_palette: true,
@@ -1877,6 +1931,7 @@ pub(crate) fn remap_image(
     edges_map: Option<&[u8]>,
     contrast_pixels: Option<&[InternalPixel]>,
     background_pixels: Option<&[InternalPixel]>,
+    adaptive: Option<&AdaptiveDither>,
 ) -> IndexedImage {
     let (palette, mut indices, counts) = if settings.dither {
         remap_image_dithered(
@@ -1890,6 +1945,7 @@ pub(crate) fn remap_image(
             edges_map,
             contrast_pixels,
             background_pixels,
+            adaptive,
         )
     } else {
         remap_image_plain(
@@ -2020,9 +2076,10 @@ pub(crate) fn remap_to_fixed_palette(
             .filter(|_| output_image_is_remapped)
             .map(|pass| pass.indices.clone())
             .unwrap_or_else(|| vec![0u8; pixels.len()]);
-        let mut base_dithering_level = (1.0 - settings.dither_level)
-            .mul_add(-(1.0 - settings.dither_level), 1.0)
-            * (15.0f32 / 16.0f32);
+        let mut base_dithering_level = full_dithering_level(settings);
+        let adaptive = settings
+            .adaptive_dither
+            .then(|| AdaptiveDither::new(&pixels, width, height, base_dithering_level));
         if !dither_map.is_empty() {
             base_dithering_level *= 1.0 / 255.0;
         }
@@ -2049,6 +2106,7 @@ pub(crate) fn remap_to_fixed_palette(
             &mut indices,
             effective_bg,
             transparent_index,
+            adaptive.as_ref(),
         );
         indices
     } else {
@@ -2284,6 +2342,7 @@ fn remap_image_dithered(
     edges_map: Option<&[u8]>,
     contrast_pixels: Option<&[InternalPixel]>,
     background_pixels: Option<&[InternalPixel]>,
+    adaptive: Option<&AdaptiveDither>,
 ) -> (Vec<(InternalPixel, [u8; 4])>, Vec<u8>, Vec<usize>) {
     let mut palette_points = palette.iter().map(|entry| entry.0).collect::<Vec<_>>();
     let gamma = gamma_lut(SRGB_OUTPUT_GAMMA);
@@ -2363,9 +2422,16 @@ fn remap_image_dithered(
         .filter(|_| output_image_is_remapped)
         .map(|pass| pass.indices.clone())
         .unwrap_or_else(|| vec![0u8; pixels.len()]);
-    let mut base_dithering_level = (1.0 - settings.dither_level)
-        .mul_add(-(1.0 - settings.dither_level), 1.0)
-        * (15.0f32 / 16.0f32);
+    let mut base_dithering_level = full_dithering_level(settings);
+    let owned_adaptive;
+    let adaptive = match adaptive {
+        Some(adaptive) => Some(adaptive),
+        None if settings.adaptive_dither => {
+            owned_adaptive = AdaptiveDither::new(pixels, width, height, base_dithering_level);
+            Some(&owned_adaptive)
+        }
+        None => None,
+    };
     if !dither_map.is_empty() {
         base_dithering_level *= 1.0 / 255.0;
     }
@@ -2395,6 +2461,7 @@ fn remap_image_dithered(
         &mut indices,
         effective_bg,
         transparent_index,
+        adaptive,
     );
     let mut counts = vec![0usize; palette.len()];
     for &idx in &indices {
@@ -2424,6 +2491,7 @@ fn remap_image_dithered_rows(
     indices: &mut [u8],
     background_pixels: &[InternalPixel],
     transparent_index: u8,
+    adaptive: Option<&AdaptiveDither>,
 ) {
     let num_chunks = effective_dither_chunks(width, height);
     let chunk_height = height.div_ceil(num_chunks);
@@ -2439,6 +2507,8 @@ fn remap_image_dithered_rows(
             let mut next_errors = vec![InternalPixel::default(); width + 2];
             let mut curr_errors = vec![InternalPixel::default(); width + 2];
             let mut discard = vec![0u8; width];
+            // Previous output row, for the adaptive path's run preference.
+            let mut above = Vec::new();
 
             if start_row > 2 {
                 for row in (start_row - 2)..start_row {
@@ -2474,7 +2544,11 @@ fn remap_image_dithered_rows(
                         row.is_multiple_of(2),
                         bg_row,
                         transparent_index,
+                        adaptive.map(|params| params.row(row, width, &above)),
                     );
+                    if adaptive.is_some() {
+                        above.clone_from(&discard);
+                    }
                 }
             }
 
@@ -2509,7 +2583,12 @@ fn remap_image_dithered_rows(
                     row.is_multiple_of(2),
                     bg_row,
                     transparent_index,
+                    adaptive.map(|params| params.row(row, width, &above)),
                 );
+                if adaptive.is_some() {
+                    above.clear();
+                    above.extend_from_slice(row_indices);
+                }
             }
         });
 }
@@ -2544,6 +2623,7 @@ fn dither_row(
     even_row: bool,
     bg_row: &[InternalPixel],
     transparent_index: u8,
+    adaptive: Option<AdaptiveRow<'_>>,
 ) {
     std::mem::swap(curr_errors, next_errors);
     next_errors.fill(InternalPixel::default());
@@ -2556,6 +2636,18 @@ fn dither_row(
         let mut dither_level = base_dithering_level;
         if let Some(&level) = dither_map.get(x) {
             dither_level *= f32::from(level);
+        }
+        let mut keep_small_errors = true;
+        let mut isolated = false;
+        if let Some(AdaptiveRow { params, map, .. }) = adaptive {
+            let cell = map[x];
+            let smooth = cell & ADAPTIVE_SMOOTH != 0;
+            isolated = cell == 0;
+            dither_level *= f32::from(cell & ADAPTIVE_STRENGTH) / f32::from(ADAPTIVE_STRENGTH);
+            if smooth {
+                dither_level = dither_level.max(params.smooth_floor);
+            }
+            keep_small_errors = smooth;
         }
 
         let spx = get_dithered_pixel(
@@ -2570,7 +2662,25 @@ fn dither_row(
         } else {
             last_match
         };
-        let (pal_idx, dither_diff) = tree.search(spx, guessed_match);
+        let (mut pal_idx, dither_diff) = tree.search(spx, guessed_match);
+        if let Some(row) = adaptive
+            && !isolated
+        {
+            let left = (offset > 0).then(|| output_row[if even_row { x - 1 } else { x + 1 }]);
+            let above = row.above.get(x).copied().filter(|&up| Some(up) != left);
+            let neighbors = [left, above];
+            if !neighbors.contains(&Some(pal_idx as u8)) {
+                let shade = (row_pixels[x].g * ADAPTIVE_RUN_DARK).min(1.0);
+                let mut best = shade.mul_add(shade * row.params.run_bias, dither_diff);
+                for cand in neighbors.into_iter().flatten() {
+                    let d = spx.diff(palette_points[cand as usize]);
+                    if d <= best {
+                        best = d;
+                        pal_idx = cand as usize;
+                    }
+                }
+            }
+        }
         let mut matched = pal_idx as u8;
         last_match = pal_idx;
         let mut output_px = palette_points[pal_idx];
@@ -2609,13 +2719,18 @@ fn dither_row(
             g: spx.g - output_px.g,
             b: spx.b - output_px.b,
         };
-        if diff.r.mul_add(diff.r, diff.g * diff.g) + diff.b.mul_add(diff.b, diff.a * diff.a)
-            > max_dither_error
-        {
+        let diff_error =
+            diff.r.mul_add(diff.r, diff.g * diff.g) + diff.b.mul_add(diff.b, diff.a * diff.a);
+        if diff_error > max_dither_error {
             diff.a *= 0.75;
             diff.r *= 0.75;
             diff.g *= 0.75;
             diff.b *= 0.75;
+        }
+        if isolated
+            || (!keep_small_errors && adaptive.is_some_and(|row| diff_error < row.params.dead_zone))
+        {
+            diff = InternalPixel::default();
         }
 
         if even_row {
@@ -2667,6 +2782,12 @@ fn select_dither_map(
     }
 
     Vec::new()
+}
+
+/// Floyd-Steinberg level before the dither map scales it (libimagequant's
+/// `(1-(1-d)²)·15/16`).
+fn full_dithering_level(settings: QuantizerSettings) -> f32 {
+    (1.0 - settings.dither_level).mul_add(-(1.0 - settings.dither_level), 1.0) * (15.0f32 / 16.0f32)
 }
 
 fn get_dithered_pixel(
@@ -2721,6 +2842,198 @@ fn clamp_dither_ratio(
         current_ratio.min((max_underflow - value) / delta)
     } else {
         current_ratio
+    }
+}
+
+/// Bit set in an adaptive dither cell for pixels inside a smooth gradient.
+const ADAPTIVE_SMOOTH: u8 = 0x80;
+/// Mask of the strength part of a cell (0 = take the nearest color, pass on no error).
+const ADAPTIVE_STRENGTH: u8 = 0x7f;
+/// Local contrast (1/255 units) where dithering starts to fade, and where it is down
+/// to `ADAPTIVE_DAMPED`. Also the upper bound of a smooth gradient.
+const ADAPTIVE_FADE_FROM: f32 = 12.0;
+const ADAPTIVE_FADE_TO: f32 = 48.0;
+const ADAPTIVE_DAMPED: f32 = 0.35;
+/// How far around a pixel the smooth-gradient test looks.
+const ADAPTIVE_SMOOTH_RADIUS: usize = 2;
+/// Least dithering in smooth gradients, as a share of the full level.
+const ADAPTIVE_SMOOTH_FLOOR: f32 = 0.5;
+/// Errors below this distance (1/255 units) are not diffused outside smooth gradients.
+const ADAPTIVE_DEAD_ZONE: f32 = 1.5;
+/// A translucent pixel is dithered only when its alpha is within this (1/255 units)
+/// of each 4-neighbor's: soft shadows yes, anti-aliased edges no.
+const ADAPTIVE_ALPHA_STEP: f32 = 16.0;
+/// Extra distance (1/255 units) a neighbor's palette entry may have over the nearest
+/// one and still be picked, so runs get longer; scaled down in dark tones.
+const ADAPTIVE_RUN_BIAS: f32 = 3.0;
+/// Brightness (green, 0-1) times this below 1 shrinks the run bias quadratically:
+/// the internal gamma squeezes dark tones, so the same bias is a bigger visible step.
+const ADAPTIVE_RUN_DARK: f32 = 2.0;
+
+/// Region-aware Floyd-Steinberg for the default dithering path.
+///
+/// libimagequant dithers everything its dither map does not flag as an edge at full
+/// strength, and every pixel takes its exactly nearest palette entry. Diffusion noise
+/// is what deflate compresses worst. On top of the dither map this:
+/// - fades dithering out with local contrast (largest step to a 4-neighbor), where
+///   texture already hides banding;
+/// - in smooth gradients keeps at least half strength and diffuses even tiny errors
+///   (a dead zone there leaves flat islands with contours between them);
+/// - elsewhere does not pass on errors below a dead zone, which keeps flat areas clean;
+/// - does not dither translucent pixels on alpha edges (anti-aliasing), where
+///   diffused error leaks into what the edge borders;
+/// - repeats the left or upper neighbor's index when it is nearly as close as the
+///   nearest entry. Its larger error is still diffused, so the average color holds,
+///   while runs get longer. Using both neighbors avoids the horizontal streaks a
+///   left-only preference draws in flat skies.
+pub(crate) struct AdaptiveDither {
+    /// Per pixel: `ADAPTIVE_SMOOTH` bit plus strength in `ADAPTIVE_STRENGTH` units.
+    map: Vec<u8>,
+    /// Squared error (sum over channels) below which errors are not diffused.
+    dead_zone: f32,
+    /// Least dithering level in smooth gradients (same scale as the base level).
+    smooth_floor: f32,
+    /// Extra squared error accepted to repeat a neighbor's index.
+    run_bias: f32,
+}
+
+#[derive(Clone, Copy)]
+struct AdaptiveRow<'a> {
+    params: &'a AdaptiveDither,
+    map: &'a [u8],
+    /// Output indices of the row dithered before this one (empty for the first).
+    above: &'a [u8],
+}
+
+impl AdaptiveDither {
+    fn new(pixels: &[InternalPixel], width: usize, height: usize, full_level: f32) -> Self {
+        let alpha_step = ADAPTIVE_ALPHA_STEP / 255.0 * InternalPixel::OPAQUE_A;
+        let radius = ADAPTIVE_SMOOTH_RADIUS;
+
+        // Local contrast (largest squared distance to a 4-neighbor) in three classes:
+        // 0 = flat, 1 = gentle (up to the fade start), 2 = steeper. Only pixels in
+        // the fade band need a square root for their strength.
+        let fade_from = (ADAPTIVE_FADE_FROM / 255.0).powi(2);
+        let fade_to = (ADAPTIVE_FADE_TO / 255.0).powi(2);
+        let mut class = vec![0u8; pixels.len()];
+        let mut map = vec![0u8; pixels.len()];
+        // Bands of rows run in parallel; inside a band each vertical step is measured
+        // once (as the row above's downward step), so a pixel costs two distances.
+        const BAND: usize = 32;
+        class
+            .par_chunks_mut(width * BAND)
+            .zip(map.par_chunks_mut(width * BAND))
+            .enumerate()
+            .for_each(|(band, (class_band, map_band))| {
+                let y0 = band * BAND;
+                let mut up_diff = vec![0f32; width];
+                let mut down_diff = vec![0f32; width];
+                if y0 > 0 {
+                    let (prev, row) = (
+                        &pixels[(y0 - 1) * width..][..width],
+                        &pixels[y0 * width..][..width],
+                    );
+                    for x in 0..width {
+                        up_diff[x] = row[x].diff(prev[x]);
+                    }
+                }
+                for (dy, (class_row, map_row)) in class_band
+                    .chunks_mut(width)
+                    .zip(map_band.chunks_mut(width))
+                    .enumerate()
+                {
+                    let y = y0 + dy;
+                    let row = &pixels[y * width..][..width];
+                    let above = (y > 0).then(|| &pixels[(y - 1) * width..][..width]);
+                    let below = (y + 1 < height).then(|| &pixels[(y + 1) * width..][..width]);
+                    let mut left_diff = 0f32;
+                    for x in 0..width {
+                        let px = row[x];
+                        let right_diff = row.get(x + 1).map_or(0.0, |&nb| px.diff(nb));
+                        down_diff[x] = below.map_or(0.0, |below| px.diff(below[x]));
+                        let most = left_diff.max(right_diff).max(up_diff[x]).max(down_diff[x]);
+                        left_diff = right_diff;
+                        class_row[x] = if most == 0.0 {
+                            0
+                        } else if most <= fade_from {
+                            1
+                        } else {
+                            2
+                        };
+                        // Opaque pixels are always ditherable; the alpha-edge test is
+                        // only needed for translucent ones.
+                        let ditherable = px.a >= InternalPixel::OPAQUE_A - 1e-6
+                            || (!px.is_fully_transparent()
+                                && [
+                                    x.checked_sub(1).map(|l| row[l]),
+                                    row.get(x + 1).copied(),
+                                    above.map(|r| r[x]),
+                                    below.map(|r| r[x]),
+                                ]
+                                .into_iter()
+                                .flatten()
+                                .all(|nb| (nb.a - px.a).abs() <= alpha_step));
+                        if ditherable {
+                            let strength = if most <= fade_from {
+                                1.0
+                            } else if most >= fade_to {
+                                ADAPTIVE_DAMPED
+                            } else {
+                                let t = (most.sqrt() * 255.0 - ADAPTIVE_FADE_FROM)
+                                    / (ADAPTIVE_FADE_TO - ADAPTIVE_FADE_FROM);
+                                1.0 - t * (1.0 - ADAPTIVE_DAMPED)
+                            };
+                            map_row[x] = (strength * f32::from(ADAPTIVE_STRENGTH)).round() as u8;
+                        }
+                    }
+                    std::mem::swap(&mut up_diff, &mut down_diff);
+                }
+            });
+
+        // Smooth gradient: some contrast within `radius`, none above the fade start.
+        let mut row_max = vec![0u8; pixels.len()];
+        row_max
+            .par_chunks_mut(width)
+            .zip(class.par_chunks(width))
+            .for_each(|(dst, src)| {
+                dst.copy_from_slice(src);
+                for shift in 1..=radius.min(width - 1) {
+                    for x in 0..width - shift {
+                        dst[x] = dst[x].max(src[x + shift]);
+                        dst[x + shift] = dst[x + shift].max(src[x]);
+                    }
+                }
+            });
+        map.par_chunks_mut(width)
+            .enumerate()
+            .for_each(|(y, map_row)| {
+                let mut most = vec![0u8; width];
+                for yy in y.saturating_sub(radius)..=(y + radius).min(height - 1) {
+                    for (m, &v) in most.iter_mut().zip(&row_max[yy * width..][..width]) {
+                        *m = (*m).max(v);
+                    }
+                }
+                for (cell, &m) in map_row.iter_mut().zip(&most) {
+                    if *cell != 0 && m == 1 {
+                        *cell |= ADAPTIVE_SMOOTH;
+                    }
+                }
+            });
+
+        Self {
+            map,
+            dead_zone: (ADAPTIVE_DEAD_ZONE / 255.0).powi(2),
+            smooth_floor: ADAPTIVE_SMOOTH_FLOOR * full_level,
+            run_bias: (ADAPTIVE_RUN_BIAS / 255.0).powi(2),
+        }
+    }
+
+    fn row<'a>(&'a self, row: usize, width: usize, above: &'a [u8]) -> AdaptiveRow<'a> {
+        AdaptiveRow {
+            params: self,
+            map: &self.map[row * width..][..width],
+            above,
+        }
     }
 }
 
@@ -3056,8 +3369,16 @@ mod tests {
     }
 
     fn photo_palette_for(rgba: &[u8], width: usize, height: usize) -> bool {
-        let settings =
-            quantizer_settings(256, SpeedSettings::from_speed(4), 0.0, None, false, 0, 1.0);
+        let settings = quantizer_settings(
+            256,
+            SpeedSettings::from_speed(4),
+            0.0,
+            None,
+            false,
+            0,
+            1.0,
+            true,
+        );
         let gamma = gamma_lut(SRGB_OUTPUT_GAMMA);
         let histogram = super::build_histogram(
             rgba,
@@ -3088,8 +3409,16 @@ mod tests {
     fn quantize_is_thread_count_independent() {
         let (w, h) = (256, 192);
         let photo = synthetic_rgba(w, h, true);
-        let settings =
-            quantizer_settings(256, SpeedSettings::from_speed(4), 0.0, None, false, 0, 1.0);
+        let settings = quantizer_settings(
+            256,
+            SpeedSettings::from_speed(4),
+            0.0,
+            None,
+            false,
+            0,
+            1.0,
+            true,
+        );
         let run = |threads: usize| {
             rayon::ThreadPoolBuilder::new()
                 .num_threads(threads)
@@ -3132,8 +3461,16 @@ mod tests {
             255u8, 0, 0, 255, 250, 0, 0, 255, 0, 255, 0, 255, 0, 250, 0, 255, 0, 0, 255, 255, 0, 0,
             250, 255,
         ];
-        let settings =
-            quantizer_settings(16, SpeedSettings::from_speed(4), 0.0, None, true, 0, 0.0);
+        let settings = quantizer_settings(
+            16,
+            SpeedSettings::from_speed(4),
+            0.0,
+            None,
+            true,
+            0,
+            0.0,
+            false,
+        );
         let out = quantize_indexed(&rgba, 3, 2, settings);
         assert_eq!(out.indices.len(), 6);
         assert!(!out.palette.is_empty());
@@ -3144,13 +3481,29 @@ mod tests {
         let rgba = vec![
             255u8, 0, 0, 255, 254, 1, 0, 255, 253, 2, 0, 255, 252, 3, 0, 255,
         ];
-        let mut direct_settings =
-            quantizer_settings(16, SpeedSettings::from_speed(4), 0.0, None, true, 0, 0.0);
+        let mut direct_settings = quantizer_settings(
+            16,
+            SpeedSettings::from_speed(4),
+            0.0,
+            None,
+            true,
+            0,
+            0.0,
+            false,
+        );
         direct_settings.input_posterize_bits = 0;
         let direct = quantize_indexed(&rgba, 2, 2, direct_settings);
 
-        let mut posterized_settings =
-            quantizer_settings(16, SpeedSettings::from_speed(4), 0.0, None, true, 0, 0.0);
+        let mut posterized_settings = quantizer_settings(
+            16,
+            SpeedSettings::from_speed(4),
+            0.0,
+            None,
+            true,
+            0,
+            0.0,
+            false,
+        );
         posterized_settings.input_posterize_bits = 2;
         let posterized = quantize_indexed(&rgba, 2, 2, posterized_settings);
 
@@ -3178,7 +3531,16 @@ mod tests {
         let rgba = (0..64u8)
             .flat_map(|v| [v, 255 - v, v / 2, 255])
             .collect::<Vec<_>>();
-        let settings = quantizer_settings(4, SpeedSettings::from_speed(4), 0.0, None, true, 0, 0.0);
+        let settings = quantizer_settings(
+            4,
+            SpeedSettings::from_speed(4),
+            0.0,
+            None,
+            true,
+            0,
+            0.0,
+            false,
+        );
         let out = quantize_indexed(&rgba, 8, 8, settings);
         assert!(out.palette.len() <= 4);
     }
@@ -3221,6 +3583,7 @@ mod tests {
             target_mse_is_zero: true,
             dither: true,
             dither_level: 1.0,
+            adaptive_dither: false,
             use_dither_map: DitherMapMode::Enabled,
             use_contrast_maps: false,
             photo_palette: false,
@@ -3242,6 +3605,7 @@ mod tests {
             None,
             settings,
             Some(&[255, 1]),
+            None,
             None,
             None,
             None,
@@ -3352,6 +3716,7 @@ mod tests {
             target_mse_is_zero,
             dither: false,
             dither_level: 1.0,
+            adaptive_dither: false,
             use_dither_map: DitherMapMode::None,
             use_contrast_maps: false,
             photo_palette: false,
@@ -3492,8 +3857,16 @@ mod tests {
     fn background_identical_pixels_use_transparent() {
         // When image == background, all pixels should map to transparent_index
         let rgba = vec![255u8, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 0, 0, 0, 0];
-        let settings =
-            quantizer_settings(256, SpeedSettings::from_speed(4), 0.0, None, true, 0, 1.0);
+        let settings = quantizer_settings(
+            256,
+            SpeedSettings::from_speed(4),
+            0.0,
+            None,
+            true,
+            0,
+            1.0,
+            false,
+        );
         let result =
             super::quantize_indexed_with_background(&rgba, 2, 2, settings, None, Some(&rgba));
         // Every pixel should have been mapped to transparent (matching background)
@@ -3527,6 +3900,7 @@ mod tests {
             true,
             0,
             0.0, // no dithering to simplify comparison
+            false,
         );
         let without_bg =
             super::quantize_indexed_with_background(&image_rgba, 2, 2, settings, None, None);
@@ -3550,8 +3924,16 @@ mod tests {
         let rgba = vec![
             255u8, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 128, 128, 128, 255,
         ];
-        let settings =
-            quantizer_settings(4, SpeedSettings::from_speed(10), 0.0, None, true, 0, 0.0);
+        let settings = quantizer_settings(
+            4,
+            SpeedSettings::from_speed(10),
+            0.0,
+            None,
+            true,
+            0,
+            0.0,
+            false,
+        );
         // All pixels are fully opaque, so the palette won't naturally contain a transparent entry
         let result =
             super::quantize_indexed_with_background(&rgba, 2, 2, settings, None, Some(&rgba));
@@ -3571,11 +3953,128 @@ mod tests {
         let rgba = vec![
             255u8, 0, 0, 255, 250, 0, 0, 255, 0, 255, 0, 255, 0, 250, 0, 255,
         ];
-        let settings =
-            quantizer_settings(16, SpeedSettings::from_speed(10), 0.0, None, true, 0, 0.0);
+        let settings = quantizer_settings(
+            16,
+            SpeedSettings::from_speed(10),
+            0.0,
+            None,
+            true,
+            0,
+            0.0,
+            false,
+        );
         let without = super::quantize_indexed_with_importance(&rgba, 2, 2, settings, None);
         let with_bg = super::quantize_indexed_with_background(&rgba, 2, 2, settings, None, None);
         assert_eq!(without.palette, with_bg.palette);
         assert_eq!(without.indices, with_bg.indices);
+    }
+
+    fn gray_ramp(width: usize, height: usize, alpha: u8) -> Vec<u8> {
+        let mut rgba = Vec::with_capacity(width * height * 4);
+        for _y in 0..height {
+            for x in 0..width {
+                let v = (64 + x * 64 / width) as u8;
+                rgba.extend_from_slice(&[v, v, v, alpha]);
+            }
+        }
+        rgba
+    }
+
+    fn internal_pixels(rgba: &[u8]) -> Vec<InternalPixel> {
+        let gamma = gamma_lut(SRGB_OUTPUT_GAMMA);
+        rgba.as_chunks::<4>()
+            .0
+            .iter()
+            .map(|px| InternalPixel::from_rgba(&gamma, px))
+            .collect()
+    }
+
+    #[test]
+    fn adaptive_map_flags_gradients_flat_areas_and_alpha_edges() {
+        let (width, height) = (32, 8);
+        let mut rgba = gray_ramp(width, height, 255);
+        // Right half: one flat color; last column: an anti-aliased alpha edge.
+        for y in 0..height {
+            for x in width / 2..width {
+                let alpha = if x == width - 1 { 96 } else { 255 };
+                rgba[(y * width + x) * 4..][..4].copy_from_slice(&[200, 200, 200, alpha]);
+            }
+        }
+        let adaptive = super::AdaptiveDither::new(&internal_pixels(&rgba), width, height, 1.0);
+        let cell = |x: usize, y: usize| adaptive.map[y * width + x];
+
+        assert_ne!(
+            cell(4, 4) & super::ADAPTIVE_SMOOTH,
+            0,
+            "gentle ramp is a gradient"
+        );
+        assert_eq!(
+            cell(4, 4) & super::ADAPTIVE_STRENGTH,
+            super::ADAPTIVE_STRENGTH
+        );
+        assert_eq!(
+            cell(22, 4) & super::ADAPTIVE_SMOOTH,
+            0,
+            "flat area is no gradient"
+        );
+        assert_eq!(cell(width - 1, 4), 0, "alpha edge is not dithered");
+        // The step from the ramp into the flat area is steep: dithering fades there.
+        let step = cell(width / 2, 4) & super::ADAPTIVE_STRENGTH;
+        assert!(step < super::ADAPTIVE_STRENGTH, "edge strength {step}");
+    }
+
+    #[test]
+    fn soft_shadow_alpha_stays_ditherable() {
+        let (width, height) = (32, 8);
+        let mut rgba = Vec::new();
+        for _y in 0..height {
+            for x in 0..width {
+                rgba.extend_from_slice(&[0, 0, 0, (40 + x * 2) as u8]);
+            }
+        }
+        let adaptive = super::AdaptiveDither::new(&internal_pixels(&rgba), width, height, 1.0);
+        assert!(adaptive.map.iter().all(|&cell| cell != 0));
+    }
+
+    #[test]
+    fn adaptive_dither_keeps_gradient_average() {
+        let (width, height) = (64, 64);
+        let rgba = gray_ramp(width, height, 255);
+        let palette = [64u8, 96, 128]
+            .map(|v| {
+                let rgba = [v, v, v, 255];
+                (
+                    InternalPixel::from_rgba(&gamma_lut(SRGB_OUTPUT_GAMMA), &rgba),
+                    rgba,
+                )
+            })
+            .to_vec();
+        let mut settings = quantizer_settings(
+            3,
+            SpeedSettings::from_speed(4),
+            0.0,
+            None,
+            true,
+            0,
+            1.0,
+            true,
+        );
+        let adaptive =
+            super::remap_to_fixed_palette(&rgba, width, height, &palette, settings, None);
+        settings.adaptive_dither = false;
+        let plain = super::remap_to_fixed_palette(&rgba, width, height, &palette, settings, None);
+
+        let column_mean = |indices: &[u8], x: usize| {
+            (0..height)
+                .map(|y| f64::from(palette[indices[y * width + x] as usize].1[0]))
+                .sum::<f64>()
+                / height as f64
+        };
+        for x in (4..width - 4).step_by(8) {
+            let want = f64::from(rgba[x * 4]);
+            let got = column_mean(&adaptive, x);
+            assert!((got - want).abs() < 6.0, "column {x}: {got} vs {want}");
+            assert!((got - column_mean(&plain, x)).abs() < 6.0);
+        }
     }
 }

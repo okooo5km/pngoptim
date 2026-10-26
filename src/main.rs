@@ -33,6 +33,7 @@ fn run(cli: Cli) -> Result<(), AppError> {
             quality: cli.quality.clone(),
             speed: cli.effective_speed(),
             dither_level: cli.dither_level(),
+            adaptive_dither: cli.adaptive_dither(),
             posterize: cli.posterize,
             strip: cli.strip,
             skip_if_larger: cli.skip_if_larger,

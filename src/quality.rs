@@ -144,6 +144,9 @@ pub(crate) struct InternalPixel {
 }
 
 impl InternalPixel {
+    /// Alpha component of a fully opaque pixel.
+    pub(crate) const OPAQUE_A: f32 = LIQ_WEIGHT_A as f32;
+
     pub(crate) fn from_rgba(gamma_lut: &[f32; 256], rgba: &[u8]) -> Self {
         let alpha = f32::from(rgba[3]) / 255.0;
         Self {

@@ -151,6 +151,12 @@ impl Cli {
         self.floyd.unwrap_or(1.0)
     }
 
+    /// Region-adaptive dithering applies only when the user did not pick a
+    /// Floyd level: an explicit `--floyd[=N]` gets plain libimagequant dithering.
+    pub fn adaptive_dither(&self) -> bool {
+        self.floyd.is_none() && !self.nofs
+    }
+
     pub fn effective_speed(&self) -> u8 {
         SpeedSettings::from_speed(self.speed).effective_speed
     }
@@ -305,5 +311,13 @@ mod tests {
         let cli = Cli::parse_from(["pngoptim", "in.png", "--floyd=0.5"]);
         assert_eq!(cli.floyd, Some(0.5));
         assert_eq!(cli.dither_level(), 0.5);
+    }
+
+    #[test]
+    fn adaptive_dither_only_without_explicit_floyd() {
+        assert!(Cli::parse_from(["pngoptim", "in.png"]).adaptive_dither());
+        assert!(!Cli::parse_from(["pngoptim", "in.png", "--floyd"]).adaptive_dither());
+        assert!(!Cli::parse_from(["pngoptim", "in.png", "--floyd=0.5"]).adaptive_dither());
+        assert!(!Cli::parse_from(["pngoptim", "in.png", "--nofs"]).adaptive_dither());
     }
 }

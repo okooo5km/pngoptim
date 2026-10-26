@@ -58,6 +58,7 @@ pub struct PipelineOptions {
     pub quality: Option<QualityRange>,  // Quality range (min-max)
     pub speed: u8,                      // 1-11, default 4
     pub dither_level: f32,              // 0.0-1.0, default 1.0
+    pub adaptive_dither: bool,          // Region-adaptive dithering, default true
     pub posterize: Option<u8>,          // 0-8 bits, default None
     pub strip: bool,                    // Strip metadata, default false
     pub skip_if_larger: bool,           // Skip if output > input, default false
@@ -66,7 +67,9 @@ pub struct PipelineOptions {
 }
 ```
 
-`PipelineOptions::default()` provides sensible defaults (speed=4, full dithering, ICC normalization enabled, safe APNG mode).
+`PipelineOptions::default()` provides sensible defaults (speed=4, full adaptive dithering, ICC normalization enabled, safe APNG mode).
+
+`adaptive_dither` modulates the Floyd-Steinberg strength per region (see [Dithering](options-reference.md#dithering)); set it to `false` to apply `dither_level` uniformly, which is what the CLI does when `--floyd` is given. In the C API, `dither_level < 0` (the value `pngoptim_default_options()` returns) selects adaptive full-strength dithering, and an explicit `0.0`–`1.0` is applied uniformly.
 
 ## Result: `PipelineResult`
 
