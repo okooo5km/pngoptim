@@ -6,10 +6,13 @@ use png::{BlendOp, ColorType, DisposeOp, Transformations};
 use crate::error::AppError;
 use crate::pipeline::write_png_chunk;
 
-/// Color-space metadata carried alongside APNG pixel data, extracted from the
-/// input's PNG chunks and passed through to the encoded output untouched (P2:
+/// Color-space and ancillary metadata carried alongside APNG pixel data, extracted
+/// from the input's PNG chunks and passed through to the encoded output untouched (P2:
 /// APNG never performs ICC normalization, so this is pure passthrough — no new
 /// color conversions are introduced here).
+///
+/// The pHYs/eXIf/text fields mirror what the static path keeps in
+/// `PreservedMetadata`; `strip_ancillary` drops them for `--strip`.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ApngColorMetadata {
     pub icc_profile: Option<Vec<u8>>,
@@ -17,6 +20,25 @@ pub struct ApngColorMetadata {
     pub source_chromaticities: Option<png::SourceChromaticities>,
     pub srgb: Option<png::SrgbRenderingIntent>,
     pub cicp: Option<png::CodingIndependentCodePoints>,
+    /// pHYs as (x ppu, y ppu, unit); `png::PixelDimensions` is not `Eq`.
+    pub pixel_dims: Option<(u32, u32, png::Unit)>,
+    pub exif_metadata: Option<Vec<u8>>,
+    pub uncompressed_latin1_text: Vec<png::text_metadata::TEXtChunk>,
+    pub compressed_latin1_text: Vec<png::text_metadata::ZTXtChunk>,
+    pub utf8_text: Vec<png::text_metadata::ITXtChunk>,
+}
+
+impl ApngColorMetadata {
+    /// Drop everything `--strip` removes on the static path except the color
+    /// chunks: APNG pixels are never converted to sRGB, so dropping iCCP/gAMA/cHRM
+    /// would change how the animation displays.
+    pub fn strip_ancillary(&mut self) {
+        self.pixel_dims = None;
+        self.exif_metadata = None;
+        self.uncompressed_latin1_text.clear();
+        self.compressed_latin1_text.clear();
+        self.utf8_text.clear();
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -73,6 +95,11 @@ pub fn decode_apng(input: &[u8]) -> Result<Option<ApngImage>, AppError> {
         source_chromaticities: info.chrm_chunk,
         srgb: info.srgb,
         cicp: info.coding_independent_code_points,
+        pixel_dims: info.pixel_dims.map(|d| (d.xppu, d.yppu, d.unit)),
+        exif_metadata: info.exif_metadata.as_ref().map(|v| v.as_ref().to_vec()),
+        uncompressed_latin1_text: info.uncompressed_latin1_text.clone(),
+        compressed_latin1_text: info.compressed_latin1_text.clone(),
+        utf8_text: info.utf8_text.clone(),
     };
     let num_plays = animation.num_plays;
     let has_separate_default_image = first_frame_control.is_none();
@@ -579,7 +606,7 @@ fn recompress_image_streams(png_bytes: &[u8]) -> Option<Vec<u8>> {
 }
 
 /// Build a `png::Encoder` pre-populated with color-space metadata (iCCP/gAMA/cHRM/sRGB)
-/// so it gets serialized as part of the normal header-writing path (`Encoder::write_header`).
+/// and the pHYs/eXIf/text chunks so they get serialized as part of the normal header-writing path (`Encoder::write_header`).
 ///
 /// cICP is intentionally *not* set here: the `png` crate's `Info`/`Encoder` machinery
 /// has no code path that serializes `coding_independent_code_points` at all (confirmed
@@ -609,6 +636,16 @@ fn new_encoder_with_color_metadata<W: std::io::Write>(
         info.source_gamma = color_metadata.source_gamma;
         info.source_chromaticities = color_metadata.source_chromaticities;
     }
+    info.pixel_dims = color_metadata
+        .pixel_dims
+        .map(|(xppu, yppu, unit)| png::PixelDimensions { xppu, yppu, unit });
+    info.exif_metadata = color_metadata
+        .exif_metadata
+        .as_ref()
+        .map(|v| Cow::Owned(v.clone()));
+    info.uncompressed_latin1_text = color_metadata.uncompressed_latin1_text.clone();
+    info.compressed_latin1_text = color_metadata.compressed_latin1_text.clone();
+    info.utf8_text = color_metadata.utf8_text.clone();
 
     png::Encoder::with_info(w, info)
         .map_err(|e| AppError::Encode(format!("failed to configure APNG color metadata: {e}")))

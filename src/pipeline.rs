@@ -246,6 +246,10 @@ fn process_apng(
     // Decode is already done (apng is passed in)
     let decode_ms = t_decode.elapsed().as_secs_f64() * 1000.0;
 
+    if options.strip {
+        apng.color_metadata.strip_ancillary();
+    }
+
     let t_quantize = Instant::now();
     // Detect input characteristics to skip unnecessary re-encoding
     let input_info = detect_input_characteristics(input_bytes);
@@ -1628,6 +1632,64 @@ mod tests {
         };
         let result = process_png_bytes(&input, options).unwrap();
         assert!(result.quality_score >= 65, "{}", result.quality_score);
+    }
+
+    #[test]
+    fn apng_keeps_text_and_phys_unless_stripped() {
+        use crate::apng::{ApngColorMetadata, ApngFrame, ApngImage, encode_apng};
+        use crate::cli::ApngMode;
+        use png::text_metadata::{ITXtChunk, TEXtChunk, ZTXtChunk};
+        use png::{BlendOp, DisposeOp};
+
+        let (w, h) = (16u32, 16u32);
+        let frame = |shade: u8| ApngFrame {
+            width: w,
+            height: h,
+            x_offset: 0,
+            y_offset: 0,
+            delay_num: 1,
+            delay_den: 10,
+            dispose_op: DisposeOp::None,
+            blend_op: BlendOp::Source,
+            rgba: (0..w * h)
+                .flat_map(|i| [(i * 7) as u8, shade, (i / w * 9) as u8, 255])
+                .collect(),
+        };
+        let apng = ApngImage {
+            color_metadata: ApngColorMetadata {
+                pixel_dims: Some((5669, 5669, png::Unit::Meter)),
+                uncompressed_latin1_text: vec![TEXtChunk::new("Title", "hello")],
+                compressed_latin1_text: vec![ZTXtChunk::new("Comment", "zipped")],
+                utf8_text: vec![ITXtChunk::new("Author", "作者")],
+                ..Default::default()
+            },
+            width: w,
+            height: h,
+            num_plays: 0,
+            default_image: None,
+            frames: vec![frame(10), frame(200)],
+        };
+        let input = encode_apng(&apng).unwrap();
+
+        for apng_mode in [ApngMode::Safe, ApngMode::Aggressive] {
+            for strip in [false, true] {
+                let options = PipelineOptions {
+                    quality: Some(crate::cli::parse_quality_range("0-50").unwrap()),
+                    apng_mode: apng_mode.clone(),
+                    strip,
+                    ..PipelineOptions::default()
+                };
+                let result = process_png_bytes(&input, options).unwrap();
+                let types = chunk_types(&result.png_data);
+                for kind in [b"pHYs", b"tEXt", b"zTXt", b"iTXt"] {
+                    assert_eq!(
+                        types.contains(kind),
+                        !strip,
+                        "{apng_mode:?} strip={strip}: {types:?}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

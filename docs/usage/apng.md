@@ -73,7 +73,7 @@ When these characteristics are detected, re-optimization is skipped to prevent s
 | `--speed` | Controls quantization speed/quality tradeoff |
 | `--floyd` / `--nofs` | Controls dithering for per-frame remapping |
 | `--skip-if-larger` | Applied after quantization; output is discarded if larger than input |
-| `--strip` | Not yet applied to APNG metadata (planned) |
+| `--strip` | Drops text (tEXt/zTXt/iTXt), pHYs and eXIf; without it they are kept, as for static PNGs. Color chunks (iCCP/sRGB/gAMA/cHRM/cICP) are always kept, since APNG pixels are not converted to sRGB |
 
 ## Examples
 
