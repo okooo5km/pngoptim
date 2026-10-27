@@ -154,31 +154,13 @@ pub fn compose_frames(apng: &ApngImage) -> Result<Vec<Vec<u8>>, AppError> {
         validate_frame(apng.width, apng.height, frame)?;
 
         if let Some(prev) = previous_frame {
-            match effective_dispose(prev, index - 1) {
-                DisposeOp::None => {}
-                DisposeOp::Background => clear_region(
-                    &mut canvas,
-                    apng.width,
-                    prev.x_offset,
-                    prev.y_offset,
-                    prev.width,
-                    prev.height,
-                )?,
-                DisposeOp::Previous => {
-                    if let Some(saved) = saved_before_previous.take() {
-                        canvas = saved;
-                    } else {
-                        clear_region(
-                            &mut canvas,
-                            apng.width,
-                            prev.x_offset,
-                            prev.y_offset,
-                            prev.width,
-                            prev.height,
-                        )?;
-                    }
-                }
-            }
+            dispose_frame(
+                &mut canvas,
+                apng.width,
+                prev,
+                index - 1,
+                &mut saved_before_previous,
+            )?;
         }
 
         if effective_dispose(frame, index) == DisposeOp::Previous {
@@ -193,6 +175,32 @@ pub fn compose_frames(apng: &ApngImage) -> Result<Vec<Vec<u8>>, AppError> {
     }
 
     Ok(outputs)
+}
+
+/// Apply `frame`'s dispose op to the canvas after it was shown. `saved_before_previous`
+/// holds the canvas from before the frame was drawn when its dispose op is Previous.
+fn dispose_frame(
+    canvas: &mut Vec<u8>,
+    canvas_width: u32,
+    frame: &ApngFrame,
+    frame_index: usize,
+    saved_before_previous: &mut Option<Vec<u8>>,
+) -> Result<(), AppError> {
+    match effective_dispose(frame, frame_index) {
+        DisposeOp::None => Ok(()),
+        DisposeOp::Previous if saved_before_previous.is_some() => {
+            *canvas = saved_before_previous.take().unwrap_or_default();
+            Ok(())
+        }
+        DisposeOp::Background | DisposeOp::Previous => clear_region(
+            canvas,
+            canvas_width,
+            frame.x_offset,
+            frame.y_offset,
+            frame.width,
+            frame.height,
+        ),
+    }
 }
 
 pub fn encode_apng(apng: &ApngImage) -> Result<Vec<u8>, AppError> {
@@ -789,7 +797,7 @@ fn rgba_index(width: u32, x: u32, y: u32) -> Result<usize, AppError> {
         .ok_or_else(|| AppError::Decode("APNG byte index overflow".to_string()))
 }
 
-fn blend_over(dst: &mut [u8], src: &[u8]) {
+pub(crate) fn blend_over(dst: &mut [u8], src: &[u8]) {
     let src_a = f32::from(src[3]) / 255.0;
     let dst_a = f32::from(dst[3]) / 255.0;
     let out_a = src_a + dst_a * (1.0 - src_a);
@@ -1114,42 +1122,97 @@ fn find_content_bounds(rgba: &[u8], w: u32, h: u32) -> (u32, u32) {
 /// Conservative frame trim for safe mode.
 /// Only trims trailing transparent rows/columns from full-canvas Source frames.
 /// Does NOT change dispose_op or blend_op — only shrinks frame dimensions.
+///
+/// A full-canvas Source frame also clears everything outside its content to
+/// transparent, so it is trimmed only where the canvas it is drawn onto is
+/// already transparent outside the kept box; the composited result is then the
+/// same, and so is the canvas after any dispose op. The first frame keeps the
+/// full canvas when it is also the default image, as the APNG spec requires.
 pub fn cautious_frame_trim(apng: &mut ApngImage) {
-    for frame in &mut apng.frames {
-        // Only trim full-canvas Source frames (safe: no semantic change)
-        if frame.blend_op != BlendOp::Source {
-            continue;
+    let Ok(canvas_len) = rgba_len(apng.width, apng.height) else {
+        return;
+    };
+    let (width, height) = (apng.width, apng.height);
+    let first_frame_is_default_image = apng.default_image.is_none();
+    let mut canvas = vec![0_u8; canvas_len];
+    let mut saved_before_previous: Option<Vec<u8>> = None;
+
+    for index in 0..apng.frames.len() {
+        if index > 0
+            && dispose_frame(
+                &mut canvas,
+                width,
+                &apng.frames[index - 1],
+                index - 1,
+                &mut saved_before_previous,
+            )
+            .is_err()
+        {
+            return;
         }
-        if frame.width != apng.width || frame.height != apng.height {
-            continue;
+        let frame = &mut apng.frames[index];
+        if validate_frame(width, height, frame).is_err() {
+            return;
         }
-        if frame.x_offset != 0 || frame.y_offset != 0 {
-            continue;
+        saved_before_previous =
+            (effective_dispose(frame, index) == DisposeOp::Previous).then(|| canvas.clone());
+
+        // Only full-canvas Source frames are candidates.
+        let trimmable = frame.blend_op == BlendOp::Source
+            && frame.width == width
+            && frame.height == height
+            && frame.x_offset == 0
+            && frame.y_offset == 0
+            && !(index == 0 && first_frame_is_default_image);
+        if trimmable {
+            let (trim_w, trim_h) = find_content_bounds(&frame.rgba, frame.width, frame.height);
+            // Skip when there is nothing to trim, when the frame is fully
+            // transparent (don't collapse to 0x0), or when the trimmed area
+            // would leave visible canvas pixels uncleared.
+            if (trim_w, trim_h) != (width, height)
+                && trim_w > 0
+                && trim_h > 0
+                && transparent_outside(&canvas, width, height, trim_w, trim_h)
+            {
+                // Extract top-left sub-rect (0,0 to trim_w×trim_h)
+                let mut trimmed = Vec::with_capacity((trim_w * trim_h * 4) as usize);
+                for y in 0..trim_h {
+                    let row_start = (y * frame.width * 4) as usize;
+                    let row_end = row_start + (trim_w * 4) as usize;
+                    trimmed.extend_from_slice(&frame.rgba[row_start..row_end]);
+                }
+
+                frame.width = trim_w;
+                frame.height = trim_h;
+                frame.rgba = trimmed;
+                // x_offset, y_offset stay 0; blend_op, dispose_op unchanged
+            }
         }
 
-        // Find content bounds
-        let (trim_w, trim_h) = find_content_bounds(&frame.rgba, frame.width, frame.height);
-
-        if trim_w == frame.width && trim_h == frame.height {
-            continue; // nothing to trim
+        if blend_frame(&mut canvas, width, frame).is_err() {
+            return;
         }
-        if trim_w == 0 || trim_h == 0 {
-            continue; // fully transparent — don't collapse to 0x0
-        }
-
-        // Extract top-left sub-rect (0,0 to trim_w×trim_h)
-        let mut trimmed = Vec::with_capacity((trim_w * trim_h * 4) as usize);
-        for y in 0..trim_h {
-            let row_start = (y * frame.width * 4) as usize;
-            let row_end = row_start + (trim_w * 4) as usize;
-            trimmed.extend_from_slice(&frame.rgba[row_start..row_end]);
-        }
-
-        frame.width = trim_w;
-        frame.height = trim_h;
-        frame.rgba = trimmed;
-        // x_offset, y_offset stay 0; blend_op, dispose_op unchanged
     }
+}
+
+/// Whether every canvas pixel outside the top-left `keep_w`×`keep_h` box is transparent.
+fn transparent_outside(canvas: &[u8], width: u32, height: u32, keep_w: u32, keep_h: u32) -> bool {
+    canvas
+        .chunks_exact(width as usize * 4)
+        .take(height as usize)
+        .enumerate()
+        .all(|(y, row)| {
+            let from = if (y as u32) < keep_h {
+                keep_w as usize
+            } else {
+                0
+            };
+            row[from * 4..]
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .all(|px| px[3] == 0)
+        })
 }
 
 #[cfg(test)]
@@ -2768,7 +2831,10 @@ mod tests {
             width: 4,
             height: 4,
             num_plays: 0,
-            default_image: None,
+            // A separate default image lets the first frame be a sub-rect.
+            default_image: Some(ApngDefaultImage {
+                rgba: vec![0; 4 * 4 * 4],
+            }),
             frames: vec![ApngFrame {
                 width: 4,
                 height: 4,
@@ -2806,7 +2872,10 @@ mod tests {
             width: 4,
             height: 4,
             num_plays: 0,
-            default_image: None,
+            // A separate default image lets the first frame be a sub-rect.
+            default_image: Some(ApngDefaultImage {
+                rgba: vec![0; 4 * 4 * 4],
+            }),
             frames: vec![ApngFrame {
                 width: 4,
                 height: 4,
@@ -2895,7 +2964,10 @@ mod tests {
             width: 4,
             height: 2,
             num_plays: 0,
-            default_image: None,
+            // A separate default image lets the first frame be a sub-rect.
+            default_image: Some(ApngDefaultImage {
+                rgba: vec![0; 4 * 2 * 4],
+            }),
             frames: vec![
                 ApngFrame {
                     width: 4,
@@ -2949,6 +3021,84 @@ mod tests {
         assert_eq!(apng.frames[0].width, 2);
         // Second frame is fully opaque, no trim
         assert_eq!(apng.frames[1].width, 4);
+    }
+
+    fn trim_frame(dispose_op: DisposeOp, rgba_pixels: &[[u8; 4]]) -> ApngFrame {
+        ApngFrame {
+            width: 2,
+            height: 2,
+            x_offset: 0,
+            y_offset: 0,
+            delay_num: 1,
+            delay_den: 10,
+            dispose_op,
+            blend_op: BlendOp::Source,
+            rgba: rgba(rgba_pixels),
+        }
+    }
+
+    #[test]
+    fn cautious_trim_keeps_frame_that_clears_visible_canvas() {
+        // Frame 1 is transparent except its top-left pixel; drawn with Source it also
+        // erases frame 0's opaque pixels, so trimming it to 1x1 would leave them visible.
+        let red = [255, 0, 0, 255];
+        let clear = [0, 0, 0, 0];
+        let mut apng = ApngImage {
+            color_metadata: Default::default(),
+            width: 2,
+            height: 2,
+            num_plays: 0,
+            default_image: None,
+            frames: vec![
+                trim_frame(DisposeOp::None, &[red; 4]),
+                trim_frame(DisposeOp::None, &[[0, 0, 255, 255], clear, clear, clear]),
+            ],
+        };
+        let composited_before = compose_frames(&apng).unwrap();
+        cautious_frame_trim(&mut apng);
+        assert_eq!((apng.frames[1].width, apng.frames[1].height), (2, 2));
+        assert_eq!(compose_frames(&apng).unwrap(), composited_before);
+    }
+
+    #[test]
+    fn cautious_trim_trims_frame_after_background_dispose() {
+        // Frame 0 is disposed to background, so frame 1 is drawn onto a clear canvas.
+        let red = [255, 0, 0, 255];
+        let clear = [0, 0, 0, 0];
+        let mut apng = ApngImage {
+            color_metadata: Default::default(),
+            width: 2,
+            height: 2,
+            num_plays: 0,
+            default_image: None,
+            frames: vec![
+                trim_frame(DisposeOp::Background, &[red; 4]),
+                trim_frame(DisposeOp::None, &[[0, 0, 255, 255], clear, clear, clear]),
+            ],
+        };
+        let composited_before = compose_frames(&apng).unwrap();
+        cautious_frame_trim(&mut apng);
+        assert_eq!((apng.frames[1].width, apng.frames[1].height), (1, 1));
+        assert_eq!(compose_frames(&apng).unwrap(), composited_before);
+    }
+
+    #[test]
+    fn cautious_trim_keeps_first_frame_full_canvas_without_default_image() {
+        let clear = [0, 0, 0, 0];
+        let mut apng = ApngImage {
+            color_metadata: Default::default(),
+            width: 2,
+            height: 2,
+            num_plays: 0,
+            default_image: None,
+            frames: vec![trim_frame(
+                DisposeOp::None,
+                &[[255, 0, 0, 255], clear, clear, clear],
+            )],
+        };
+        cautious_frame_trim(&mut apng);
+        assert_eq!((apng.frames[0].width, apng.frames[0].height), (2, 2));
+        assert!(encode_apng(&apng).is_ok());
     }
 
     #[test]

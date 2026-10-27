@@ -891,7 +891,23 @@ fn quantize_apng_frames(
 
         // Quality evaluation using global palette (matches actual output)
         let remapped_rgba = remapped_rgba_from_indices(&indices, &global_rgba_palette);
-        let frame_quality = if fw > 0 && fh > 0 {
+        let frame_quality = if fw > 0 && fh > 0 && bg_ref.is_some() {
+            // Background-aware remap turns pixels that match the canvas into
+            // transparency, so judge what is shown: both blended over the canvas.
+            let shown = |rgba: &[u8]| {
+                let mut out = bg_subrect.clone();
+                for (dst, src) in out
+                    .as_chunks_mut::<4>()
+                    .0
+                    .iter_mut()
+                    .zip(rgba.as_chunks::<4>().0)
+                {
+                    crate::apng::blend_over(dst, src);
+                }
+                out
+            };
+            evaluate_quality_against_rgba(&shown(&frame.rgba), &shown(&remapped_rgba))
+        } else if fw > 0 && fh > 0 {
             evaluate_quality_against_rgba(&frame.rgba, &remapped_rgba)
         } else {
             QualityMetrics {
@@ -1524,6 +1540,61 @@ mod tests {
         normalize_rgba_to_srgb_if_needed, pack_indices_by_bit_depth, process_png_bytes,
         remapped_rgba_from_indices, skip_if_larger_max_file_size,
     };
+
+    #[test]
+    fn apng_quality_judges_background_matched_pixels_as_shown() {
+        use crate::apng::{ApngFrame, ApngImage, encode_apng};
+        use png::{BlendOp, DisposeOp};
+
+        // Frame 1 redraws a patch of the background with Over blend and changes only
+        // its centre; background-aware remap shows the unchanged pixels through
+        // transparency, which must not count as error.
+        let (w, h) = (64u32, 64u32);
+        let background: Vec<u8> = (0..w * h)
+            .flat_map(|i| [(i % w * 4) as u8, (i / w * 4) as u8, 128, 255])
+            .collect();
+        let mut patch = Vec::new();
+        for y in 8..40u32 {
+            for x in 8..40u32 {
+                let i = ((y * w + x) * 4) as usize;
+                let centre = (20..28).contains(&x) && (20..28).contains(&y);
+                patch.extend_from_slice(if centre {
+                    &[255, 255, 255, 255]
+                } else {
+                    &background[i..i + 4]
+                });
+            }
+        }
+        let frame = |width, height, offset, blend_op, rgba| ApngFrame {
+            width,
+            height,
+            x_offset: offset,
+            y_offset: offset,
+            delay_num: 1,
+            delay_den: 10,
+            dispose_op: DisposeOp::None,
+            blend_op,
+            rgba,
+        };
+        let apng = ApngImage {
+            color_metadata: Default::default(),
+            width: w,
+            height: h,
+            num_plays: 0,
+            default_image: None,
+            frames: vec![
+                frame(w, h, 0, BlendOp::Source, background),
+                frame(32, 32, 8, BlendOp::Over, patch),
+            ],
+        };
+        let input = encode_apng(&apng).unwrap();
+        let options = PipelineOptions {
+            quality: Some(crate::cli::parse_quality_range("65-100").unwrap()),
+            ..PipelineOptions::default()
+        };
+        let result = process_png_bytes(&input, options).unwrap();
+        assert!(result.quality_score >= 65, "{}", result.quality_score);
+    }
 
     #[test]
     fn posterize_reduces_bits() {
