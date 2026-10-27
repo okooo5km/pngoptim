@@ -63,7 +63,7 @@ pngoptim detects already-optimized APNG inputs by scanning chunk-level character
 - **Indexed color** APNG (already palette-based)
 - **Sub-rect frames** (frames with non-full-size rectangles)
 
-When these characteristics are detected, re-optimization is skipped to prevent size regression. This means it's always safe to run pngoptim on APNG files — it won't make them larger.
+When these characteristics are detected, re-optimization is skipped to prevent size regression. As a final guard, if the result is not smaller than the input (tiny or already-optimized files, where the palette and re-encoding overhead outweighs the savings), the input is written back unchanged and reported at quality 100. This means it's always safe to run pngoptim on APNG files — it won't make them larger. The guard is off with `--strip`, which has to re-encode to drop metadata.
 
 ## Integration with Other Options
 
@@ -72,7 +72,7 @@ When these characteristics are detected, re-optimization is skipped to prevent s
 | `--quality` | Controls quantization quality range; worst-frame quality is reported |
 | `--speed` | Controls quantization speed/quality tradeoff |
 | `--floyd` / `--nofs` | Controls dithering for per-frame remapping |
-| `--skip-if-larger` | Applied after quantization; output is discarded if larger than input |
+| `--skip-if-larger` | Applied after quantization; output is discarded if larger than input. An APNG that would not shrink is already returned unchanged, which `--skip-if-larger` then rejects |
 | `--strip` | Drops text (tEXt/zTXt/iTXt), pHYs and eXIf; without it they are kept, as for static PNGs. Color chunks (iCCP/sRGB/gAMA/cHRM/cICP) are always kept, since APNG pixels are not converted to sRGB |
 
 ## Examples

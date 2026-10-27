@@ -3389,6 +3389,45 @@ mod tests {
     }
 
     #[test]
+    fn indexed_apng_round_trip_preserves_text_and_phys() {
+        use png::text_metadata::{ITXtChunk, TEXtChunk, ZTXtChunk};
+
+        let metadata = ApngColorMetadata {
+            pixel_dims: Some((2835, 2835, png::Unit::Meter)),
+            uncompressed_latin1_text: vec![TEXtChunk::new("Title", "hello")],
+            compressed_latin1_text: vec![ZTXtChunk::new("Comment", "zipped")],
+            utf8_text: vec![ITXtChunk::new("Author", "作者")],
+            ..Default::default()
+        };
+        let indexed = IndexedApngImage {
+            color_metadata: metadata.clone(),
+            width: 2,
+            height: 2,
+            num_plays: 0,
+            palette: vec![[255, 0, 0, 255], [0, 255, 0, 255]],
+            default_image_indices: None,
+            frames: vec![IndexedApngFrame {
+                width: 2,
+                height: 2,
+                x_offset: 0,
+                y_offset: 0,
+                delay_num: 1,
+                delay_den: 10,
+                dispose_op: DisposeOp::None,
+                blend_op: BlendOp::Source,
+                indices: vec![0, 1, 0, 1],
+            }],
+        };
+
+        let encoded = encode_indexed_apng(&indexed).expect("encode indexed APNG");
+        let decoded = decode_apng(&encoded).expect("decode").expect("is apng");
+        assert_eq!(decoded.color_metadata.pixel_dims, metadata.pixel_dims);
+        assert_eq!(decoded.color_metadata.uncompressed_latin1_text.len(), 1);
+        assert_eq!(decoded.color_metadata.compressed_latin1_text.len(), 1);
+        assert_eq!(decoded.color_metadata.utf8_text.len(), 1);
+    }
+
+    #[test]
     fn indexed_apng_prefers_iccp_over_srgb_when_both_present() {
         let icc = lcms2::Profile::new_srgb()
             .icc()

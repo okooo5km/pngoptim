@@ -254,82 +254,71 @@ fn process_apng(
     // Detect input characteristics to skip unnecessary re-encoding
     let input_info = detect_input_characteristics(input_bytes);
 
-    if input_info.is_indexed && input_info.has_subrect_frames {
-        // Already optimized indexed APNG with sub-rect frames — skip all optimizations,
-        // only apply skip-if-larger as safety net
-        let quantize_ms = t_quantize.elapsed().as_secs_f64() * 1000.0;
-        let t_encode = Instant::now();
-        let png_data = encode_apng(&apng)?;
-        let encode_ms = t_encode.elapsed().as_secs_f64() * 1000.0;
+    let (mut png_data, mut quality_score, mut quality_mse, quantize_ms, encode_ms) =
+        if input_info.is_indexed && input_info.has_subrect_frames {
+            // Already optimized indexed APNG with sub-rect frames — skip all
+            // optimizations and re-encode as is.
+            let quantize_ms = t_quantize.elapsed().as_secs_f64() * 1000.0;
+            let t_encode = Instant::now();
+            let png_data = encode_apng(&apng)?;
+            let encode_ms = t_encode.elapsed().as_secs_f64() * 1000.0;
+            (png_data, 100, 0.0, quantize_ms, encode_ms)
+        } else {
+            // H2 lossless optimizations
+            fold_duplicate_frames(&mut apng);
 
-        if options.skip_if_larger {
-            let max_file_size = skip_if_larger_max_file_size(input_bytes.len() as u64, 100);
-            if (png_data.len() as u64) > max_file_size {
-                return Err(AppError::SkipIfLargerRejected {
-                    input_bytes: input_bytes.len() as u64,
-                    output_bytes: png_data.len() as u64,
-                    maximum_file_size: max_file_size,
-                    quality_score: 100,
+            if options.apng_mode == ApngMode::Aggressive && !input_info.is_indexed {
+                minimize_frame_rects_checked(&mut apng);
+            } else if !input_info.is_indexed {
+                // Safe mode: conservative trim only
+                cautious_frame_trim(&mut apng);
+            }
+
+            // H3: lossy quantization with global shared palette
+            let (indexed_apng, quality) = quantize_apng_frames(&apng, options)?;
+            let quantize_ms = t_quantize.elapsed().as_secs_f64() * 1000.0;
+
+            // Quality gating
+            if let Some(range) = options.quality.as_ref()
+                && quality.quality_score < range.min
+            {
+                return Err(AppError::QualityTooLow {
+                    minimum: range.min,
+                    actual: quality.quality_score,
                 });
             }
-        }
 
-        let total_ms = t_total.elapsed().as_secs_f64() * 1000.0;
-        return Ok(PipelineResult {
-            width,
-            height,
-            input_bytes: input_bytes.len() as u64,
-            output_bytes: png_data.len() as u64,
-            quality_score: 100,
-            quality_mse: 0.0,
-            png_data,
-            metrics: PipelineMetrics {
-                decode_ms,
+            let t_encode = Instant::now();
+            let png_data = encode_indexed_apng(&indexed_apng)?;
+            let encode_ms = t_encode.elapsed().as_secs_f64() * 1000.0;
+            (
+                png_data,
+                quality.quality_score,
+                quality.standard_mse,
                 quantize_ms,
                 encode_ms,
-                total_ms,
-            },
-        });
+            )
+        };
+
+    // An animation that does not shrink is returned unchanged: the input is a
+    // valid APNG at full quality. Tiny or already palette-optimized files grow
+    // from the PLTE/tRNS and re-encoding overhead. `--strip` must re-encode to
+    // drop metadata, so it keeps the encoded output.
+    if !options.strip && png_data.len() >= input_bytes.len() {
+        png_data = input_bytes.to_vec();
+        quality_score = 100;
+        quality_mse = 0.0;
     }
-
-    // H2 lossless optimizations
-    fold_duplicate_frames(&mut apng);
-
-    if options.apng_mode == ApngMode::Aggressive && !input_info.is_indexed {
-        minimize_frame_rects_checked(&mut apng);
-    } else if !input_info.is_indexed {
-        // Safe mode: conservative trim only
-        cautious_frame_trim(&mut apng);
-    }
-
-    // H3: lossy quantization with global shared palette
-    let (indexed_apng, quality) = quantize_apng_frames(&apng, options)?;
-    let quantize_ms = t_quantize.elapsed().as_secs_f64() * 1000.0;
-
-    // Quality gating
-    if let Some(range) = options.quality.as_ref()
-        && quality.quality_score < range.min
-    {
-        return Err(AppError::QualityTooLow {
-            minimum: range.min,
-            actual: quality.quality_score,
-        });
-    }
-
-    let t_encode = Instant::now();
-    let png_data = encode_indexed_apng(&indexed_apng)?;
-    let encode_ms = t_encode.elapsed().as_secs_f64() * 1000.0;
 
     // skip-if-larger: compare against original input
     if options.skip_if_larger {
-        let max_file_size =
-            skip_if_larger_max_file_size(input_bytes.len() as u64, quality.quality_score);
+        let max_file_size = skip_if_larger_max_file_size(input_bytes.len() as u64, quality_score);
         if (png_data.len() as u64) > max_file_size {
             return Err(AppError::SkipIfLargerRejected {
                 input_bytes: input_bytes.len() as u64,
                 output_bytes: png_data.len() as u64,
                 maximum_file_size: max_file_size,
-                quality_score: quality.quality_score,
+                quality_score,
             });
         }
     }
@@ -341,8 +330,8 @@ fn process_apng(
         height,
         input_bytes: input_bytes.len() as u64,
         output_bytes: png_data.len() as u64,
-        quality_score: quality.quality_score,
-        quality_mse: quality.standard_mse,
+        quality_score,
+        quality_mse,
         png_data,
         metrics: PipelineMetrics {
             decode_ms,
@@ -1601,7 +1590,7 @@ mod tests {
 
     #[test]
     fn apng_quality_judges_background_matched_pixels_as_shown() {
-        use crate::apng::{ApngFrame, ApngImage, encode_apng};
+        use crate::apng::{ApngFrame, ApngImage};
         use png::{BlendOp, DisposeOp};
 
         // Frame 1 redraws a patch of the background with Over blend and changes only
@@ -1645,13 +1634,53 @@ mod tests {
                 frame(32, 32, 8, BlendOp::Over, patch),
             ],
         };
-        let input = encode_apng(&apng).unwrap();
         let options = PipelineOptions {
             quality: Some(crate::cli::parse_quality_range("65-100").unwrap()),
             ..PipelineOptions::default()
         };
-        let result = process_png_bytes(&input, options).unwrap();
-        assert!(result.quality_score >= 65, "{}", result.quality_score);
+        // Judge the quantizer directly: this small input may not shrink, and
+        // the pipeline then returns it unchanged at quality 100.
+        let (_, quality) = super::quantize_apng_frames(&apng, &options).unwrap();
+        assert!(quality.quality_score >= 65, "{}", quality.quality_score);
+    }
+
+    #[test]
+    fn apng_that_does_not_shrink_is_returned_unchanged() {
+        use crate::apng::{ApngFrame, ApngImage, encode_apng};
+        use png::{BlendOp, DisposeOp};
+
+        let frame = |rgba: [u8; 4]| ApngFrame {
+            width: 2,
+            height: 2,
+            x_offset: 0,
+            y_offset: 0,
+            delay_num: 1,
+            delay_den: 10,
+            dispose_op: DisposeOp::None,
+            blend_op: BlendOp::Source,
+            rgba: rgba.repeat(4),
+        };
+        let apng = ApngImage {
+            color_metadata: Default::default(),
+            width: 2,
+            height: 2,
+            num_plays: 0,
+            default_image: None,
+            frames: vec![frame([255, 0, 0, 255]), frame([0, 0, 255, 255])],
+        };
+        let input = encode_apng(&apng).unwrap();
+        let result = process_png_bytes(&input, PipelineOptions::default()).unwrap();
+        assert_eq!(result.png_data, input);
+        assert_eq!(result.quality_score, 100);
+
+        let skip = PipelineOptions {
+            skip_if_larger: true,
+            ..PipelineOptions::default()
+        };
+        assert!(matches!(
+            process_png_bytes(&input, skip),
+            Err(crate::error::AppError::SkipIfLargerRejected { .. })
+        ));
     }
 
     #[test]
