@@ -360,6 +360,8 @@ struct QualityTargets {
     target_mse: f64,
     max_mse: Option<f64>,
     target_mse_is_zero: bool,
+    /// Base for the local-shift threshold; see `local_shift_base_mse`.
+    local_shift_mse: f64,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -505,8 +507,9 @@ fn local_shift_threshold(targets: QualityTargets) -> f64 {
     // Whether a colour shift is visible does not depend much on the requested
     // quality, so high-quality requests share one floor instead of demanding
     // near-exact block means (which mostly flags harmless dither bias).
-    let base = targets.max_mse.unwrap_or(targets.target_mse);
-    base.max(quality_to_mse(LOCAL_SHIFT_FLOOR_QUALITY))
+    targets
+        .local_shift_mse
+        .max(quality_to_mse(LOCAL_SHIFT_FLOOR_QUALITY))
 }
 const LOCAL_SHIFT_FLOOR_QUALITY: u8 = 80;
 /// Minimum area-weighted excess (≈ number of 16×16 blocks whose mean colour
@@ -976,13 +979,25 @@ fn quality_targets(quality: Option<&QualityRange>, output_posterize_bits: u8) ->
     let max_mse = quality.map(|range| quality_to_mse(range.min));
     let target_mse_is_zero = quality.is_none();
     let target_mse = quality.map_or(0.0, |range| quality_to_mse(range.max));
+    let local_shift_mse = quality.map_or(0.0, local_shift_base_mse);
 
     QualityTargets {
         target_mse,
         max_mse,
         target_mse_is_zero,
+        local_shift_mse,
     }
 }
+
+/// The local-shift pass keys off the floor, but never one more than
+/// `LOCAL_SHIFT_SPAN` below the target: a wide range such as `0-39` would
+/// otherwise map to an effectively infinite MSE and switch the pass off,
+/// while a threshold right at the target flags so many blocks that the
+/// boost spreads too thin to rescue the smallest ones.
+fn local_shift_base_mse(range: &QualityRange) -> f64 {
+    quality_to_mse(range.min.max(range.max.saturating_sub(LOCAL_SHIFT_SPAN)))
+}
+const LOCAL_SHIFT_SPAN: u8 = 4;
 
 fn remapped_rgba_from_indices(indices: &[u8], palette: &[[u8; 4]]) -> Vec<u8> {
     let mut out = Vec::with_capacity(indices.len() * 4);
@@ -1540,6 +1555,25 @@ mod tests {
         normalize_rgba_to_srgb_if_needed, pack_indices_by_bit_depth, process_png_bytes,
         remapped_rgba_from_indices, skip_if_larger_max_file_size,
     };
+
+    #[test]
+    fn local_shift_base_ignores_floor_far_below_target() {
+        use super::local_shift_base_mse;
+        use crate::cli::QualityRange;
+        use crate::quality::quality_to_mse;
+
+        let range = |min, max| QualityRange {
+            raw: format!("{min}-{max}"),
+            min,
+            max,
+        };
+        // A floor of 0 must not disable the local-shift pass.
+        assert_eq!(local_shift_base_mse(&range(0, 39)), quality_to_mse(35));
+        // A narrow range keeps keying off its floor.
+        assert_eq!(local_shift_base_mse(&range(35, 39)), quality_to_mse(35));
+        assert_eq!(local_shift_base_mse(&range(37, 39)), quality_to_mse(37));
+        assert_eq!(local_shift_base_mse(&range(0, 3)), quality_to_mse(0));
+    }
 
     #[test]
     fn apng_quality_judges_background_matched_pixels_as_shown() {
