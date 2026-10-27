@@ -436,6 +436,21 @@ fn evaluate_candidate(
         return first;
     }
     let threshold = local_shift_threshold(quality_targets);
+    // Re-weighting trades global error for local error. A wide range's floor
+    // is far too low to stop that trade, so there the result may cost at most
+    // LOCAL_FEEDBACK_MAX_DROP quality points against the first pass. Rounds
+    // accumulate, and one that dips can still lead to a better one, so only
+    // the outcome is checked.
+    let wide_floor = quality_targets
+        .max_mse
+        .filter(|&max_mse| quality_targets.local_shift_mse < max_mse)
+        .map(|_| {
+            let lowest = first
+                .quality
+                .quality_score
+                .saturating_sub(LOCAL_FEEDBACK_MAX_DROP);
+            (quality_to_mse(lowest), first.clone())
+        });
     let mut best_report =
         local_shift_report(rgba, analysis.pixels(), &first, width, height, threshold);
     let mut best = first;
@@ -487,11 +502,16 @@ fn evaluate_candidate(
         best = candidate;
         best_report = report;
     }
-    best
+    match wide_floor {
+        Some((floor, first)) if best.quality.internal_mse > floor => first,
+        _ => best,
+    }
 }
 
 /// Extra quantization passes spent on starved regions.
 const LOCAL_FEEDBACK_ROUNDS: usize = 2;
+/// Most quality points the feedback passes may give up under a wide range.
+const LOCAL_FEEDBACK_MAX_DROP: u8 = 8;
 
 /// Block edge (pixels) for the local-error feedback pass.
 const LOCAL_BLOCK: usize = 16;

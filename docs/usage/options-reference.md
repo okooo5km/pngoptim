@@ -66,7 +66,7 @@ Dithering smooths color transitions by adding controlled noise at palette bounda
 **Default (adaptive) dithering.** Without `--floyd` or `--nofs`, pngoptim dithers at full strength but modulates it per region, so the noise goes where it prevents banding and is trimmed where it only costs bytes:
 
 - smooth gradients (sky, skin, 3D shading, soft shadows) keep at least half strength and diffuse even tiny errors, so they never posterize into flat bands;
-- dithering fades out with local contrast (edges and texture already hide banding);
+- dithering fades out with local contrast (edges and texture already hide banding), except on the anti-aliased pixels of a long straight edge between flat areas when no palette entry comes close to them: damping those would snap the whole edge to one side (seen on icons at low quality);
 - outside gradients, errors too small to see are not diffused, which keeps flat areas clean;
 - anti-aliased alpha edges are not dithered (soft shadows with gently changing alpha still are);
 - a pixel may reuse its left or upper neighbor's palette entry when that is nearly as close as the nearest one (less so in dark tones); the difference is still diffused, so the average color is kept while runs get longer and compress better.

@@ -2754,11 +2754,20 @@ fn dither_row(
         }
         let mut keep_small_errors = true;
         let mut isolated = false;
-        if let Some(AdaptiveRow { params, map, .. }) = adaptive {
+        if let Some(AdaptiveRow {
+            params, map, edge, ..
+        }) = adaptive
+        {
             let cell = map[x];
             let smooth = cell & ADAPTIVE_SMOOTH != 0;
             isolated = cell == 0;
-            dither_level *= f32::from(cell & ADAPTIVE_STRENGTH) / f32::from(ADAPTIVE_STRENGTH);
+            let far_edge = edge[x] && {
+                let gap = tree.search(row_pixels[x], last_match).1;
+                gap > params.edge_gap
+            };
+            if !far_edge {
+                dither_level *= f32::from(cell & ADAPTIVE_STRENGTH) / f32::from(ADAPTIVE_STRENGTH);
+            }
             if smooth {
                 dither_level = dither_level.max(params.smooth_floor);
             }
@@ -2970,6 +2979,8 @@ const ADAPTIVE_STRENGTH: u8 = 0x7f;
 const ADAPTIVE_FADE_FROM: f32 = 12.0;
 const ADAPTIVE_FADE_TO: f32 = 48.0;
 const ADAPTIVE_DAMPED: f32 = 0.35;
+/// Least run (pixels) of identical neighbors along a straight edge.
+const ADAPTIVE_EDGE_RUN: usize = 12;
 /// How far around a pixel the smooth-gradient test looks.
 const ADAPTIVE_SMOOTH_RADIUS: usize = 2;
 /// Least dithering in smooth gradients, as a share of the full level.
@@ -3005,6 +3016,12 @@ const ADAPTIVE_RUN_DARK: f32 = 2.0;
 pub(crate) struct AdaptiveDither {
     /// Per pixel: `ADAPTIVE_SMOOTH` bit plus strength in `ADAPTIVE_STRENGTH` units.
     map: Vec<u8>,
+    /// Damped anti-aliased pixels on a long straight edge between flat areas.
+    edge: Vec<bool>,
+    /// Squared distance to the nearest palette entry above which an `edge` pixel
+    /// is dithered at full strength: damping relies on contrast masking the error,
+    /// which no longer holds once the error itself reaches the fade-out contrast.
+    edge_gap: f32,
     /// Squared error (sum over channels) below which errors are not diffused.
     dead_zone: f32,
     /// Least dithering level in smooth gradients (same scale as the base level).
@@ -3017,6 +3034,7 @@ pub(crate) struct AdaptiveDither {
 struct AdaptiveRow<'a> {
     params: &'a AdaptiveDither,
     map: &'a [u8],
+    edge: &'a [bool],
     /// Output indices of the row dithered before this one (empty for the first).
     above: &'a [u8],
 }
@@ -3033,14 +3051,16 @@ impl AdaptiveDither {
         let fade_to = (ADAPTIVE_FADE_TO / 255.0).powi(2);
         let mut class = vec![0u8; pixels.len()];
         let mut map = vec![0u8; pixels.len()];
+        let mut edge = vec![false; pixels.len()];
         // Bands of rows run in parallel; inside a band each vertical step is measured
         // once (as the row above's downward step), so a pixel costs two distances.
         const BAND: usize = 32;
         class
             .par_chunks_mut(width * BAND)
             .zip(map.par_chunks_mut(width * BAND))
+            .zip(edge.par_chunks_mut(width * BAND))
             .enumerate()
-            .for_each(|(band, (class_band, map_band))| {
+            .for_each(|(band, ((class_band, map_band), edge_band))| {
                 let y0 = band * BAND;
                 let mut up_diff = vec![0f32; width];
                 let mut down_diff = vec![0f32; width];
@@ -3053,9 +3073,10 @@ impl AdaptiveDither {
                         up_diff[x] = row[x].diff(prev[x]);
                     }
                 }
-                for (dy, (class_row, map_row)) in class_band
+                for (dy, ((class_row, map_row), edge_row)) in class_band
                     .chunks_mut(width)
                     .zip(map_band.chunks_mut(width))
+                    .zip(edge_band.chunks_mut(width))
                     .enumerate()
                 {
                     let y = y0 + dy;
@@ -3067,7 +3088,30 @@ impl AdaptiveDither {
                         let px = row[x];
                         let right_diff = row.get(x + 1).map_or(0.0, |&nb| px.diff(nb));
                         down_diff[x] = below.map_or(0.0, |below| px.diff(below[x]));
-                        let most = left_diff.max(right_diff).max(up_diff[x]).max(down_diff[x]);
+                        let across = left_diff.max(right_diff);
+                        let along = up_diff[x].max(down_diff[x]);
+                        let most = across.max(along);
+                        // An anti-aliased pixel between two flat areas, along a long
+                        // straight edge: damping it can snap the whole edge to one side.
+                        let run = |next: &dyn Fn(usize) -> Option<InternalPixel>| {
+                            (1..=ADAPTIVE_EDGE_RUN)
+                                .take_while(|&k| next(k).is_some_and(|nb| nb.diff(px) == 0.0))
+                                .count()
+                        };
+                        let straight = (across == 0.0
+                            && up_diff[x] > 0.0
+                            && down_diff[x] > 0.0
+                            && run(&|k| x.checked_sub(k).map(|i| row[i]))
+                                + run(&|k| row.get(x + k).copied())
+                                >= ADAPTIVE_EDGE_RUN)
+                            || (along == 0.0
+                                && left_diff > 0.0
+                                && right_diff > 0.0
+                                && run(&|k| y.checked_sub(k).map(|j| pixels[j * width + x]))
+                                    + run(&|k| {
+                                        (y + k < height).then(|| pixels[(y + k) * width + x])
+                                    })
+                                    >= ADAPTIVE_EDGE_RUN);
                         left_diff = right_diff;
                         class_row[x] = if most == 0.0 {
                             0
@@ -3100,6 +3144,7 @@ impl AdaptiveDither {
                                 1.0 - t * (1.0 - ADAPTIVE_DAMPED)
                             };
                             map_row[x] = (strength * f32::from(ADAPTIVE_STRENGTH)).round() as u8;
+                            edge_row[x] = straight && strength < 1.0;
                         }
                     }
                     std::mem::swap(&mut up_diff, &mut down_diff);
@@ -3138,6 +3183,8 @@ impl AdaptiveDither {
 
         Self {
             map,
+            edge,
+            edge_gap: fade_to,
             dead_zone: (ADAPTIVE_DEAD_ZONE / 255.0).powi(2),
             smooth_floor: ADAPTIVE_SMOOTH_FLOOR * full_level,
             run_bias: (ADAPTIVE_RUN_BIAS / 255.0).powi(2),
@@ -3148,6 +3195,7 @@ impl AdaptiveDither {
         AdaptiveRow {
             params: self,
             map: &self.map[row * width..][..width],
+            edge: &self.edge[row * width..][..width],
             above,
         }
     }
@@ -4145,6 +4193,29 @@ mod tests {
         // The step from the ramp into the flat area is steep: dithering fades there.
         let step = cell(width / 2, 4) & super::ADAPTIVE_STRENGTH;
         assert!(step < super::ADAPTIVE_STRENGTH, "edge strength {step}");
+    }
+
+    #[test]
+    fn adaptive_map_marks_long_straight_edges_only() {
+        // Yellow over black with one olive anti-aliased row; a short olive stroke
+        // (like text) below it.
+        let (width, height) = (32, 12);
+        let mut rgba = Vec::new();
+        for y in 0..height {
+            for x in 0..width {
+                rgba.extend_from_slice(match y {
+                    0..=3 => &[252, 234, 43, 255],
+                    4 => &[67, 62, 11, 255],
+                    9 if (4..8).contains(&x) => &[67, 62, 11, 255],
+                    _ => &[0, 0, 0, 255],
+                });
+            }
+        }
+        let adaptive = super::AdaptiveDither::new(&internal_pixels(&rgba), width, height, 1.0);
+        let edge = |x: usize, y: usize| adaptive.edge[y * width + x];
+        assert!(edge(16, 4), "long anti-aliased row");
+        assert!(!edge(16, 3) && !edge(16, 5), "flat sides are not the edge");
+        assert!(!edge(5, 9), "short stroke");
     }
 
     #[test]
